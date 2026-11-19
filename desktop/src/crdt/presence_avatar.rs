@@ -1,0 +1,588 @@
+//! Deterministic pixel-plasma presence avatar — the Rust port of Synapse's
+//! `MemberOrb`. A hash of the seed (a peer's stable name, e.g.
+//! `piss-desktop`) fixes a palette + plasma frequencies, so the same host
+//! always renders the same chunky pixelated orb on every device with zero
+//! storage. Rendered as a grid of small solid quads; cells outside the unit
+//! circle are skipped, which gives the round pixelated silhouette for free
+//! (no mask needed). Pass a wall-clock `time` in seconds to animate the
+//! plasma, or a fixed value (e.g. `0.6`) for a still, still-unique frame.
+
+use std::f32::consts::TAU;
+
+/// One filled pixel of the avatar: a device-independent rect (relative to
+/// the caller's origin, already sized to the requested box) and its RGBA.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AvatarCell {
+    /// `[x, y, w, h]` in the same logical space as the requested box.
+    pub rect: [f32; 4],
+    /// Straight-alpha RGBA in 0..1.
+    pub color: [f32; 4],
+}
+
+/// Cache only grid-dependent geometry for grids 11–15 (including the f32
+/// rounding edge case); size, origin and time stay live.
+struct CircularCellGeometry {
+    i: usize,
+    j: usize,
+    nx: f32,
+    ny: f32,
+    dist: f32,
+    rim: f32,
+}
+
+fn circular_geometry(grid: u32) -> &'static [CircularCellGeometry] {
+    static CACHE: std::sync::OnceLock<[Vec<CircularCellGeometry>; 5]> =
+        std::sync::OnceLock::new();
+    &CACHE.get_or_init(|| {
+        std::array::from_fn(|index| {
+            let grid = (11 + index) as u32;
+            let mut cells = Vec::new();
+            for j in 0..grid {
+                for i in 0..grid {
+                    // Keep the original floating-point expression order.
+                    let nx = ((i as f32 + 0.5) / grid as f32) * 2.0 - 1.0;
+                    let ny = ((j as f32 + 0.5) / grid as f32) * 2.0 - 1.0;
+                    let dist = (nx * nx + ny * ny).sqrt();
+                    if dist > 1.02 {
+                        continue;
+                    }
+                    let rim = 1.0 - (((dist - 0.62) / 0.38).max(0.0)) * 0.55;
+                    cells.push(CircularCellGeometry {
+                        i: i as usize,
+                        j: j as usize,
+                        nx,
+                        ny,
+                        dist,
+                        rim,
+                    });
+                }
+            }
+            cells
+        })
+    })[(grid - 11) as usize]
+}
+
+/// Hashed plasma parameters — the identity of one avatar. Deterministic in
+/// the seed; build once and reuse across frames.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AvatarProfile {
+    hues: [f32; 5],
+    f1: f32,
+    f2: f32,
+    f3: f32,
+    f4: f32,
+    s1: f32,
+    s2: f32,
+    s3: f32,
+    s4: f32,
+    p1: f32,
+    p2: f32,
+    /// Chunky pixel resolution across (normally 11–14, matching Synapse).
+    /// `Rng::next` can round to 1.0 in f32, producing 15; preserve that output.
+    grid: u32,
+}
+
+#[inline]
+fn fmod(a: f32, n: f32) -> f32 {
+    ((a % n) + n) % n
+}
+
+/// Shortest-path hue interpolation (cross the wheel the pretty way).
+#[inline]
+fn lerp_hue(a: f32, b: f32, t: f32) -> f32 {
+    fmod(a + (fmod(b - a + 180.0, 360.0) - 180.0) * t, 360.0)
+}
+
+/// FNV-1a (32-bit), byte-identical to Synapse's `hashSeed` for ASCII; for
+/// non-ASCII we hash UTF-16 code units so multi-byte names still match the
+/// JS `charCodeAt` stream.
+fn hash_seed(seed: &str) -> u32 {
+    let mut h: u32 = 2_166_136_261;
+    for unit in seed.encode_utf16() {
+        h ^= u32::from(unit);
+        h = h.wrapping_mul(16_777_619);
+    }
+    h
+}
+
+/// xorshift32 PRNG matching Synapse's `makeRng` (0..=1 after f32 rounding).
+struct Rng(u32);
+impl Rng {
+    fn new(seed: u32) -> Self {
+        Self(if seed == 0 { 1 } else { seed })
+    }
+    fn next(&mut self) -> f32 {
+        let mut s = self.0;
+        s ^= s << 13;
+        s ^= s >> 17;
+        s ^= s << 5;
+        self.0 = s;
+        s as f32 / 4_294_967_296.0
+    }
+}
+
+impl AvatarProfile {
+    pub fn from_seed(seed: &str) -> Self {
+        // Memoize by seed. `from_seed` is a pure function of the seed
+        // (hash → hues/frequencies) with NO time dependence, yet it runs
+        // for every presence orb on every frame — the editor caret, the
+        // roster, and the top-chrome cluster each draw the same peer's orb,
+        // 2–3× per peer per frame. Caching the tiny `Copy` result removes
+        // that per-frame hashing/RNG cost (a real contributor to frames
+        // tipping over the vblank budget in a busy shared session). The orb
+        // ANIMATION is untouched: `cells(t)` still recomputes each frame.
+        // Cache is per-thread (rendering is single-threaded) and bounded by
+        // the number of distinct collaborator identities seen this session.
+        thread_local! {
+            static PROFILE_CACHE: std::cell::RefCell<
+                std::collections::HashMap<String, AvatarProfile>,
+            > = std::cell::RefCell::new(std::collections::HashMap::new());
+        }
+        let key = if seed.is_empty() { " " } else { seed };
+        if let Some(cached) = PROFILE_CACHE.with(|cache| cache.borrow().get(key).copied())
+        {
+            return cached;
+        }
+        let profile = Self::compute_from_seed(key);
+        PROFILE_CACHE.with(|cache| {
+            cache.borrow_mut().insert(key.to_string(), profile);
+        });
+        profile
+    }
+
+    fn compute_from_seed(seed: &str) -> Self {
+        let h = hash_seed(seed);
+        let mut r = Rng::new(h);
+        let base = (h % 360) as f32;
+        // Vibrant palette the pixels cycle through: an analogous run plus
+        // one opposite pop.
+        let hues = [
+            base,
+            fmod(base + 26.0 + r.next() * 24.0, 360.0),
+            fmod(base + 58.0 + r.next() * 30.0, 360.0),
+            fmod(base - 40.0 - r.next() * 24.0, 360.0),
+            fmod(base + 165.0 + r.next() * 40.0, 360.0),
+        ];
+        let f1 = 5.0 + r.next() * 7.0;
+        let f2 = 5.0 + r.next() * 7.0;
+        let f3 = 4.0 + r.next() * 6.0;
+        let f4 = 6.0 + r.next() * 10.0;
+        let s1 = 0.5 + r.next() * 0.9;
+        let s2 = 0.5 + r.next() * 0.9;
+        let s3 = 0.4 + r.next() * 0.8;
+        let s4 = 0.6 + r.next() * 1.1;
+        let p1 = r.next() * TAU;
+        let p2 = r.next() * TAU;
+        let grid = 11 + (r.next() * 4.0).floor() as u32;
+        Self {
+            hues,
+            f1,
+            f2,
+            f3,
+            f4,
+            s1,
+            s2,
+            s3,
+            s4,
+            p1,
+            p2,
+            grid,
+        }
+    }
+
+    /// The ORB itself, unmasked: the exact same grid, per-cell four-sine
+    /// plasma formula, palette, and rim shading as [`Self::cells`] — only
+    /// the unit-circle skip is dropped so the plasma fills an arbitrary
+    /// `w`×`h` rectangle. This is what progress-bar fills should use when
+    /// they want to read as the profile pic's living pixels, not an
+    /// approximation of them.
+    pub fn cells_rect(
+        &self,
+        ox: f32,
+        oy: f32,
+        w: f32,
+        h: f32,
+        t: f32,
+        mut push: impl FnMut(AvatarCell),
+    ) {
+        if w <= 1.0 || h <= 1.0 {
+            return;
+        }
+        // Square-ish cells at the orb's chunky resolution: same grid count
+        // across as the circular avatar, extra rows derived from the aspect.
+        let cols = self.grid;
+        let cell = w / cols as f32;
+        let rows = ((h / cell).ceil() as u32).max(1);
+        let cw = w / cols as f32;
+        let chh = h / rows as f32;
+        let gc = cols as f32;
+        let gr = rows as f32;
+        for j in 0..rows {
+            let y0 = (oy + j as f32 * chh).round();
+            let y1 = (oy + (j as f32 + 1.0) * chh).round();
+            if y1 - y0 < 1.0 {
+                continue;
+            }
+            let ny = ((j as f32 + 0.5) / gr) * 2.0 - 1.0;
+            for i in 0..cols {
+                let x0 = (ox + i as f32 * cw).round();
+                let x1 = (ox + (i as f32 + 1.0) * cw).round();
+                if x1 - x0 < 1.0 {
+                    continue;
+                }
+                let nx = ((i as f32 + 0.5) / gc) * 2.0 - 1.0;
+                let dist = (nx * nx + ny * ny).sqrt();
+                // Identical field to the orb, rim included.
+                let mut p = (nx * self.f1 + t * self.s1 + self.p1).sin()
+                    + (ny * self.f2 - t * self.s2 + self.p2).sin()
+                    + ((nx + ny) * self.f3 + t * self.s3).sin()
+                    + (dist * self.f4 - t * self.s4).sin();
+                p = (p + 4.0) / 8.0; // -> 0..1
+                let idx = p * self.hues.len() as f32;
+                let lo = idx.floor() as usize;
+                let hue = lerp_hue(
+                    self.hues[lo % self.hues.len()],
+                    self.hues[(lo + 1) % self.hues.len()],
+                    idx - lo as f32,
+                );
+                let rim = 1.0 - (((dist - 0.62) / 0.38).max(0.0)) * 0.55;
+                let lightness = ((34.0 + p * 40.0) * rim) / 100.0;
+                let color = hsl_to_rgba(hue, 0.88, lightness);
+                push(AvatarCell {
+                    rect: [x0, y0, x1 - x0, y1 - y0],
+                    color,
+                });
+            }
+        }
+    }
+
+    /// Grid resolution (cells across / down).
+    pub fn grid(&self) -> u32 {
+        self.grid
+    }
+
+    /// Emit the filled cells for a `size`×`size` box whose top-left is at
+    /// `(ox, oy)`, at animation time `t` seconds. Cells outside the unit
+    /// circle are omitted (the round silhouette). `push` receives each
+    /// `AvatarCell`; the caller draws them as solid quads.
+    ///
+    /// Cell boundaries are integer-snapped so the grid TILES exactly —
+    /// cell `i`'s right edge is cell `i+1`'s left edge (both `round`) —
+    /// with no seam and no overlap. Feed device-pixel `ox/oy/size` (the
+    /// draw helper does) and every quad lands on a whole pixel: crisp,
+    /// no fractional-pixel blend. This replaces the old `+1` overdraw,
+    /// which smeared neighbouring cells into each other at small sizes.
+    pub fn cells(
+        &self,
+        ox: f32,
+        oy: f32,
+        size: f32,
+        t: f32,
+        mut push: impl FnMut(AvatarCell),
+    ) {
+        let cell = size / self.grid as f32;
+        // Adjacent boundaries used the same formula in the original loop.
+        // Integer indices 0..=15 convert/add exactly, so sharing them is exact.
+        let mut xs = [0.0; 16];
+        let mut ys = [0.0; 16];
+        for k in 0..=self.grid as usize {
+            xs[k] = (ox + k as f32 * cell).round();
+            ys[k] = (oy + k as f32 * cell).round();
+        }
+        for geometry in circular_geometry(self.grid) {
+            let CircularCellGeometry {
+                i,
+                j,
+                nx,
+                ny,
+                dist,
+                rim,
+            } = *geometry;
+            let mut p = (nx * self.f1 + t * self.s1 + self.p1).sin()
+                + (ny * self.f2 - t * self.s2 + self.p2).sin()
+                + ((nx + ny) * self.f3 + t * self.s3).sin()
+                + (dist * self.f4 - t * self.s4).sin();
+            p = (p + 4.0) / 8.0; // → 0..1
+            let idx = p * self.hues.len() as f32;
+            let lo = idx.floor() as usize;
+            let hue = lerp_hue(
+                self.hues[lo % self.hues.len()],
+                self.hues[(lo + 1) % self.hues.len()],
+                idx - lo as f32,
+            );
+            let lightness = ((34.0 + p * 40.0) * rim) / 100.0;
+            let color = hsl_to_rgba(hue, 0.88, lightness);
+            push(AvatarCell {
+                rect: [xs[i], ys[j], xs[i + 1] - xs[i], ys[j + 1] - ys[j]],
+                color,
+            });
+        }
+    }
+}
+
+/// Convenience: build a profile from `seed` and fill an arbitrary rect with
+/// the orb's unmasked pixel plasma (see [`AvatarProfile::cells_rect`]).
+pub fn avatar_cells_rect(
+    seed: &str,
+    ox: f32,
+    oy: f32,
+    w: f32,
+    h: f32,
+    t: f32,
+    push: impl FnMut(AvatarCell),
+) {
+    AvatarProfile::from_seed(seed).cells_rect(ox, oy, w, h, t, push);
+}
+
+/// Convenience: build the profile and emit cells in one call (for one-off
+/// draws that don't cache the profile).
+pub fn avatar_cells(
+    seed: &str,
+    ox: f32,
+    oy: f32,
+    size: f32,
+    t: f32,
+    push: impl FnMut(AvatarCell),
+) {
+    AvatarProfile::from_seed(seed).cells(ox, oy, size, t, push);
+}
+
+/// Wall-clock animation time (seconds since process start) to drive the
+/// plasma. Reuses the shared process clock, which is:
+///   * f32-precision safe — it counts elapsed seconds from a process
+///     epoch, not the raw unix epoch (a raw epoch as f32 quantizes to
+///     ~128 s and freezes any animation sampling it), and
+///   * wasm-safe — `web_time` under the hood (std `Instant` panics on
+///     wasm32).
+/// Pass this instead of a fixed frame so the orb animates. Pair it with
+/// the render loop's presence-orb redraw owner (desktop
+/// `redraw_reason()` returns `Some` while any peer is present) so frames
+/// keep coming while an orb is on screen — and stop, for zero cost, the
+/// instant the last peer leaves.
+pub fn presence_orb_now_seconds() -> f32 {
+    crate::cursor_style::rainbow_now_seconds()
+}
+
+/// HSL (h in degrees, s/l in 0..1) → straight-alpha RGBA in 0..1, alpha 1.
+fn hsl_to_rgba(h: f32, s: f32, l: f32) -> [f32; 4] {
+    let l = l.clamp(0.0, 1.0);
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let hp = fmod(h, 360.0) / 60.0;
+    let x = c * (1.0 - (hp % 2.0 - 1.0).abs());
+    let (r1, g1, b1) = match hp as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = l - c / 2.0;
+    [r1 + m, g1 + m, b1 + m, 1.0]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Original circular algorithm, deliberately independent of the geometry cache.
+    fn reference_cells(
+        profile: &AvatarProfile,
+        ox: f32,
+        oy: f32,
+        size: f32,
+        t: f32,
+        mut push: impl FnMut(AvatarCell),
+    ) {
+        let grid = profile.grid as f32;
+        let cell = size / grid;
+        for j in 0..profile.grid {
+            // Integer-snapped row band: this row's bottom edge IS the
+            // next row's top edge, so rows tile seamlessly.
+            let y0 = (oy + j as f32 * cell).round();
+            let y1 = (oy + (j as f32 + 1.0) * cell).round();
+            for i in 0..profile.grid {
+                let nx = ((i as f32 + 0.5) / grid) * 2.0 - 1.0;
+                let ny = ((j as f32 + 0.5) / grid) * 2.0 - 1.0;
+                let dist = (nx * nx + ny * ny).sqrt();
+                // Keep the rim cells a hair past the unit circle so the
+                // silhouette reads full and round at the cardinal
+                // shoulders instead of being clipped a pixel shy.
+                if dist > 1.02 {
+                    continue; // outside the circle → transparent
+                }
+                let mut p = (nx * profile.f1 + t * profile.s1 + profile.p1).sin()
+                    + (ny * profile.f2 - t * profile.s2 + profile.p2).sin()
+                    + ((nx + ny) * profile.f3 + t * profile.s3).sin()
+                    + (dist * profile.f4 - t * profile.s4).sin();
+                p = (p + 4.0) / 8.0; // → 0..1
+                let idx = p * profile.hues.len() as f32;
+                let lo = idx.floor() as usize;
+                let hue = lerp_hue(
+                    profile.hues[lo % profile.hues.len()],
+                    profile.hues[(lo + 1) % profile.hues.len()],
+                    idx - lo as f32,
+                );
+                // Rim falloff darkens the outer edge for a lit-sphere read.
+                let rim = 1.0 - (((dist - 0.62) / 0.38).max(0.0)) * 0.55;
+                let lightness = ((34.0 + p * 40.0) * rim) / 100.0;
+                let color = hsl_to_rgba(hue, 0.88, lightness);
+                // Integer-snapped column band, tiling with its neighbour.
+                let x0 = (ox + i as f32 * cell).round();
+                let x1 = (ox + (i as f32 + 1.0) * cell).round();
+                push(AvatarCell {
+                    rect: [x0, y0, x1 - x0, y1 - y0],
+                    color,
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn cached_geometry_matches_original_bit_for_bit() {
+        for seed in ["", " ", "piss-desktop", "other-host", "λ🚀", "a", "z"] {
+            let mut profile = AvatarProfile::from_seed(seed);
+            // Cover every cached grid for every palette/frequency set.
+            for grid in 11..=15 {
+                profile.grid = grid;
+                for t in [-123.25, -0.0, 0.0, 0.6, 0.6001, 1.0, 37.125, 9999.0] {
+                    for size in [-3.0, 0.0, 0.5, 1.0, 7.25, 14.0, 42.0, 127.75] {
+                        for (ox, oy) in
+                            [(0.0, 0.0), (-0.5, 0.5), (3.25, -17.75), (1024.5, 4096.25)]
+                        {
+                            let mut actual = Vec::new();
+                            let mut expected = Vec::new();
+                            profile.cells(ox, oy, size, t, |c| actual.push(c));
+                            reference_cells(&profile, ox, oy, size, t, |c| {
+                                expected.push(c)
+                            });
+                            assert_eq!(actual.len(), expected.len());
+                            for (a, b) in actual.iter().zip(&expected) {
+                                assert_eq!(
+                                    a.rect.map(f32::to_bits),
+                                    b.rect.map(f32::to_bits)
+                                );
+                                assert_eq!(a.color.map(f32::to_bits), b.color.map(f32::to_bits),
+                                    "seed={seed:?} grid={grid} t={t} size={size} origin=({ox},{oy})");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cached_geometry_keeps_animation_live() {
+        let mut profile = AvatarProfile::from_seed("piss-desktop");
+        for grid in 11..=15 {
+            profile.grid = grid;
+            let frame = |t| {
+                let mut cells = Vec::new();
+                profile.cells(0.25, -0.5, 42.0, t, |c| cells.push(c));
+                cells
+            };
+            let first = frame(0.6);
+            for t in [0.6001, 0.616, 0.7, 1.0, 37.125] {
+                let next = frame(t);
+                assert_eq!(
+                    first.iter().map(|c| c.rect).collect::<Vec<_>>(),
+                    next.iter().map(|c| c.rect).collect::<Vec<_>>()
+                );
+                assert!(first.iter().zip(&next).any(|(a, b)| a.color != b.color));
+            }
+        }
+    }
+
+    #[test]
+    fn cached_geometry_work_reduction() {
+        for grid in 11..=15 {
+            let retained = circular_geometry(grid).len();
+            // Steady state: no coordinate normalization, distance square roots,
+            // circle tests or rim calculations; sine evaluations are unchanged.
+            println!("grid {grid}: sqrt/circle tests {} -> 0; rim calculations {retained} -> 0; boundary rounds {} -> {}; sine evaluations {} unchanged",
+                grid * grid, 2 * grid as usize + 2 * retained,
+                2 * (grid + 1), 4 * retained);
+            assert!(retained > 0 && retained < (grid * grid) as usize);
+        }
+    }
+
+    #[test]
+    fn profile_is_deterministic_in_the_seed() {
+        let a = AvatarProfile::from_seed("piss-desktop");
+        let b = AvatarProfile::from_seed("piss-desktop");
+        assert_eq!(a, b);
+        let c = AvatarProfile::from_seed("other-host");
+        assert_ne!(a, c);
+        assert!((11..=15).contains(&a.grid()));
+    }
+
+    #[test]
+    fn all_emitted_cells_sit_inside_the_circle_and_the_box() {
+        let prof = AvatarProfile::from_seed("piss-desktop");
+        let size = 40.0;
+        let mut count = 0;
+        let mut all_inside_box = true;
+        prof.cells(0.0, 0.0, size, 0.6, |cell| {
+            count += 1;
+            if cell.rect[0] < 0.0 || cell.rect[1] < 0.0 {
+                all_inside_box = false;
+            }
+            for ch in &cell.color[..3] {
+                assert!((0.0..=1.0).contains(ch), "channel out of range: {ch}");
+            }
+        });
+        assert!(all_inside_box);
+        // A circle inside an NxN grid fills ~78% of the cells; assert we got
+        // a plausible non-empty, non-full count.
+        let grid = prof.grid();
+        let total = grid * grid;
+        assert!(count > (total / 2) as usize && count < total as usize);
+    }
+
+    #[test]
+    fn emitted_cells_tile_on_integer_pixels_without_overlap() {
+        let prof = AvatarProfile::from_seed("piss-desktop");
+        let size = 42.0;
+        let mut cells: Vec<[f32; 4]> = Vec::new();
+        prof.cells(0.0, 0.0, size, 0.6, |c| cells.push(c.rect));
+        assert!(!cells.is_empty());
+        for r in &cells {
+            // Every edge lands on a whole pixel — the crispness contract.
+            for v in r {
+                assert_eq!(*v, v.round(), "cell edge not integer-aligned: {r:?}");
+            }
+            // No cell collapses below a pixel, and none escapes the box.
+            assert!(
+                r[2] >= 1.0 && r[3] >= 1.0,
+                "cell smaller than a pixel: {r:?}"
+            );
+            assert!(
+                r[0] >= 0.0 && r[1] >= 0.0 && r[0] + r[2] <= size && r[1] + r[3] <= size,
+                "cell outside box: {r:?}"
+            );
+        }
+        // Seamless tiling: no two cells overlap (a shared edge is not an
+        // overlap — that's what makes the pixels crisp instead of blended).
+        for a in 0..cells.len() {
+            for b in (a + 1)..cells.len() {
+                let (p, q) = (cells[a], cells[b]);
+                let overlap = p[0] < q[0] + q[2]
+                    && p[0] + p[2] > q[0]
+                    && p[1] < q[1] + q[3]
+                    && p[1] + p[3] > q[1];
+                assert!(!overlap, "cells overlap: {p:?} vs {q:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn hsl_primaries_round_trip() {
+        let red = hsl_to_rgba(0.0, 1.0, 0.5);
+        assert!(red[0] > 0.99 && red[1] < 0.01 && red[2] < 0.01);
+        let green = hsl_to_rgba(120.0, 1.0, 0.5);
+        assert!(green[1] > 0.99 && green[0] < 0.01 && green[2] < 0.01);
+        let blue = hsl_to_rgba(240.0, 1.0, 0.5);
+        assert!(blue[2] > 0.99 && blue[0] < 0.01 && blue[1] < 0.01);
+    }
+}

@@ -1,5 +1,6 @@
-FROM rust:1.92-bookworm AS build
+FROM rust:1.99.1-bookworm AS build
 WORKDIR /build
+RUN apt-get update && apt-get install --no-install-recommends -y clang libclang-dev && rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY docs/start.md docs/boards.md docs/tasks.md docs/agents.md docs/operations.md ./docs/

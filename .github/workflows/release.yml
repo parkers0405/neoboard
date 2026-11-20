@@ -45,6 +45,8 @@ jobs:
       - run: cargo build --release --locked --bin neochat-desktop
         working-directory: desktop
       - run: python scripts/package-release.py ${{ matrix.asset }}
+      - name: Write, restart and read using binaries from the release ZIP
+        run: python scripts/smoke-release.py zip dist/neoboard-${{ matrix.asset }}.zip
       - if: runner.os == 'Windows'
         shell: pwsh
         run: ./scripts/build-msi.ps1
@@ -53,9 +55,24 @@ jobs:
           name: neoboard-${{ matrix.asset }}
           path: dist/*
           if-no-files-found: error
+  image-smoke:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
+      - uses: actions/checkout@v4
+        if: inputs.release_tag != ''
+        with:
+          path: packaging
+          ref: ${{ github.sha }}
+          sparse-checkout: scripts
+      - run: docker build --tag neoboard:smoke .
+      - name: Write, restart and read in the final image
+        run: python3 ${{ inputs.release_tag != '' && 'packaging/' || '' }}scripts/smoke-release.py image neoboard:smoke
   publish:
     if: startsWith(github.ref, 'refs/tags/v') || inputs.release_tag != ''
-    needs: bundle
+    needs: [bundle, image-smoke]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -72,5 +89,5 @@ jobs:
             test -s "$asset"
             sha256sum --check "$asset.sha256"
           done
-          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --draft --title "NeoBoard $TAG" --notes 'First public beta. On macOS Apple Silicon, open the DMG and drag NeoBoard to Applications. On Windows x86-64, run the MSI. On Linux x86-64, extract the tarball and run neochat-desktop. The daemon, CLI, and MCP adapter are included. Portable archives and SHA-256 checksums are provided.' *.dmg *.msi *.tar.gz *.zip *.sha256
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --draft --title "NeoBoard $TAG" --notes 'Before upgrading a host, stop the daemon and back up the entire data directory while it is stopped. For an installer-managed installation, upgrade with the matching installer, not the portable updater. On macOS Apple Silicon, open the DMG and drag NeoBoard to Applications. On Windows x86-64, run the MSI. On Linux x86-64, extract the tarball and run neochat-desktop. Portable archives and SHA-256 checksums are provided.' *.dmg *.msi *.tar.gz *.zip *.sha256
           gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest

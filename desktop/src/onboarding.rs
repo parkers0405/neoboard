@@ -234,6 +234,40 @@ mod tests {
     }
 
     #[test]
+    fn onboarding_modal_leaves_only_the_titlebar_draggable() {
+        for adding in [false, true] {
+            let mut app = App::new();
+            if adding { fixture::load(&mut app, false); app.begin_add_board(); }
+            let mut rt = rune::Runtime::new(app, view::root, (850., 600.), rune::Env::new(true, 1.));
+            let mut insets = rune::ChromeInsets::default();
+            insets.height = view::TITLEBAR_H; insets.leading = 76.;
+            rt.set_chrome_insets(insets);
+            for _ in 0..5 { rt.frame(1. / 60.); }
+            let press = |rt: &mut rune::Runtime<App>, x, y| {
+                rt.pointer_move(x, y); rt.pointer_down(x, y);
+                let action = rt.take_titlebar_action();
+                rt.pointer_up(x, y); rt.frame(1. / 60.);
+                action
+            };
+            assert_eq!(press(&mut rt, 425., insets.height / 2.), Some(rune::TitlebarAction::Drag));
+            assert_eq!(press(&mut rt, 12., insets.height + 2.), None);
+            if adding {
+                click(&mut rt, "projects-toggle");
+                assert!(!rt.state.project_menu, "the board behind onboarding stays modal-blocked");
+                click(&mut rt, "onboarding-join");
+            }
+            let field = if adding { "onboarding-invite" } else { "onboarding-name" };
+            let (x, y) = rt.find(field).unwrap();
+            assert_eq!(press(&mut rt, x, y), None);
+            rt.key(rune::KeyEvent { key: Key::Text("sample".into()), mods: Default::default() });
+            rt.frame(1. / 60.);
+            let onboarding = &rt.state.onboarding;
+            assert_eq!((if adding { &onboarding.invite } else { &onboarding.name }).text, "sample");
+            if !adding { click(&mut rt, "onboarding-next"); assert!(rt.find("onboarding-board-name").is_some()); }
+        }
+    }
+
+    #[test]
     fn empty_daemon_requires_onboarding_and_creation_opens_the_agent_step() {
         let mut app = App::new();
         app.board_cache = Some(Snapshot { cursor: 0, channels: vec!["general".into()], messages: vec![] });

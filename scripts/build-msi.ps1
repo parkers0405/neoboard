@@ -14,12 +14,30 @@ try {
     }
     $msi = Join-Path $work $name
     $installerVersion = $Matches[1]
-    # Isolate the pinned WiX CLI from other jobs and preinstalled WiX versions.
-    dotnet tool install wix --version 5.0.2 --tool-path "$work/tools"
+    # WixUI_Minimal displays an RTF license. Use the actual bundled license, not the WiX sample.
+    $licenseRtf = Join-Path $work 'License.rtf'
+    Add-Type -AssemblyName System.Windows.Forms
+    $license = [System.Windows.Forms.RichTextBox]::new()
+    try {
+        $license.Text = [IO.File]::ReadAllText("$payload/LICENSE")
+        $license.SaveFile($licenseRtf)
+    } finally { $license.Dispose() }
+
+    $wixVersion = '5.0.2'
+    dotnet tool install wix --version $wixVersion --tool-path "$work/tools"
     if ($LASTEXITCODE -ne 0) { throw 'WiX tool installation failed' }
     $icon = (Resolve-Path "$PSScriptRoot/../design/NeoBoard.ico").Path
-    & "$work/tools/wix.exe" build "$PSScriptRoot/neoboard.wxs" -arch x64 -d "Version=$installerVersion" -d "BinaryDir=$payload" -d "IconFile=$icon" -intermediateFolder "$work/obj" -o $msi
-    if ($LASTEXITCODE -ne 0) { throw 'WiX MSI build failed' }
+    $wix = "$work/tools/wix.exe"
+    # Keep the matching project-local WiX extension cache in the disposable build directory.
+    Push-Location $work
+    try {
+        foreach ($extension in 'WixToolset.UI.wixext', 'WixToolset.Util.wixext') {
+            & $wix extension add "$extension/$wixVersion"
+            if ($LASTEXITCODE -ne 0) { throw "WiX extension installation failed: $extension" }
+        }
+        & $wix build "$PSScriptRoot/neoboard.wxs" -arch x64 -ext WixToolset.UI.wixext -ext WixToolset.Util.wixext -d "Version=$installerVersion" -d "BinaryDir=$payload" -d "IconFile=$icon" -d "LicenseRtf=$licenseRtf" -intermediateFolder "$work/obj" -o $msi
+        if ($LASTEXITCODE -ne 0) { throw 'WiX MSI build failed' }
+    } finally { Pop-Location }
     & "$PSScriptRoot/verify-windows-msi.ps1" -Msi $msi -Zip $zip
 
     $hash = (Get-FileHash -LiteralPath $msi -Algorithm SHA256).Hash.ToLowerInvariant()

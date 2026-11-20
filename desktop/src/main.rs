@@ -1,3 +1,6 @@
+#![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
+
+mod background_process;
 mod connection;
 #[cfg(test)]
 mod live_organization_test;
@@ -723,6 +726,15 @@ fn poll(app: &mut App, seconds: f64, tx: &mut Tx) -> bool {
 }
 fn main() {
     let args: Vec<_> = std::env::args().skip(1).collect();
+    #[cfg(windows)]
+    if !args.is_empty() {
+        // Help, argument errors and Rune headless modes can write to the invoking
+        // terminal. Borrow it if present; never allocate one for Explorer launches.
+        #[link(name = "kernel32")]
+        unsafe extern "system" { fn AttachConsole(process_id: u32) -> i32; }
+        // SAFETY: ATTACH_PARENT_PROCESS is a documented sentinel; no pointers involved.
+        unsafe { AttachConsole(u32::MAX); }
+    }
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!("Neoboard — native board inspector\n\n--endpoint URL --token TOKEN  Remote board (or NEOCHAT_TOKEN)\n--profile NAME                Actor profile\n--data-dir PATH               Local service discovery/bootstrap\n--fixture                     Offline read-only fixture\n--scene tasks-sparse|tasks-dense|activity|thread\n--snap PATH --size 1252x674 --scale 2  Headless Rune PNG");
         return;
@@ -766,7 +778,8 @@ fn main() {
         }),
         scenes: &[("tasks-sparse", |a| fixture::load(a, false)), ("tasks-dense", |a| fixture::load(a, true)),
             ("settings", |a| {fixture::load(a,true); a.dialog=Some(Dialog::Settings);}),
-            ("update-offer", |a| {fixture::load(a,true); a.release.stage=release_update::Stage::Offer(semver::Version::new(1,2,0));}),
+            ("update-offer", |a| {fixture::load(a,true); a.release.stage=release_update::Stage::Offer(semver::Version::new(1,2,0), release_update::Update::Portable);}),
+            ("update-msi", |a| {fixture::load(a,true); a.dialog=Some(Dialog::Settings); a.release.stage=release_update::Stage::Offer(semver::Version::new(1,2,0), release_update::Update::Managed(release_update::Installer::Msi));}),
             ("update-running", |a| {fixture::load(a,true); a.release.stage=release_update::Stage::Running;}),
             ("personal", |a| {fixture::load(a,true);a.dialog=Some(Dialog::Personal);}),
             ("task-filters", |a| {fixture::load(a,true);a.dialog=Some(Dialog::Filters);}),
@@ -795,7 +808,7 @@ fn main() {
             ("attachments", |a| { fixture::load(a, true); a.page = Page::Activity; a.open_thread(1); a.attachment_message = Some(1); a.download_id = Some(1); }),
             ("scheduled", |a| { fixture::load(a, true); a.page = Page::Scheduled; a.show_schedule = true; a.schedule_at = edit(&(a.now + 3600).to_string()); })],
         ..AppSpec::new("Neoboard", (1252.0, 674.0), App::new, view::root)
-    }).titlebar(rune::Titlebar::new(view::TITLEBAR_H)).run();
+    }).titlebar(rune::Titlebar::new(view::TITLEBAR_H).empty_caption_band()).run();
 }
 
 #[cfg(test)]

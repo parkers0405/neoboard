@@ -49,8 +49,7 @@ pub(crate) struct CustomFrame {
 }
 
 struct State {
-    /// The titlebar's height in points, which the caption buttons take.
-    height: Cell<f32>,
+    titlebar: Cell<crate::Titlebar>,
     caption: Cell<CaptionState>,
     /// Windows' rect for the new scale while `WM_DPICHANGED` runs: winit's own `SetWindowPos`
     /// lands on it (`WM_WINDOWPOSCHANGING`), so the window moves and resizes once.
@@ -59,9 +58,9 @@ struct State {
 
 impl CustomFrame {
     /// Takes the title bar off `window`, keeping its client size.
-    pub(crate) fn install(window: &winit::window::Window, height: f32) -> Option<Self> {
+    pub(crate) fn install(window: &winit::window::Window, titlebar: crate::Titlebar) -> Option<Self> {
         let hwnd = super::hwnd(window)?;
-        let state = Rc::new(State { height: Cell::new(height), caption: Cell::new(CaptionState::Idle), dpi_rect: Cell::new(None) });
+        let state = Rc::new(State { titlebar: Cell::new(titlebar), caption: Cell::new(CaptionState::Idle), dpi_rect: Cell::new(None) });
         let data = Rc::into_raw(state.clone());
         // SAFETY: `data` stays alive until WM_NCDESTROY, where the subclass that reads it goes.
         if unsafe { SetWindowSubclass(hwnd, Some(subclass), SUBCLASS, data as usize) } == 0 {
@@ -87,13 +86,12 @@ impl CustomFrame {
     pub(crate) fn caption(&self, window: &winit::window::Window) -> Caption {
         match super::hwnd(window) {
             Some(hwnd) => self.state.caption(hwnd),
-            None => Caption::new(self.state.height.get()),
+            None => Caption::new(self.state.titlebar.get().height()),
         }
     }
 
-    /// A new titlebar height (`Cx::titlebar_height`): the buttons and the band they hit-test.
-    pub(crate) fn set_height(&self, height: f32) {
-        self.state.height.set(height);
+    pub(crate) fn set_titlebar(&self, titlebar: crate::Titlebar) {
+        self.state.titlebar.set(titlebar);
     }
 }
 
@@ -351,7 +349,7 @@ impl State {
         // SAFETY: reads a live window's state and style.
         let (zoomed, style) = unsafe { (IsZoomed(hwnd) != 0, GetWindowLongPtrW(hwnd, GWL_STYLE) as u32) };
         Caption {
-            height: self.height.get(),
+            height: self.titlebar.get().height(),
             state: self.caption.get(),
             maximized: zoomed,
             minimizable: style & WS_MINIMIZEBOX != 0,
@@ -388,7 +386,7 @@ fn client_point(lparam: LPARAM) -> POINT {
 }
 
 /// What a point (screen pixels) in the client area hits: the top resize edge, an enabled
-/// caption button, or the client.
+/// caption button, an explicitly empty caption band, or the client.
 fn hit_test(state: &State, hwnd: HWND, mut point: POINT) -> u32 {
     // SAFETY: Win32 calls on a live window this thread owns.
     let (dpi, zoomed, resizable) = unsafe {
@@ -401,10 +399,15 @@ fn hit_test(state: &State, hwnd: HWND, mut point: POINT) -> u32 {
     if !zoomed && resizable && point.y >= 0 && point.y < edge {
         return if point.x < edge { HTTOPLEFT } else if point.x >= client_width - edge { HTTOPRIGHT } else { HTTOP };
     }
-    match caption_hit(state, hwnd, point) {
+    let scale = dpi as f32 / 96.0;
+    let width = client_width as f32 / scale;
+    let at = (point.x as f32 / scale, point.y as f32 / scale);
+    let caption = state.caption(hwnd);
+    match caption.hit(width, scale, at) {
         Some(CaptionButton::Minimize) => HTMINBUTTON,
         Some(CaptionButton::Maximize) => HTMAXBUTTON,
         Some(CaptionButton::Close) => HTCLOSE,
+        None if state.titlebar.get().native_drag_at(&caption, width, scale, at) => HTCAPTION,
         None => HTCLIENT,
     }
 }

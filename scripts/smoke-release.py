@@ -35,10 +35,43 @@ def run(*cmd, **kwargs):
     return subprocess.run(cmd, check=True, timeout=30, capture_output=True, text=True, **kwargs).stdout
 
 
+def check_windows_subsystems(bundle):
+    # Check the linker output, not the Rust source. The PE32/PE32+ optional
+    # headers both put Subsystem at offset 68, after the signature + COFF header.
+    for name in ('neochat-desktop', 'neoboard', 'neochat', 'neochatd', 'neochat-mcp', 'neochat-share'):
+        with bundle.open(name + '.exe') as exe:
+            if exe.read(2) != b'MZ':
+                raise ValueError(f'{name}: missing DOS header')
+            exe.seek(0x3c)
+            pe = int.from_bytes(exe.read(4), 'little')
+            exe.seek(pe)
+            if exe.read(4) != b'PE\0\0':
+                raise ValueError(f'{name}: missing PE header')
+            exe.seek(pe + 20)
+            size = int.from_bytes(exe.read(2), 'little')  # SizeOfOptionalHeader
+            exe.seek(pe + 24)
+            if size < 70 or exe.read(2) not in (b'\x0b\x01', b'\x0b\x02'):
+                raise ValueError(f'{name}: invalid PE optional header')
+            exe.seek(pe + 24 + 68)
+            field = exe.read(2)
+            if len(field) != 2:
+                raise ValueError(f'{name}: truncated PE subsystem')
+            actual = int.from_bytes(field, 'little')
+            expected = 2 if name == 'neochat-desktop' else 3  # WINDOWS_GUI / WINDOWS_CUI
+            if actual != expected:
+                raise ValueError(f'{name}: expected PE subsystem {expected}, got {actual}')
+
+
 def smoke_zip(archive):
     with tempfile.TemporaryDirectory() as tmp, zipfile.ZipFile(archive) as bundle:
         root = Path(tmp).resolve()
         suffix = '.exe' if os.name == 'nt' else ''
+        if os.name == 'nt':
+            check_windows_subsystems(bundle)
+            desktop = bundle.extract('neochat-desktop.exe', root)
+            help_text = subprocess.run([desktop, '--help'], check=True, capture_output=True, timeout=30).stdout
+            if b'--data-dir' not in help_text:
+                raise RuntimeError('GUI desktop lost redirected --help output')
         daemon, client = [root / (name + suffix) for name in ('neochatd', 'neochat')]
         for path in (daemon, client):
             info = bundle.getinfo(path.name)
@@ -101,9 +134,15 @@ def smoke_image(image):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode', choices=('zip', 'image'))
+    parser.add_argument('mode', choices=('zip', 'image', 'windows-pe'),
+                        help='windows-pe checks the Windows ZIP on any host without running a binary')
     parser.add_argument('artifact')
     args = parser.parse_args()
+    if args.mode == 'windows-pe':
+        with zipfile.ZipFile(args.artifact) as bundle:
+            check_windows_subsystems(bundle)
+        print('Verified Windows PE subsystems: desktop GUI (2); all five console tools CUI (3)')
+        raise SystemExit(0)
     try:
         (smoke_zip if args.mode == 'zip' else smoke_image)(args.artifact)
     except subprocess.CalledProcessError as exc:

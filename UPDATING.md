@@ -1,6 +1,16 @@
 # Updating a Neoboard release
 
-For a **manual update**, run `neoboard update` from the installed bundle to install the latest published release, even if it is the same version. Stop the desktop, daemon, sharing and MCP processes first. Keep board data outside the install directory; back it up before starting a new daemon version. The manual CLI does not start programs, migrate databases, or read tokens. Use a dedicated directory in a trusted, writable parent, not a shared `bin` directory, Cargo checkout or build tree. Don't run concurrent installers or modify the directory during an update.
+## Installer-managed desktop
+
+Open **Settings → Check for updates**. A newer stable release offers **Start MSI update** for the Windows x86-64 MSI installation in Program Files, or **Open release DMG** for the Apple Silicon `.app`. Dismiss makes no changes. Save drafts first; if you host a board, stop its daemon and back up the entire data directory while stopped. The installer does not back up board data for you.
+
+After confirmation, NeoBoard downloads the installer and its `.sha256` from the official GitHub release **for the displayed tag** and verifies the file before handing it off. On Windows, follow Windows Installer; on macOS, quit NeoBoard and drag the app from the mounted image to Applications. Starting the installer or opening the image is **not** confirmation that the update was installed. Reopen the installed desktop, check the version, restart your services and reconnect MCP clients. After finishing you can remove the temporary installer at the path shown (eject the DMG first on macOS).
+
+If the desktop cannot safely identify an updater for your installation, or the release does not list both the matching installer and checksum, **View release** opens the official page for the displayed version. This does not download or run an installer on your behalf.
+
+## Portable bundles
+
+For a **manual portable update**, run `neoboard update` from the installed bundle to install the latest published release, even if it is the same version. Stop the desktop, daemon, sharing and MCP processes first. Keep board data outside the install directory; back it up before starting a new daemon version. The manual CLI does not start programs, migrate databases, or read tokens. Use a dedicated directory in a trusted, writable parent, not a shared `bin` directory, Cargo checkout or build tree. Don't run concurrent installers or modify the directory during an update.
 
 **Linux x86-64 / Apple Silicon macOS:** the updater verifies and extracts into a sibling directory, then swaps the two directories with one filesystem operation. If the filesystem does not support atomic exchange, it fails rather than falling back to per-file replacement. Restart your processes from the normal path. The printed sibling path contains the complete previous bundle. For binary rollback, stop everything and launch from that directory instead. Keep the backup until the new release is confirmed; binary rollback is not a database restore.
 
@@ -18,7 +28,7 @@ The launcher starts the installed sibling `neochatd` on ephemeral loopback with 
 
 ## Release inputs and trust
 
-Only `https://github.com/parkers0405/neoboard/releases/latest/download/` is used as the release source (HTTPS redirects for GitHub's asset hosting). The filenames are `neoboard-linux-x86_64.zip`, `neoboard-darwin-aarch64.zip` and `neoboard-windows-x86_64.zip`, each with an appended `.sha256` sidecar. The sidecar must contain one hex SHA-256, optionally followed by the matching basename (GNU text or binary format). This detects damaged or mismatched downloads; it is not an independent publisher signature. If a release changes between requests and hashes differ, rerun the command.
+Managed installers use `https://github.com/parkers0405/neoboard/releases/download/<tag>/` with `NeoBoard-x86_64.msi` or `neoboard-darwin-aarch64.dmg` and the matching named checksum. Portable bundles use `https://github.com/parkers0405/neoboard/releases/latest/download/` (HTTPS redirects for GitHub's asset hosting). The portable filenames are `neoboard-linux-x86_64.zip`, `neoboard-darwin-aarch64.zip` and `neoboard-windows-x86_64.zip`, each with an appended `.sha256` sidecar. The portable sidecar must contain one hex SHA-256, optionally followed by the matching basename (GNU text or binary format). These checks detect damaged or mismatched downloads; they are not independent publisher signatures. If a release changes between requests and hashes differ, recheck for updates.
 
 Use a flat, single-disk, non-ZIP64 stored/deflated ZIP containing `neoboard`, `neochat`, `neochatd`, `neochat-share`, `neochat-mcp`, and `neochat-desktop` (all with `.exe` on Windows), plus `LICENSE`. The allowlist includes the packager's `MCP.md`, `LICENSE-Rune`, `LICENSE-winit`, and `OFL.GeistMono.txt`, and optional `README`, `README.md`, `LICENSE.txt`, `NOTICE`, `NOTICE.txt`. Coordinate new filenames before publishing. No nested paths, links, empty entries or duplicate names. Maximums: 1 KiB sidecar, 256 MiB ZIP, 16 entries, 192 MiB per entry and 512 MiB expanded total. Unknown files in the installed directory cause refusal rather than data removal.
 

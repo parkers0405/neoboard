@@ -2819,7 +2819,7 @@ dependencies = [
 
 [[package]]
 name = "neochat"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -2842,7 +2842,7 @@ dependencies = [
 
 [[package]]
 name = "neochat-desktop"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "base64 0.22.1",
  "dirs",
@@ -2853,7 +2853,9 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

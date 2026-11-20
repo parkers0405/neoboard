@@ -1,5 +1,9 @@
-//! One background check per launch. Only a local user action can release the worker to run the CLI.
-use std::{fs, io::Read, path::{Path, PathBuf}, process::{Command, Stdio}, sync::mpsc, time::Duration};
+//! A check only offers an action. Only local consent can release its worker.
+mod managed;
+pub use managed::Installer;
+use std::{fs, io::Read, path::{Path, PathBuf}, process::Stdio, sync::mpsc, time::Duration};
+#[cfg(unix)]
+use std::process::Command;
 use semver::Version;
 
 const LATEST: &str = "https://api.github.com/repos/parkers0405/neoboard/releases/latest";
@@ -7,43 +11,75 @@ const LIMIT: u64 = 256 * 1024;
 const HANDOFF: &str = "NEOBOARD_DESKTOP_UPDATE_HANDOFF";
 pub const RECONNECT: &str = "External MCP connections are not verified. Reconnect Neoboard in each MCP client to load the updated adapter.";
 
-fn managed_installer(exe: &Path) -> Option<&'static str> {
+// WiX installs in ProgramFiles64Folder/NeoBoard. Other Program Files paths
+// remain excluded from portable staging, but are not evidence of an MSI install.
+#[cfg(any(windows, test))]
+fn program_files_location(dir: &Path, root: &Path, x64: bool) -> Option<bool> {
+    let eq = |a: &Path, b: &Path| a == b || a.as_os_str().eq_ignore_ascii_case(b.as_os_str());
+    dir.ancestors().any(|p| eq(p, root)).then(|| x64 && eq(dir, &root.join("NeoBoard")))
+}
+
+#[cfg(windows)]
+fn in_program_files(dir: &Path) -> Option<bool> {
+    [("ProgramW6432", true), ("ProgramFiles", cfg!(target_pointer_width = "64")), ("ProgramFiles(x86)", false)]
+        .into_iter().filter_map(|(var, x64)| Some((PathBuf::from(std::env::var_os(var)?).canonicalize().ok()?, x64)))
+        .find_map(|(root, x64)| program_files_location(dir, &root, x64))
+}
+
+fn managed_installer(exe: &Path) -> Option<Installer> {
     let dir = exe.parent()?;
     // The DMG's signed app also contains all six portable executables.
-    if dir.ends_with("Contents/MacOS") && dir.ancestors().nth(2)?.extension().is_some_and(|s| s.eq_ignore_ascii_case("app")) {
-        return Some("Install the new NeoBoard.app from the release DMG.");
+    if cfg!(target_os = "macos") && dir.ends_with("Contents/MacOS") && dir.ancestors().nth(2)?.extension().is_some_and(|s| s.eq_ignore_ascii_case("app")) {
+        return Some(Installer::Dmg);
     }
     #[cfg(windows)]
-    for root in ["ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"].iter().filter_map(std::env::var_os) {
-        // current_exe was canonicalized and normally has a verbatim path prefix.
-        let root = PathBuf::from(root);
-        let normalized = root.canonicalize().unwrap_or_else(|_|root.clone());
-        if dir.ancestors().any(|a| [root.as_os_str(), normalized.as_os_str()].iter().any(|r| a.as_os_str().eq_ignore_ascii_case(r))) {
-            return Some("Run the new NeoBoard MSI to upgrade this managed installation.");
-        }
+    if in_program_files(dir) == Some(true) {
+        return Some(Installer::Msi);
     }
     None
 }
 
-fn stable_version(body: impl Read) -> Option<Version> {
+const RELEASES: &str = "https://github.com/parkers0405/neoboard/releases";
+
+struct Release { version: Version, v_prefix: bool, assets: Vec<String> }
+
+impl Release {
+    fn tag(&self) -> String { format!("{}{}", if self.v_prefix { "v" } else { "" }, self.version) }
+
+    fn offer(&self, action: Option<Update>) -> Stage {
+        match action {
+            Some(Update::Managed(installer)) if !installer.available(self) => (),
+            Some(action) => return Stage::Offer(self.version.clone(), action),
+            None => (),
+        }
+        // Never use html_url or browser_download_url supplied by release metadata.
+        Stage::ManualRelease(self.version.clone(), format!("{RELEASES}/tag/{}", self.tag()))
+    }
+}
+
+fn stable_release(body: impl Read) -> Option<Release> {
     #[derive(serde::Deserialize)]
-    struct Release { tag_name: String, draft: bool, prerelease: bool }
+    struct Metadata { tag_name: String, draft: bool, prerelease: bool, #[serde(default)] assets: Vec<Asset> }
+    #[derive(serde::Deserialize)]
+    struct Asset { name: String }
     let mut data = Vec::new();
     body.take(LIMIT + 1).read_to_end(&mut data).ok()?;
     if data.len() as u64 > LIMIT { return None; }
-    let release: Release = serde_json::from_slice(&data).ok()?;
+    let release: Metadata = serde_json::from_slice(&data).ok()?;
     let tag = release.tag_name.strip_prefix('v').unwrap_or(&release.tag_name);
     let version = Version::parse(tag).ok()?;
-    (!release.draft && !release.prerelease && version.pre.is_empty()).then_some(version)
+    (!release.draft && !release.prerelease && version.pre.is_empty()).then_some(Release {
+        version, v_prefix: release.tag_name.starts_with('v'), assets: release.assets.into_iter().map(|a| a.name).collect(),
+    })
 }
 
-fn latest() -> Option<Version> {
+fn latest() -> Option<Release> {
     let client = reqwest::blocking::Client::builder().https_only(true)
         .redirect(reqwest::redirect::Policy::none()).timeout(Duration::from_secs(8))
         .user_agent(concat!("neoboard-desktop/", env!("CARGO_PKG_VERSION"))).build().ok()?;
     let response = client.get(LATEST).send().ok()?;
     if response.status() != reqwest::StatusCode::OK { return None; }
-    stable_version(response)
+    stable_release(response)
 }
 
 fn binary(name: &str) -> String { format!("{name}{}", std::env::consts::EXE_SUFFIX) }
@@ -51,6 +87,8 @@ fn binary(name: &str) -> String { format!("{name}{}", std::env::consts::EXE_SUFF
 fn package_cli(exe: &Path) -> Option<PathBuf> {
     let dir = exe.parent()?;
     if managed_installer(exe).is_some() { return None; }
+    #[cfg(windows)]
+    if in_program_files(dir).is_some() { return None; }
     if !exe.is_absolute() || exe.file_name()?.to_str()? != binary("neochat-desktop") { return None; }
     for parent in dir.ancestors() {
         for marker in [".git", "Cargo.toml", ".rustc_info.json"] {
@@ -92,12 +130,8 @@ fn install(exe: &Path) -> Result<String, String> {
     let old = fs::metadata(exe).map_err(|e| e.to_string())?;
     #[cfg(unix)]
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-    let mut command = Command::new(cli);
+    let mut command = crate::background_process::command(cli);
     command.arg("update").current_dir(exe.parent().unwrap()).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
-    #[cfg(windows)] {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x08000000); // CREATE_NO_WINDOW
-    }
     let mut child = command.spawn().map_err(|e| format!("Could not run the updater: {e}"))?;
     // The CLI prints its verified staging/backup path and manual restart steps to stderr.
     // Drain the entire pipe without waiting on the UI or retaining an unbounded log.
@@ -130,8 +164,30 @@ fn install(exe: &Path) -> Result<String, String> {
     #[cfg(not(unix))] { Ok(diagnostic) }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Update { Portable, Managed(Installer) }
+
+impl Update {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Managed(Installer::Msi) => "Start MSI update",
+            Self::Managed(Installer::Dmg) => "Open release DMG",
+            Self::Portable if cfg!(unix) => "Update and reopen",
+            Self::Portable => "Stage update",
+        }
+    }
+    pub fn instructions(self) -> &'static str {
+        match self {
+            Self::Managed(Installer::Msi) => "Save your work. If you host a board, stop its daemon and back up the entire data directory first. Start the update to download and verify the MSI, then follow Windows Installer.",
+            Self::Managed(Installer::Dmg) => "Save your work. If you host a board, stop its daemon and back up the entire data directory first. Open the verified disk image, quit NeoBoard and drag the new app to Applications.",
+            Self::Portable if cfg!(unix) => "Finish your drafts first. Updating will reopen the installed desktop. Reconnect external MCP clients after updating.",
+            Self::Portable => "The update will stage a separate bundle. Switch paths and reconnect external MCP clients manually.",
+        }
+    }
+}
+
 #[derive(Default)]
-pub enum Stage { #[default] Hidden, Checking, Notice(String), Offer(Version), Running, Finished(Result<String, String>) }
+pub enum Stage { #[default] Hidden, Checking, Notice(String), ManualRelease(Version, String), Offer(Version, Update), Running, HandedOff(Installer, String), Finished(Result<String, String>) }
 
 #[derive(Default)]
 pub struct Session {
@@ -145,8 +201,9 @@ pub struct Session {
 
 impl Session {
     pub fn start(&mut self, fixture: bool, wake: rune::Waker) {
+        if fixture { return; }
         self.wake = Some(wake.clone());
-        if fixture || cfg!(any(test, debug_assertions)) || self.started { return; }
+        if cfg!(any(test, debug_assertions)) || self.started { return; }
         self.started = true;
         if let Ok(detail) = std::env::var(HANDOFF) {
             self.stage = Stage::Notice(format!("Desktop {} reopened. {RECONNECT}\n\n{detail}", env!("CARGO_PKG_VERSION")));
@@ -168,20 +225,30 @@ impl Session {
             if !manual && exe.is_none() && managed.is_none(){return None;}
             let current=Version::parse(env!("CARGO_PKG_VERSION")).ok()?;
             let latest = latest();
-            if !manual && !latest.as_ref().is_some_and(|v| v.cmp_precedence(&current).is_gt()) { return None; }
-            let stage=match latest {
-                Some(v) if v.cmp_precedence(&current).is_gt() && exe.is_some()=>Stage::Offer(v),
-                Some(v) if v.cmp_precedence(&current).is_gt() && managed.is_some()=>Stage::Notice(format!("Version {v} is available. {} {RECONNECT}", managed.unwrap())),
-                Some(v) if v.cmp_precedence(&current).is_gt()=>Stage::Notice(format!("Version {v} is available. This development build cannot update itself.")),
+            if !manual && !latest.as_ref().is_some_and(|r| r.version.cmp_precedence(&current).is_gt()) { return None; }
+            let action = match (std::env::consts::OS, std::env::consts::ARCH, managed) {
+                ("macos", "aarch64", _) | ("windows" | "linux", "x86_64", _) =>
+                    managed.map(Update::Managed).or_else(||exe.as_ref().map(|_|Update::Portable)),
+                _ => None,
+            };
+            let stage=match &latest {
+                Some(r) if r.version.cmp_precedence(&current).is_gt() => r.offer(action),
                 Some(_) => Stage::Notice(format!("You're up to date (version {current}).")),
                 None => Stage::Notice("Couldn't check GitHub Releases. Check your connection and try again.".into()),
             };
-            let offered=matches!(stage,Stage::Offer(_));
+            let offered=matches!(stage,Stage::Offer(..));
             send.send(stage).ok()?;
             wake();
             if !offered{return None;}
             wait.recv().ok()?;
-            send.send(Stage::Finished(install(&exe?))).ok()?;
+            let result = match action? {
+                Update::Portable => Stage::Finished(install(&exe?)),
+                Update::Managed(installer) => match installer.start(&latest?) {
+                    Ok(detail) => Stage::HandedOff(installer, detail),
+                    Err(e) => Stage::Finished(Err(e.to_string())),
+                },
+            };
+            send.send(result).ok()?;
             wake();
             Some(())
         });
@@ -189,7 +256,7 @@ impl Session {
         else if manual {self.stage=Stage::Notice("Could not start the update check.".into());}
     }
     pub fn accept(&mut self) {
-        if !matches!(self.stage, Stage::Offer(_)) { return; }
+        if !matches!(self.stage, Stage::Offer(..)) { return; }
         self.stage = if self.consent.take().is_some_and(|tx| tx.send(()).is_ok()) { Stage::Running }
             else { Stage::Finished(Err("No packaged updater is available.".into())) };
     }
@@ -228,9 +295,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn only_wix_folder_gets_the_msi_action() {
+        let root = Path::new("Program Files");
+        assert_eq!(program_files_location(&root.join("neoboard"), root, true), Some(true));
+        for other in ["", "Other", "NeoBoard/portable"] {
+            assert_eq!(program_files_location(&root.join(other), root, true), Some(false));
+        }
+        assert_eq!(program_files_location(&root.join("NeoBoard"), root, false), Some(false));
+        assert_eq!(program_files_location(Path::new("portable/NeoBoard"), root, true), None);
+    }
+
+    #[test]
+    fn missing_asset_or_unsupported_build_only_links_to_the_offered_release() {
+        let mut release = stable_release(br#"{"tag_name":"v2.0.0","draft":false,"prerelease":false,"html_url":"https://example.org/wrong"}"#.as_slice()).unwrap();
+        let msi = Some(Update::Managed(Installer::Msi));
+        let mut app = crate::App::new();
+        crate::fixture::load(&mut app, true);
+        app.dialog = Some(crate::Dialog::Settings);
+        release.assets.push("NeoBoard-x86_64.msi".into());
+        app.release.stage = release.offer(msi); // missing checksum
+        let mut rt = rune::Runtime::new(app, crate::view::root, (760., 520.), rune::Env::new(true, 1.));
+        for _ in 0..5 { rt.frame(1./60.); }
+        assert!(rt.find("start-update").is_none());
+        assert!(rt.take_url_requests().is_empty());
+        let (x,y) = rt.find("view-release").unwrap();
+        rt.pointer_move(x,y); rt.pointer_down(x,y); rt.pointer_up(x,y); rt.frame(1./60.);
+        assert_eq!(rt.take_url_requests(), ["https://github.com/parkers0405/neoboard/releases/tag/v2.0.0"]);
+        release.assets.push("NeoBoard-x86_64.msi.sha256".into());
+        assert!(matches!(release.offer(msi), Stage::Offer(_, Update::Managed(Installer::Msi))));
+        assert!(matches!(release.offer(None), Stage::ManualRelease(..)));
+        assert!(matches!(release.offer(Some(Update::Portable)), Stage::Offer(_, Update::Portable)));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn signed_app_uses_managed_installer() {
         let exe = Path::new("/Applications/Renamed.app/Contents/MacOS/neochat-desktop");
-        assert!(managed_installer(exe).unwrap().contains("DMG"));
+        assert_eq!(managed_installer(exe), Some(Installer::Dmg));
         assert!(package_cli(exe).is_none());
     }
 
@@ -287,12 +388,12 @@ mod tests {
             ("latest", false, false, false),
         ] {
             let json = serde_json::json!({"tag_name": tag, "draft":draft, "prerelease":prerelease}).to_string();
-            assert_eq!(stable_version(json.as_bytes()).is_some_and(|v|v.cmp_precedence(&current).is_gt()), offer, "{tag}");
+            assert_eq!(stable_release(json.as_bytes()).is_some_and(|r|r.version.cmp_precedence(&current).is_gt()), offer, "{tag}");
         }
         let valid = br#"{"tag_name":"v2.0.0","draft":false,"prerelease":false}"#;
         let mut oversized = valid.to_vec();
         oversized.resize(LIMIT as usize + 1, b' ');
-        assert!(stable_version(&oversized[..]).is_none());
+        assert!(stable_release(&oversized[..]).is_none());
     }
 
     #[test]
@@ -301,18 +402,26 @@ mod tests {
         app.draft = crate::edit("unsent");
         let (approve, rx) = mpsc::channel();
         app.release.consent = Some(approve);
-        app.release.stage = Stage::Offer(Version::new(2,0,0));
+        app.release.stage = Stage::Offer(Version::new(2,0,0), Update::Managed(Installer::Msi));
         app.release.dismiss();
         assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Disconnected)));
         assert!(matches!(app.release.stage, Stage::Hidden));
         let (approve, rx) = mpsc::channel();
         app.release.consent = Some(approve);
-        app.release.stage = Stage::Offer(Version::new(2,0,0));
-        app.release.accept();
-        app.release.accept();
+        app.release.stage = Stage::Offer(Version::new(2,0,0), Update::Managed(Installer::Msi));
+        // Exercise Rune hit testing with Settings still open beneath the offer.
+        app.dialog = Some(crate::Dialog::Settings);
+        crate::fixture::load(&mut app, true);
+        let mut rt = rune::Runtime::new(app, crate::view::root, (760., 520.), rune::Env::new(true, 1.));
+        for _ in 0..5 { rt.frame(1./60.); }
+        assert!(rx.try_recv().is_err());
+        let (x,y) = rt.find("start-update").unwrap();
+        rt.pointer_move(x,y); rt.pointer_down(x,y); rt.pointer_up(x,y); rt.frame(1./60.);
         assert_eq!(rx.try_iter().count(), 1);
-        assert!(matches!(app.release.stage, Stage::Running));
-        assert_eq!(app.draft.text, "unsent");
+        rt.state.release.accept();
+        assert_eq!(rx.try_iter().count(), 0);
+        assert!(matches!(rt.state.release.stage, Stage::Running));
+        assert_eq!(rt.state.draft.text, "unsent");
     }
 
     #[cfg(unix)]

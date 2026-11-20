@@ -205,7 +205,12 @@ impl Writer {
         if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
             std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         }
-        let child = std::process::Command::new("ffmpeg").args(&args)
+        let mut encoder = std::process::Command::new("ffmpeg");
+        #[cfg(windows)] {
+            use std::os::windows::process::CommandExt;
+            encoder.creation_flags(0x0800_0000); // CREATE_NO_WINDOW; frames still go through stdin.
+        }
+        let child = encoder.args(&args)
             .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::null())
             .spawn().map_err(|e| match e.kind() {
                 std::io::ErrorKind::NotFound => "--video needs ffmpeg on PATH (macOS: brew install ffmpeg; Debian/Ubuntu: apt install ffmpeg)".to_owned(),

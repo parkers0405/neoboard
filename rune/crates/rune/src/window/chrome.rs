@@ -37,10 +37,10 @@ pub(super) fn frame_chrome(chrome: Chrome, titlebar: Option<crate::Titlebar>, se
 pub(super) fn sync_chrome<S: 'static>(rt: &mut Runtime<S>, w: &Win, chrome: Chrome, titlebar: Option<crate::Titlebar>) {
     let leading = place_chrome(&w.window, frame_chrome(chrome, titlebar, rt.titlebar_set()));
     rt.set_titlebar_inset(leading);
-    let height = titlebar.map(|t| rt.titlebar_set().over(t).height());
-    let caption = caption(w, height);
+    let titlebar = titlebar.map(|t| rt.titlebar_set().over(t));
+    let caption = caption(w, titlebar);
     let scale = w.window.scale_factor() as f32;
-    let height = height.filter(|_| custom_frame(w)).unwrap_or(0.0);
+    let height = titlebar.filter(|_| custom_frame(w)).map_or(0.0, |t| t.height());
     rt.set_chrome_insets(crate::ChromeInsets::new(leading, caption.map_or(0.0, |c| c.width(scale)), height));
     rt.set_caption(caption);
 }
@@ -57,14 +57,14 @@ fn custom_frame(w: &Win) -> bool {
 }
 
 /// The caption buttons a custom frame draws `height` points tall; none in full screen.
-fn caption(w: &Win, height: Option<f32>) -> Option<crate::titlebar::Caption> {
+fn caption(w: &Win, titlebar: Option<crate::Titlebar>) -> Option<crate::titlebar::Caption> {
     #[cfg(target_os = "windows")]
     return w.native.frame.as_ref().map(|f| {
-        if let Some(h) = height { f.set_height(h); }
+        if let Some(t) = titlebar { f.set_titlebar(t); }
         f.caption(&w.window)
     });
     #[cfg(not(target_os = "windows"))]
-    { let _ = (w, height); None }
+    { let _ = (w, titlebar); None }
 }
 
 /// A double click on a titlebar: AppKit's action on macOS, else maximize or restore, as the

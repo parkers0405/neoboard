@@ -30,8 +30,10 @@ pub fn local_name(fixture: bool) -> String {
     let host = std::fs::read_to_string("/proc/sys/kernel/hostname")
         .or_else(|_| std::fs::read_to_string("/etc/hostname")).ok()
         .or_else(|| std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).ok())
-        .or_else(|| std::process::Command::new("hostname").output().ok().filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned()));
+        .or_else(|| {
+            crate::background_process::command("hostname").output().ok().filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        });
     choose_name([env.as_deref(), configured, host.as_deref()])
 }
 

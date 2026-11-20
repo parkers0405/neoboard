@@ -773,8 +773,10 @@ fn update_layer(app: &App, viewport: [f32; 2]) -> Option<El> {
         Stage::Hidden => return None,
         Stage::Checking => ("Checking for updates", "Contacting GitHub Releases…".into()),
         Stage::Notice(detail) => ("Check for updates",detail.clone()),
-        Stage::Offer(version) => ("Update available", format!("Neoboard {version} is available. {} {}", if cfg!(unix) { "Finish your drafts first. Updating will reopen the installed desktop." } else { "The update will stage a separate bundle." }, release_update::RECONNECT)),
-        Stage::Running => ("Updating Neoboard", "The packaged updater is running. It does not report download progress.".into()),
+        Stage::ManualRelease(version, _) => ("Update available", format!("Neoboard {version} is available. No automatic update is available for this installation. View the official release for manual options. Before upgrading a host, stop its daemon and back up the entire data directory.")),
+        Stage::Offer(version, action) => ("Update available", format!("Neoboard {version} is available. {}", action.instructions())),
+        Stage::Running => ("Preparing update", "The updater is working. It does not report progress.".into()),
+        Stage::HandedOff(installer, detail) => (match installer { release_update::Installer::Msi => "Windows Installer started", release_update::Installer::Dmg => "Disk image opened" }, format!("Finish the upgrade outside NeoBoard. Installation is not confirmed. {}\n\n{detail}", release_update::RECONNECT)),
         Stage::Finished(Ok(detail)) if cfg!(windows) => ("Update staged", format!("Your running installation has not been replaced. After switching, point MCP clients to the new bundle. {}\n\n{detail}", release_update::RECONNECT)),
         Stage::Finished(Ok(detail)) => ("Updater finished", format!("Finish your drafts before restarting Neoboard and its services.\n\n{detail}")),
         Stage::Finished(Err(error)) => ("Update not confirmed", format!("{error}\n\nKeep your drafts. Check the installation before retrying. {}", release_update::RECONNECT)),
@@ -785,8 +787,13 @@ fn update_layer(app: &App, viewport: [f32; 2]) -> Option<El> {
             .child(el().absolute(112.*app.release.pulse,0.).w(48.).h(5.).radius(2.).fill(gray(200))));
     } else {
         let mut actions = row().gap(8.).child(dialog_action(button("Dismiss", |a| a.release.dismiss())));
-        if matches!(app.release.stage, Stage::Offer(_)) {
-            actions = actions.child(dialog_action(button(if cfg!(unix) { "Update and reopen" } else { "Stage update" }, |a| a.release.accept())));
+        if let Stage::Offer(_, action) = app.release.stage {
+            actions = actions.child(dialog_action(button(action.label(), |a| a.release.accept()).key("start-update")));
+        } else if let Stage::ManualRelease(_, url) = &app.release.stage {
+            let url = url.clone();
+            actions = actions.child(dialog_action(button("View release", |_| {}).key("view-release").on_press_tx(move |a: &mut App, tx| {
+                if let Err(e) = tx.open_url(&url) { a.release.stage = Stage::Notice(format!("Could not open {url}: {e}")); }
+            })));
         }
         body = body.child(actions);
     }
@@ -804,10 +811,17 @@ pub fn root(app: &App, cx: &mut Cx<App>) -> El {
         row().key("titlebar").w_full().h(height).fill(gray(26)).items_center().window_drag()
             .border_sides([0.0, 0.0, 1.0, 0.0], gray(28))
     });
-    let shell = col().w_full().h_full().fill(gray(0)).children(titlebar);
+    let shell = col().w_full().h_full().fill(gray(0));
+    // Rune modals block earlier hit targets. Reserve the usual band but place its native
+    // drag target above onboarding, leaving the board behind the modal and out of reach.
+    let (shell, onboarding_chrome) = if app.onboarding_visible() && matches!(app.release.stage, release_update::Stage::Hidden) {
+        (shell.pt(height), titlebar.map(|bar| bar.absolute(0., 0.)))
+    } else {
+        (shell.children(titlebar), None)
+    };
     if first_run {
         let content = el().w_full().h_full().child(onboarding_layer(app, viewport)).children(update_layer(app, viewport));
-        return shell.child(zoom::wrap(app, cx, content));
+        return shell.child(zoom::wrap(app, cx, content)).children(onboarding_chrome);
     }
     app.profiles.begin_view();
     let mut main = col().key("main").w(0.0).grow(1.0).h_full().clip_soft(0.0).child(header(app)).child(line());
@@ -908,7 +922,7 @@ pub fn root(app: &App, cx: &mut Cx<App>) -> El {
     let menu = if matches!(app.release.stage, release_update::Stage::Hidden) && app.project_menu && app.sidebar && (app.width >= 900.0 || app.thread.is_none()) {
         cx.layout("projects-toggle").map(|[x, y, _, h]| board_menu(app, x, y + h - height, viewport, height))
     } else { None };
-    shell.child(zoom::wrap(app, cx, root)).children(menu)
+    shell.child(zoom::wrap(app, cx, root)).children(menu).children(onboarding_chrome)
 }
 
 fn status_name(index: usize) -> String {

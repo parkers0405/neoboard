@@ -10,6 +10,8 @@
 use crate::Chrome;
 
 mod caption;
+#[cfg(any(target_os = "windows", test))]
+mod empty_band;
 
 pub(crate) use caption::{BUTTONS_KEY, FRAME_KEY, frame};
 
@@ -32,6 +34,7 @@ pub(crate) use caption::{BUTTONS_KEY, FRAME_KEY, frame};
 pub struct Titlebar {
     height: f32,
     traffic_lights: Option<(f32, f32)>,
+    empty_caption_band: bool,
 }
 
 impl Titlebar {
@@ -39,7 +42,21 @@ impl Titlebar {
     pub const CAPTION_BUTTON_WIDTH: f32 = 46.0;
 
     pub const fn new(height: f32) -> Self {
-        Self { height, traffic_lights: None }
+        Self { height, traffic_lights: None, empty_caption_band: false }
+    }
+
+    /// Windows: let the system move the window directly from the band, even when a view
+    /// modal owns client input. Use only for a dedicated band with no app controls or
+    /// overlays; titlebars with interactive content should use `.window_drag()` instead.
+    pub const fn empty_caption_band(mut self) -> Self {
+        self.empty_caption_band = true;
+        self
+    }
+
+    #[cfg(any(target_os = "windows", test))]
+    pub(crate) fn native_drag_at(&self, caption: &Caption, width: f32, scale: f32, (x, y): (f32, f32)) -> bool {
+        self.empty_caption_band && !caption.hidden
+            && empty_band::contains(width, self.height, caption.width(scale), (x, y))
     }
 
     /// macOS: the close button's top-left, in points from the window's top-left, for this
@@ -202,5 +219,30 @@ impl Caption {
     /// Points the buttons take from the trailing edge at `scale`.
     pub(crate) fn width(&self, scale: f32) -> f32 {
         caption::size(self.height, scale).0 * self.buttons().len() as f32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_an_empty_caption_band_claims_native_drag() {
+        let title = Titlebar::new(30.0);
+        let band = title.empty_caption_band();
+        let mut caption = Caption::new(30.0);
+        caption.minimizable = false; // Dimmed, but still occupies the first button slot.
+        for scale in [1.0, 1.25, 2.0] {
+            let start = 800.0 - caption.width(scale);
+            assert!(!title.native_drag_at(&caption, 800.0, scale, (100.0, 20.0)));
+            assert!(band.native_drag_at(&caption, 800.0, scale, (start - 1.0, 20.0)));
+            assert!(!band.native_drag_at(&caption, 800.0, scale, (100.0, 30.0)));
+            for (button, [x, _, _, _]) in caption.rects(800.0, scale) {
+                assert!(!band.native_drag_at(&caption, 800.0, scale, (x, 20.0)));
+                assert_eq!(caption.hit(800.0, scale, (x, 20.0)), caption.enabled(button).then_some(button));
+            }
+        }
+        caption.hidden = true;
+        assert!(!band.native_drag_at(&caption, 800.0, 1.0, (100.0, 20.0)));
     }
 }

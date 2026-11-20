@@ -1,6 +1,6 @@
 [package]
 name = "neochat"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 license = "MIT"
 
@@ -8,6 +8,7 @@ license = "MIT"
 
 [dependencies]
 axum = "0.8"
+base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
 dirs = "6"
 opentunnel = "=0.5.1"

@@ -50,11 +50,14 @@ pub struct Task {
     #[serde(default,skip_serializing_if="Option::is_none")]
     pub result: Option<String>,
     pub expires_at: Option<u64>,
+    /// First explicit start of this task or one of its subtasks, independent of lease ownership.
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    pub started_at: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum TaskState { Ready, Waiting, Claimed, Blocked, Completed, Failed, Canceled }
+pub enum TaskState { Ready, Waiting, Claimed, InProgress, Blocked, Completed, Failed, Canceled }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, clap::ValueEnum, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -137,6 +140,7 @@ pub enum Action {
     /// Host only. Board namespace roots and their default general channel are protected.
     DeleteChannel { channel: String },
     Claim { id: u64, lease_secs: u64 },
+    Start { id: u64 },
     ClaimNext { channel: String, #[serde(default)] labels: BTreeMap<String, String>, #[serde(default)] assignment: ClaimAssignment, lease_secs: u64 },
     Renew { id: u64, lease_secs: u64 },
     /// Creator manages unleased work; a live lease holder may hand off their own
@@ -159,6 +163,7 @@ pub enum Action {
     SetLabels { id: u64, labels: BTreeMap<String, String> },
     React { id: u64, reaction: String, #[serde(default)] remove: bool },
     Schedule { channel: String, text: String, publish_at: u64, #[serde(default)] labels: BTreeMap<String, String> },
+    ScheduleFollowup { thread: u64, text: String, publish_at: u64, #[serde(default)] internal_only: bool, #[serde(default)] labels: BTreeMap<String, String> },
     CancelSchedule { id: u64 },
 }
 
@@ -206,7 +211,7 @@ pub struct Reaction {
     pub reaction: String,
 }
 
-/// Pending scheduled posts belonging to the requesting credential only.
+/// A credential's pending post or retained private reminder.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScheduledPost {
     pub id: u64,
@@ -215,6 +220,9 @@ pub struct ScheduledPost {
     pub text: String,
     pub labels: BTreeMap<String, String>,
     pub publish_at: u64,
+    #[serde(default)] pub thread: Option<u64>,
+    #[serde(default)] pub internal_only: bool,
+    #[serde(default)] pub fired: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -229,7 +237,7 @@ pub enum Grant {
     CreateSprint, FinishSprint,
     #[value(skip)] CreateArea,
     #[value(skip)] SetAreaOwner,
-    AcknowledgeTask, CreateChannel, Claim, ClaimNext, Renew, Assign, Block, Unblock,
+    AcknowledgeTask, CreateChannel, Claim, ClaimNext, Start, Renew, Assign, Block, Unblock,
     Complete, Fail, Cancel, Edit, DeleteThread, SetLabels, React, Schedule, CancelSchedule,
 }
 impl Action {
@@ -250,6 +258,7 @@ impl Action {
             CreateChannel { .. } => Grant::CreateChannel,
             Claim { .. } => Grant::Claim,
             ClaimNext { .. } => Grant::ClaimNext,
+            Start { .. } => Grant::Start,
             Renew { .. } => Grant::Renew,
             Assign { .. } => Grant::Assign,
             Block { .. } => Grant::Block,
@@ -261,7 +270,7 @@ impl Action {
             DeleteThread { .. } => Grant::DeleteThread,
             SetLabels { .. } => Grant::SetLabels,
             React { .. } => Grant::React,
-            Schedule { .. } => Grant::Schedule,
+            Schedule { .. } | ScheduleFollowup { .. } => Grant::Schedule,
             CancelSchedule { .. } => Grant::CancelSchedule,
         })
     }

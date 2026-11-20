@@ -179,6 +179,12 @@ fn cli_and_client_share_durable_board_with_scoped_guest_access() {
     let task = cli(dir, &["tasks", "create", "dev", "Review the release"]);
     assert_eq!(cli(dir, &["tasks", "claim-next", "dev", "--label", "missing=yes"]), "");
     assert_eq!(cli(dir, &["--as", "coder", "tasks", "claim-next", "dev", "--assignment", "unassigned"]), task);
+    let progress = || cli(dir, &["--json", "tasks", "list", "--state", "in_progress"]);
+    assert_eq!(progress(), "[]");
+    cli(dir, &["--as", "coder", "tasks", "start", &task]);
+    let rows: serde_json::Value = serde_json::from_str(&progress()).unwrap();
+    assert_eq!(rows[0]["id"], task.parse::<u64>().unwrap());
+    assert_eq!(rows[0]["task"]["state"], "in_progress");
     cli(dir, &["--as", "coder", "tasks", "complete", &task, "Approved"]);
     let snapshot = client.snapshot().unwrap();
     assert!(snapshot.messages.iter().any(|m| m.text == "Reviewing" && m.parent == Some(root.parse().unwrap())));

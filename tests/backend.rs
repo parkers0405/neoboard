@@ -24,6 +24,82 @@ fn post(channel:&str,text:&str,task:bool,needs:Vec<u64>)->Action {
 }
 
 #[test]
+fn start_rollup_preserves_parent_constraints_and_leases() {
+    let f=Fixture::new();
+    let worker=f.invite("worker",vec!["general".into()]);
+    let dependency=f.post("prerequisite",true,vec![]);
+    for expected in [TaskState::Waiting,TaskState::Blocked,TaskState::Completed,TaskState::InProgress] {
+        let parent=f.post("parent",true,if expected==TaskState::Waiting {vec![dependency]} else {vec![]});
+        let id=f.action(Action::PostTask {channel:"general".into(),text:"child".into(),labels:Default::default(),
+            needs:vec![],assignee:None,area:None,parent:Some(parent),global:false}).id.unwrap();
+        match expected {
+            TaskState::Blocked => { f.action(Action::Block {id:parent,text:"paused".into()}); }
+            TaskState::Completed => {
+                f.action(Action::Claim {id:parent,lease_secs:60});
+                f.action(Action::CompleteAnyway {id:parent,text:String::new()});
+            }
+            TaskState::InProgress => { f.action(Action::Claim {id:parent,lease_secs:60}); }
+            _ => {}
+        }
+        let before=f.state(parent);
+        f.board.action(&worker.token,None,None,Action::Claim {id,lease_secs:60}).unwrap();
+        f.board.action(&worker.token,None,None,Action::Start {id}).unwrap();
+        let after=f.state(parent);
+        assert!(after.started_at.is_some());
+        assert_eq!((after.state,after.owner,after.expires_at),(expected,before.owner,before.expires_at));
+        assert!(f.board.action(&worker.token,None,None,Action::Claim {id:parent,lease_secs:60}).is_err());
+    }
+}
+
+#[test]
+fn explicit_start_survives_expiry_restart_and_reclaim() {
+    let mut f=Fixture::new();
+    let worker=f.invite("worker",vec!["general".into()]);
+    let parent=f.post("parent",true,vec![]);
+    let child=|title:&str| f.action(Action::PostTask {
+        channel:"general".into(), text:title.into(), labels:BTreeMap::from([("name".into(),title.into())]),
+        needs:vec![], assignee:None, area:None, parent:Some(parent), global:false,
+    }).id.unwrap();
+    let id=child("work"); let sibling=child("sibling"); let untouched=f.state(sibling);
+    let start=|| serde_json::from_value(serde_json::json!({"type":"start","id":id})).unwrap();
+    let next=|| Action::ClaimNext {channel:"general".into(),labels:BTreeMap::from([("name".into(),"work".into())]),assignment:ClaimAssignment::Eligible,lease_secs:60};
+    assert!(f.board.action(&f.token,None,None,start()).is_err());
+    f.action(Action::Claim {id,lease_secs:60});
+    let lease=f.state(id); assert_eq!((lease.state,lease.started_at),(TaskState::Claimed,None));
+    assert!(f.board.action(&worker.token,None,None,start()).is_err());
+    let cursor=f.action(start()).cursor;
+    assert_eq!(f.action(start()).cursor,cursor);
+    let started=f.state(id); let at=started.started_at.unwrap();
+    assert_eq!(serde_json::to_value(&started).unwrap()["state"],"in_progress");
+    assert_eq!((started.owner,started.expires_at),(lease.owner,lease.expires_at));
+    let rolled=f.state(parent);
+    assert_eq!((rolled.state,rolled.started_at,rolled.owner,rolled.expires_at),(TaskState::InProgress,Some(at),None,None));
+    assert_eq!(f.state(sibling),untouched);
+    assert_eq!(f.action(next()).id,None);
+    f.action(Action::Renew {id,lease_secs:1});
+    std::thread::sleep(Duration::from_millis(1100));
+    f.board=Board::open(f.dir.path().join("board.sqlite3"),&f.token,&f.admin).unwrap();
+    assert!(f.board.action(&f.token,None,None,start()).is_err());
+    let expired=f.state(id);
+    assert_eq!((expired.state,expired.started_at,expired.owner,expired.expires_at),(TaskState::InProgress,Some(at),None,None));
+    assert_eq!(f.board.action(&worker.token,None,None,next()).unwrap().id,Some(id));
+    assert!(f.board.action(&f.token,None,None,Action::Renew {id,lease_secs:30}).is_err());
+    f.board.action(&worker.token,None,None,Action::Renew {id,lease_secs:30}).unwrap();
+    f.board.action(&worker.token,None,None,Action::Complete {id,text:String::new()}).unwrap();
+    assert_eq!((f.state(id).state,f.state(id).started_at),(TaskState::Completed,Some(at)));
+    assert_eq!(f.state(sibling),untouched);
+    f.action(Action::Block {id:parent,text:"pause".into()});
+    assert_eq!(f.state(parent).state,TaskState::Blocked);
+    assert!(f.board.action(&f.token,None,None,Action::Claim {id:parent,lease_secs:60}).is_err());
+    f.action(Action::Unblock {id:parent});
+    assert_eq!(f.state(parent).state,TaskState::InProgress);
+    f.action(Action::Claim {id:parent,lease_secs:60});
+    assert!(f.board.action(&f.token,None,None,Action::Complete {id:parent,text:String::new()}).is_err());
+    f.action(Action::Fail {id:parent,text:String::new()});
+    assert_eq!((f.state(parent).state,f.state(parent).started_at),(TaskState::Failed,Some(at)));
+}
+
+#[test]
 fn tagged_reply_is_atomic_scoped_and_keeps_legacy_reply() {
     let f=Fixture::new();
     let root=f.post("root",false,vec![]);
@@ -163,6 +239,46 @@ fn edits_labels_reactions_and_cancel() {
     assert!(f.board.reactions(&f.token).unwrap().is_empty());
     let m=f.board.snapshot(&f.token).unwrap().messages.remove(0);
     assert_eq!(m.text,"edited"); assert_eq!(m.labels["priority"],"high"); assert_eq!(m.task.unwrap().state,TaskState::Canceled);
+}
+
+#[test]
+fn scheduled_followups_survive_restart_and_keep_private_reminders_off_board() {
+    let f=Fixture::new(); let root=f.post("original",false,vec![]);
+    let worker=f.invite("worker",vec!["general".into()]);
+    let due=now()+2;
+    let schedule=|text:&str, internal_only| Action::ScheduleFollowup { thread:root,text:text.into(),publish_at:due,internal_only,labels:BTreeMap::new() };
+    let act=|action| f.board.action(&worker.token,None,None,action).unwrap().id.unwrap();
+    let before=f.board.snapshot(&f.token).unwrap().cursor;
+    let private=act(schedule("private",true));
+    let canceled=act(schedule("cancel me",true)); act(Action::CancelSchedule { id:canceled });
+    assert!(f.board.events(&f.token,before).unwrap().is_empty());
+    assert!(f.board.action(&f.token,None,None,Action::CancelSchedule { id:private }).is_err());
+    act(schedule("reply",false));
+    assert!(f.board.schedules(&worker.token).unwrap().iter().all(|s| s.thread==Some(root) && !s.fired));
+    drop(f.board); std::thread::sleep(Duration::from_millis(2100));
+    let board=Board::open(f.dir.path().join("board.sqlite3"),&f.token,&f.admin).unwrap();
+    board.tick().unwrap(); board.tick().unwrap();
+    let snapshot=board.snapshot(&f.token).unwrap(); assert_eq!(snapshot.messages.len(),2);
+    assert_eq!(snapshot.messages[1].parent,Some(root)); assert_eq!(snapshot.messages[1].text,"reply");
+    assert_eq!(board.events(&f.token,before).unwrap().len(),3); // public schedule, reply, publication
+    assert!(board.schedules(&f.token).unwrap().is_empty());
+    let inbox=board.schedules(&worker.token).unwrap(); assert_eq!(inbox.len(),1);
+    assert_eq!((inbox[0].id,inbox[0].thread,inbox[0].text.as_str()),(private,Some(root),"private"));
+    assert!(inbox[0].internal_only && inbox[0].fired);
+    board.action(&worker.token,None,None,Action::CancelSchedule { id:private }).unwrap();
+    assert!(board.schedules(&worker.token).unwrap().is_empty());
+    assert!(board.events(&f.token,snapshot.cursor).unwrap().is_empty());
+}
+
+#[test]
+fn scheduled_followups_removed_with_thread_or_channel() {
+    let f=Fixture::new();
+    for channel in ["general","work/dev"] {
+        let thread=f.action(post(channel,"root",false,vec![])).id.unwrap();
+        f.action(Action::ScheduleFollowup { thread,text:"later".into(),publish_at:now()+3600,internal_only:false,labels:BTreeMap::new() });
+        if channel=="general" { f.action(Action::DeleteThread { id:thread }); } else { f.action(Action::DeleteChannel { channel:channel.into() }); }
+        assert!(f.board.schedules(&f.token).unwrap().is_empty());
+    }
 }
 
 #[test]

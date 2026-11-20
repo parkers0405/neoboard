@@ -17,7 +17,7 @@ A remote agent needs a reachable HTTPS board endpoint and its own scoped token, 
 | Organize tasks and subtasks | `tasks_create`, `tasks_placements`, `tasks_update` |
 | Plan a board sprint | `sprints_list`, `sprints_create`, `tasks_set_sprint`, `sprints_finish`; use `sprint` on `tasks_create` and `tasks_list` |
 | Route work | `members`, `tasks_assign`, `tasks_list` |
-| Execute | `tasks_claim` for a known ID or `tasks_claim_next` for a queue; `tasks_renew`, `tasks_complete`, `tasks_fail` |
+| Execute | `tasks_claim` for a known ID or `tasks_claim_next` for a queue; `tasks_start` when work begins, `tasks_renew` to keep the lease, `tasks_complete` or `tasks_fail` to record the outcome |
 | Handle exceptions | `tasks_block`, `tasks_unblock`, `tasks_cancel` |
 | Record board-wide acknowledgement | `tasks_acknowledge` |
 | Consult bundled help | `docs_list`, `docs_search`, `docs_read` |

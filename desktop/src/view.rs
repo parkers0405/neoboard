@@ -141,10 +141,16 @@ fn header(app: &App) -> El {
 fn task_status(state:TaskState)->El {
     static DONE:rune::Icon=rune::Icon{name:"Completed",view:24.,body:r#"<g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"><circle cx="12" cy="12" r="9.5"/><path d="m8 12 2.7 2.7 5.3-5.4"/></g>"#};
     if state==TaskState::Completed{return row().items_center().gap(5.).child(rune::icon(&DONE,14.).color(gray(227))).child(label("completed"));}
-    let icon=match state {TaskState::Claimed=>"⦿",TaskState::Completed=>"☑",TaskState::Waiting=>"◌",TaskState::Failed=>"⊗",TaskState::Blocked|TaskState::Canceled=>"⊘",TaskState::Ready=>"○"};
+    let icon=match state {TaskState::InProgress=>"▶",TaskState::Claimed=>"⦿",TaskState::Completed=>"☑",TaskState::Waiting=>"◌",TaskState::Failed=>"⊗",TaskState::Blocked|TaskState::Canceled=>"⊘",TaskState::Ready=>"○"};
     row().items_center().gap(5.).child(label(icon)).child(label(state_name(&state)))
 }
 fn lease(app:&App,expires:u64)->String {let s=expires.saturating_sub(app.now);format!("{}:{:02} left",s/60,s%60)}
+fn active_lease(task: &neochat::protocol::Task, now: u64) -> Option<(&str, u64)> {
+    Some((task.owner.as_deref()?, task.expires_at.filter(|end| *end > now)?))
+}
+fn lease_label(app: &App, task: &neochat::protocol::Task) -> String {
+    active_lease(task, app.now).map_or_else(|| "Unowned".into(), |(actor, end)| format!("{} · {}", app.actor_label(actor), lease(app, end)))
+}
 fn thread_options(app:&App,id:u64,row:El)->El {
     let mut slot=el().size(23.,23.).center();
     if app.hover_row==Some(id)||app.row_menu==Some(id){slot=slot.child(el().key(format!("thread-options-{id}")).size(23.,23.).center().radius(5.).fill(gray(27)).hover(gray(45)).child(label("⋯"))
@@ -159,7 +165,7 @@ fn task_row(app: &App, m: &Message) -> El {
     for(k,v)in m.labels.iter().filter(|(k,_)| k.as_str() != "area").take(if split{2}else{4}){title=title.child(chip(format!("{k}={v}")));}
     let mut body=col().grow(1.).w(0.).gap(3.).child(title).children(m.sender.as_ref().map(|_|marked_sender(m, muted(app.sender_label(m)).truncate())));
     if app.organization.tasks.get(&m.id).is_some_and(|p| p.global) { body = body.child(muted("Assigned to Everyone")); }
-    else if let Some(actor)=&task.owner {body=body.child(muted(format!("Claimed by {}{}",app.actor_label(actor),task.expires_at.map_or(String::new(),|t|format!(" · {}",lease(app,t))))).truncate());}
+    else if matches!(task.state, TaskState::Claimed | TaskState::InProgress) {body=body.child(muted(format!("Lease: {}",lease_label(app,task))).truncate());}
     else if let Some(actor)=&task.assignee {body=body.child(muted(format!("Assigned to {}",app.actor_label(actor))).truncate());}
     else if !task.needs.is_empty(){body=body.child(muted(format!("needs {}",task.needs.iter().map(|id|format!("#{id}")).collect::<Vec<_>>().join(", "))).truncate());}
     let mut r=row().key(format!("task-{id}")).w_full().min_h(if app.compact{30.}else{42.}).px(16.).py(5.).gap(7.).items_center().fill(gray(if app.thread==Some(id){18}else{0})).hover(gray(20)).child(task_status(task.state).w(92.)).child(body);
@@ -508,10 +514,9 @@ fn thread(app: &App, root: &Message,width:f32,height:f32) -> El {
         let placement = app.organization.tasks.get(&id);
         let global = placement.is_some_and(|p| p.global);
         let field=|name:&str,value:String| row().w_full().items_center().gap(8.).child(muted(name).w(90.)).child(label(value).grow(1.).w(0.).truncate());
-        let mut status=row().w_full().gap(6.).items_center().child(task_status(task.state));
-        if let Some(t)=task.expires_at {status=status.child(muted(lease(app,t)));}
+        let status=row().w_full().gap(6.).items_center().child(task_status(task.state));
         let mut details=col().key("task-summary").w_full().padding(16.).gap(7.).child(status);
-        details = details.child(row().w_full().items_center().gap(8.).child(muted("Owner").w(90.)).child(marked_sender(root, label(app.sender_label(root)).truncate())))
+        details = details.child(row().w_full().items_center().gap(8.).child(muted("Created by").w(90.)).child(marked_sender(root, label(app.sender_label(root)).truncate())))
             .child(field("Assigned to", if global { "Everyone" } else { task.assignee.as_deref().map_or("Unassigned", |actor| app.actor_label(actor)) }.into()));
         let mut subtask_options=None;
         if let Some(parent) = placement.and_then(|p| p.parent) {
@@ -528,32 +533,35 @@ fn thread(app: &App, root: &Message,width:f32,height:f32) -> El {
                 let height = (children.len().min(4) * 26) as f32;
                 for child in children {
                     let id = child.id;
-                    items = items.child(row().key(format!("open-subtask-{id}")).w_full().h(26.).px(5.).items_center().radius(4.).hover(gray(35)).child(label(format!("#{id} {}",child.text.lines().next().unwrap_or(""))).w(0.).grow(1.).truncate()).on_press(move|a:&mut App|a.open_thread(id)));
+                    items = items.child(row().key(format!("open-subtask-{id}")).w_full().h(26.).px(5.).items_center().gap(6.).radius(4.).hover(gray(35)).child(label(format!("#{id} {}",child.text.lines().next().unwrap_or(""))).w(0.).grow(1.).truncate()).children(child.task.as_ref().map(|t|task_status(t.state))).on_press(move|a:&mut App|a.open_thread(id)));
                 }
                 section = section.child(col().key(format!("subtasks-{id}")).w_full().h(height).scroll(ScrollSpec{stick_bottom:false}).child(items));
             }
             if task.state!=TaskState::Completed {section=section.child(button("+ Add subtask", move |a| a.add_subtask(id)).key("add-subtask"));}
             if has_children || task.state!=TaskState::Completed {subtask_options=Some(section);}
         }
-        if let Some(actor) = &task.owner { details = details.child(field("Claimed by", app.actor_label(actor).into())); }
+        if !global { details = details.child(field("Lease", lease_label(app,task))); }
+        if let Some(started) = task.started_at { details = details.child(field("Started", format!("{} UTC",format_utc(started)))); }
         if let Some(actor) = &task.finished_by { details = details.child(field("Finished by", app.actor_label(actor).into())); }
         for dep in task.needs.iter().take(4){let status=app.snapshot.messages.iter().find(|m|m.id==*dep).and_then(|m|m.task.as_ref()).map_or("",|t|state_name(&t.state));let dep=*dep;details=details.child(field("needs",format!("#{dep} {status}")).on_press(move|a:&mut App|a.open_thread(dep)));}
         if task.needs.len()>4 {details=details.child(muted(format!("+{} more dependencies",task.needs.len()-4)));}
         if let Some(result)=&task.result{details=details.child(field("result",result.clone()));}
         let me=app.me.as_ref().map(|m|m.actor.as_str());
-        let mine=me.is_some() && task.owner.as_deref()==me && task.state==TaskState::Claimed && task.expires_at.is_some_and(|t|t>app.now);
+        let holder=active_lease(task, app.now).map(|(actor,_)|actor);
+        let mine=!global && me.is_some() && holder==me && matches!(task.state,TaskState::Claimed|TaskState::InProgress);
         let creator=me==root.author.split('/').next();
         let active=!matches!(task.state,TaskState::Completed|TaskState::Failed|TaskState::Canceled);
-        let claim=!global && task.state==TaskState::Ready && (task.assignee.is_none() || task.assignee.as_deref()==me);
+        let claim=!global && holder.is_none() && matches!(task.state,TaskState::Ready|TaskState::InProgress) && (task.assignee.is_none() || task.assignee.as_deref()==me);
         let primary=|name:&str|el().h(30.).px(12.).center().radius(7.).fill(gray(226)).hover(gray(248)).child(label(name).color(gray(10)));
-        let mut actions=row().gap(8.).items_center();
+        let mut actions=row().w_full().flex_wrap().gap(8.).items_center();
         if global && active && let Some(me) = me {
             let done = placement.is_some_and(|p|p.done_by.iter().any(|actor|actor==me));
             actions = actions.child(primary(if done { "Undo my completion" } else { "Mark done for me" }).on_press(move |a: &mut App| {
                 a.dispatch(Action::AcknowledgeTask { id, done: !done },None);
             }));
         }
-        if claim{actions=actions.child(primary("Claim task").key("claim-task").on_press(move|a:&mut App|a.dispatch(Action::Claim{id,lease_secs:300},None)));}
+        if claim{actions=actions.child(primary(if task.state==TaskState::InProgress {"Reclaim task"} else {"Claim task"}).key("claim-task").on_press(move|a:&mut App|a.dispatch(Action::Claim{id,lease_secs:300},None)));}
+        if mine && task.state==TaskState::Claimed {actions=actions.child(primary("Start").key("start-task").on_press(move|a:&mut App|a.dispatch(Action::Start{id},None)));}
         if mine {
             let unfinished=app.snapshot.messages.iter().any(|m|app.organization.tasks.get(&m.id).and_then(|p|p.parent)==Some(id) && m.task.as_ref().is_some_and(|t|t.state!=TaskState::Completed));
             if unfinished && app.confirm_parent_completion==Some(id) {
@@ -566,7 +574,7 @@ fn thread(app: &App, root: &Message,width:f32,height:f32) -> El {
         if global||claim||mine||(active&&creator){details=details.child(actions);}
         if active && app.task_menu==Some(id) && (mine||creator){
             let mut menu=col().w_full().padding(6.).radius(7.).border(1.,gray(52));
-            if mine || (creator && task.state != TaskState::Claimed) {
+            if mine || (creator && holder.is_none()) {
                 menu = menu.child(button("Edit task", |_| {}).key("edit-task").on_press_tx(move |a: &mut App, tx| {
                     a.open_task_editor(id);
                     if a.dialog == Some(Dialog::NewTask) { tx.focus("task-title", false); }

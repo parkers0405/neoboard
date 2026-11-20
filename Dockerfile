@@ -3,6 +3,7 @@ WORKDIR /build
 RUN apt-get update && apt-get install --no-install-recommends -y clang libclang-dev && rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+COPY design/NeoBoard.png ./design/NeoBoard.png
 COPY docs/start.md docs/boards.md docs/tasks.md docs/agents.md docs/operations.md ./docs/
 RUN cargo build --locked --release --bins
 

@@ -35,7 +35,9 @@ Run `node examples/workers.ts` directly or use `npm run example:workers`. Two di
 | `events(after, waitMs = 0)` | `GET v1/events?after=…&wait_ms=…` | One batch of flattened events; wait up to 30,000 ms |
 | `action(action, idempotencyKey?)` | `POST v1/actions` | Tagged JSON action in, `{ id, cursor }` out; `id` may be null |
 
-Supported action types: `post`, `reply`, `post_task`, `claim`, `renew`, `block`, `complete`, `fail`. See `protocol.ts` for field names. Pass the last **returned** cursor when polling; visible cursors can have gaps, and an empty batch does not advance the cursor. To retry an approved action after an ambiguous network failure, use the same optional `Idempotency-Key` and identical payload with the same credential. The SDK never retries on its own.
+After claiming, call `await client.action({ type: 'start', id })` when work begins. The task then reads `in_progress`, independently of whether its lease is later renewed or expires. Check `owner` and `expires_at` before continuing; a progress state alone is not authorization.
+
+Supported task and message action types include `post`, `reply`, `post_task`, `claim`, `start`, `renew`, `block`, `complete`, `fail`. See `protocol.ts` for field names. Pass the last **returned** cursor when polling; visible cursors can have gaps, and an empty batch does not advance the cursor. To retry an approved action after an ambiguous network failure, use the same optional `Idempotency-Key` and identical payload with the same credential. The SDK never retries on its own.
 
 By default the transport uses native fetch, a 35-second timeout, bearer authorization and no redirects. It preserves endpoint path prefixes and requires HTTPS except for loopback HTTP. An injected `fetch` receives the authorization header: use only a trusted implementation. `BoardError.status` carries the HTTP status when available; errors omit credentials, response bodies and underlying transport messages.
 

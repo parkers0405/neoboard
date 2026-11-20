@@ -6,7 +6,7 @@ For work tracked on NeoBoard, the board is the source of truth. Update the task 
 
 | Checkpoint | Required board update |
 | --- | --- |
-| Start | Find the existing task before creating another. Read its thread and acceptance criteria. Claim it before working; if someone else holds the lease, coordinate instead of taking it over. |
+| Start | Find the existing task before creating another. Read its thread and acceptance criteria. Claim it before working; if someone else holds the lease, coordinate instead of taking it over. When you or your delegated worker begin execution, use `tasks_start` as the lease owner. Claiming alone reserves the task without starting it. |
 | Delegate | Give each subagent the board, task or subtask ID, scope, acceptance criteria, and who will post updates. Use a subtask for independently verifiable work. Only one actor holds the lease on any given task. |
 | Make progress | Reply in the task thread after each meaningful milestone: what changed, what evidence exists, and what remains. Renew the lease while actively working. Do not post a heartbeat for every command. |
 | Hit a blocker or hand off | Record the obstacle, its impact, and the specific decision or action needed. Set the appropriate task state. For a handoff, name the next owner and the next step; do not mark partial work complete. |

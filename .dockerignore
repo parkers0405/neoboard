@@ -3,6 +3,9 @@
 !Cargo.lock
 !src/
 !src/**
+!design/
+design/*
+!design/NeoBoard.png
 !docs/
 docs/*
 !docs/start.md

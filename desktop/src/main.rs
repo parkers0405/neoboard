@@ -23,7 +23,7 @@ use rune::{AppSpec, Key, TextEdit, Tx};
 use connection::{Command, Options, Update};
 
 static OPTIONS: OnceLock<Options> = OnceLock::new();
-const FILTERS: &[&str] = &["open", "waiting", "ready", "claimed", "blocked", "completed", "failed", "canceled", "all"];
+const FILTERS: &[&str] = &["open", "waiting", "ready", "claimed", "blocked", "completed", "failed", "canceled", "in_progress", "all"];
 const ALL_TASKS: usize = FILTERS.len() - 1;
 const OPEN_TASKS: usize = 0;
 
@@ -157,6 +157,7 @@ fn edit(value: &str) -> TextEdit { TextEdit::new(value) }
 fn state_name(state: &TaskState) -> &'static str {
     match state {
         TaskState::Ready => "ready", TaskState::Waiting => "waiting", TaskState::Claimed => "claimed",
+        TaskState::InProgress => "in_progress",
         TaskState::Blocked => "blocked", TaskState::Completed => "completed", TaskState::Failed => "failed", TaskState::Canceled => "canceled",
     }
 }
@@ -787,6 +788,7 @@ fn main() {
             ("channel-thread", |a| {fixture::load(a,true);a.navigate(Page::Channel(projects::channel(&a.project,"dev/rune")));a.open_thread(1);}),
             ("preferences", |a| {fixture::load(a,true); a.dialog=Some(Dialog::BoardView);}),
             ("activity", |a| { fixture::load(a, true); a.page = Page::Activity; }),
+            ("task-progress", fixture::progress),
             ("thread", |a| { fixture::load(a, true); a.aliases.insert("parker".into(),"Parker".into()); if let Some(reply)=a.snapshot.messages.iter_mut().find(|m|m.id==100){reply.author="parker".into();} a.page = Page::Activity; a.open_thread(1); }),
             ("reply-labels", |a| { fixture::load(a,true);a.page=Page::Activity;a.open_thread(1);a.reply_labels.insert(1,edit("area=\"desktop UI\""));a.dialog=Some(Dialog::ReplyTags(1)); }),
             ("completed-task", |a| {fixture::load(a,true);a.filter=5;a.open_thread(7);}),
@@ -801,7 +803,9 @@ mod tests {
     use super::*;
     #[test] fn filters() {
         for state in [TaskState::Ready, TaskState::Waiting, TaskState::Claimed, TaskState::Blocked] { assert!(matches_filter(&state, 0)); }
-        for state in [TaskState::Completed, TaskState::Failed, TaskState::Canceled] { assert!(!matches_filter(&state, 0)); assert!(matches_filter(&state, 8)); }
+        for state in [TaskState::Completed, TaskState::Failed, TaskState::Canceled] { assert!(!matches_filter(&state, 0)); assert!(matches_filter(&state, ALL_TASKS)); }
+        assert!(matches_filter(&TaskState::InProgress, 0));
+        assert!(matches_filter(&TaskState::InProgress, FILTERS.iter().position(|s| *s == "in_progress").unwrap()));
         assert!(matches_filter(&TaskState::Ready, 2));
         assert!(!matches_filter(&TaskState::Waiting, 2));
     }
@@ -859,6 +863,27 @@ mod tests {
             for _ in 0..24{rt.frame(1./60.);}assert!(rx.try_recv().is_err());let(x,y)=rt.find(key).unwrap();rt.pointer_move(x,y);rt.pointer_down(x,y);rt.pointer_up(x,y);rt.frame(1./60.);
         }
         assert!(matches!(rx.try_recv(),Ok(Command::Action{action:Action::DeleteThread{id:1},..})));
+    }
+    #[test] fn progress_actions_follow_the_live_lease_not_the_parent_state() {
+        let mut app = App::new(); fixture::progress(&mut app);
+        let (tx, rx) = mpsc::sync_channel(4); app.commands = Some(tx);
+        let mut rt = rune::Runtime::new(app, view::root, (1252., 800.), rune::Env::new(true, 1.));
+        let settle = |rt: &mut rune::Runtime<App>| { for _ in 0..5 { rt.frame(1./60.); } };
+        let click = |rt: &mut rune::Runtime<App>, key| {
+            let (x,y) = rt.find(key).unwrap(); rt.pointer_move(x,y); rt.pointer_down(x,y); rt.pointer_up(x,y); rt.frame(1./60.);
+        };
+        settle(&mut rt);
+        assert!(rt.find("start-task").is_none());
+        click(&mut rt,"claim-task");
+        assert!(matches!(rx.try_recv(), Ok(Command::Action { action: Action::Claim { id:10, .. }, .. })));
+        rt.update(|a,_| {a.pending=false; a.open_thread(3);}); settle(&mut rt);
+        click(&mut rt,"start-task");
+        assert!(matches!(rx.try_recv(), Ok(Command::Action { action: Action::Start { id:3 }, .. })));
+        rt.update(|a,_| {a.pending=false; a.snapshot.messages[2].task.as_mut().unwrap().state=TaskState::InProgress;});
+        settle(&mut rt); assert!(rt.find("start-task").is_none()); assert!(rt.find("claim-task").is_none());
+        rt.update(|a,_| a.now+=300); settle(&mut rt); assert!(rt.find("claim-task").is_some());
+        rt.update(|a,_| a.me.as_mut().unwrap().actor="other".into()); settle(&mut rt);
+        assert!(rt.find("claim-task").is_none()); assert!(rt.find("start-task").is_none());
     }
     #[test] fn assigned_thread_filters_intersect() {
         let mut app=App::new();fixture::load(&mut app,true);app.filter=FILTERS.len()-1;

@@ -72,6 +72,7 @@ enum Commands {
         #[arg(long = "label")] labels: Vec<String>,
     },
     CancelSchedule { id: u64 },
+    ScheduleFollowup { thread: u64, text: String, #[arg(long)] in_secs: u64, #[arg(long)] internal_only: bool, #[arg(long = "label")] labels: Vec<String> },
     Schedules,
     #[command(subcommand)]
     Invite(Invites),
@@ -88,7 +89,7 @@ enum Sprints {
 enum Tasks {
     /// Show task parents and global acknowledgements, keyed by task ID.
     Placements,
-    List { #[arg(long)] channel: Option<String>, #[arg(long)] include_global: bool, #[arg(long)] sprint: Option<u64> },
+    List { #[arg(long)] channel: Option<String>, #[arg(long)] include_global: bool, #[arg(long)] sprint: Option<u64>, #[arg(long, value_parser = parse_state)] state: Option<neochat::protocol::TaskState> },
     /// Assign a top-level task to a sprint, or omit the sprint to unassign.
     SetSprint { id: u64, sprint: Option<u64> },
     Create {
@@ -114,7 +115,9 @@ enum Tasks {
     },
     Ack { id: u64, #[arg(long)] undo: bool },
     Claim { id: u64, #[arg(long, default_value_t = 900)] lease_secs: u64 },
-    /// Claim the lowest-ID matching ready task, or print nothing if none is available.
+    /// Mark work in progress when execution begins. Requires your active lease.
+    Start { id: u64 },
+    /// Claim the lowest-ID matching unleased ready or in-progress task, or print nothing if none is available.
     ClaimNext { channel: String, #[arg(long = "label")] labels: Vec<String>, #[arg(long, value_enum, default_value = "eligible")] assignment: neochat::protocol::ClaimAssignment, #[arg(long, default_value_t = 900)] lease_secs: u64, #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u64).range(0..=25000))] wait_ms: u64 },
     Renew { id: u64, #[arg(long, default_value_t = 900)] lease_secs: u64 },
     Complete { id: u64, text: String, #[arg(long, help = "Complete even if subtasks are unfinished; leave them unchanged")] allow_unfinished: bool },
@@ -186,7 +189,7 @@ fn run(cli: Cli) -> Result<()> {
             let channels = client.snapshot()?.channels;
             return if json { print_json(&channels) } else { print_lines(channels) };
         }
-        Commands::Read { channel, thread } => return show_messages(&client, json, channel.as_deref(), thread, None, None),
+        Commands::Read { channel, thread } => return show_messages(&client, json, channel.as_deref(), thread, None, None, None),
         Commands::Channel { name } => Action::CreateChannel { channel: name },
         Commands::Post { channel, text, labels } => Action::Post { channel, text, labels: parse_labels(labels)?, task: false, needs: Vec::new(), assignee: None },
         Commands::Reply { thread, text } => Action::Reply { thread, text },
@@ -224,9 +227,10 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Wait { after, channel, thread, timeout_secs } => return follow(&client, json, after, channel.as_deref(), thread, Some(timeout_secs)),
         Commands::Schedule { channel, text, in_secs, labels } => Action::Schedule { channel, text, publish_at: future(in_secs)?, labels: parse_labels(labels)? },
         Commands::CancelSchedule { id } => Action::CancelSchedule { id },
+        Commands::ScheduleFollowup { thread,text,in_secs,internal_only,labels } => Action::ScheduleFollowup { thread,text,publish_at:future(in_secs)?,internal_only,labels:parse_labels(labels)? },
         Commands::Schedules => {
             let schedules = client.schedules()?;
-            return if json { print_json(&schedules) } else { print_lines(schedules.iter().map(|s| format!("#{} #{} at {}", s.id, s.channel, s.publish_at))) };
+            return if json { print_json(&schedules) } else { print_lines(schedules.iter().map(|s| format!("#{} #{} at {}{}{}", s.id, s.channel, s.publish_at, s.thread.map(|t| format!(" thread #{t}")).unwrap_or_default(), if s.fired { " (private, fired)" } else if s.internal_only { " (private)" } else { "" }))) };
         }
         Commands::Invite(Invites::Explain { id }) => return print_json(&client.explain_invite(id)?),
         Commands::Invite(Invites::RevokeGrant { id, grant }) => {
@@ -250,7 +254,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         Commands::Tasks(tasks) => match tasks {
             Tasks::SetSprint { id, sprint } => Action::SetTaskSprint { id, sprint },
-            Tasks::List { channel, include_global, sprint } => return show_messages(&client, json, channel.as_deref(), None, Some(include_global), sprint),
+            Tasks::List { channel, include_global, sprint, state } => return show_messages(&client, json, channel.as_deref(), None, Some(include_global), sprint, state),
             Tasks::Placements => return print_json(&client.task_placements()?),
             Tasks::Create { channel, text, description, labels, needs, assignee, parent, global, sprint } => {
                 let text = task_body(text,description)?;
@@ -266,6 +270,7 @@ fn run(cli: Cli) -> Result<()> {
             Tasks::Update { id, text, description, labels, needs, assignee, parent } => Action::UpdateTaskFields { id, text:task_body(text,description)?, labels: parse_labels(labels)?, needs, assignee, parent },
             Tasks::Ack { id, undo } => Action::AcknowledgeTask { id, done: !undo },
             Tasks::Claim { id, lease_secs } => Action::Claim { id, lease_secs },
+            Tasks::Start { id } => Action::Start { id },
             Tasks::ClaimNext { channel, labels, assignment, lease_secs, wait_ms } => {
                 claim_wait = Some(wait_ms);
                 Action::ClaimNext { channel, labels: parse_labels(labels)?, assignment, lease_secs }
@@ -300,11 +305,16 @@ fn parse_labels(values: Vec<String>) -> Result<BTreeMap<String, String>> {
     }).collect()
 }
 
-fn show_messages(client: &Client, json: bool, channel: Option<&str>, thread: Option<u64>, tasks: Option<bool>, sprint: Option<u64>) -> Result<()> {
+fn parse_state(value: &str) -> std::result::Result<neochat::protocol::TaskState, serde_json::Error> {
+    serde_json::from_value(serde_json::Value::String(value.to_owned()))
+}
+
+fn show_messages(client: &Client, json: bool, channel: Option<&str>, thread: Option<u64>, tasks: Option<bool>, sprint: Option<u64>, state: Option<neochat::protocol::TaskState>) -> Result<()> {
     let snapshot = client.snapshot()?;
     let org = if sprint.is_some() { Some(client.organization()?) } else if tasks == Some(false) { client.organization_if_supported()? } else { None };
     let messages: Vec<_> = snapshot.messages.into_iter().filter(|msg| {
         (tasks.is_none() || msg.task.is_some())
+            && state.is_none_or(|s| msg.task.as_ref().is_some_and(|t| t.state == s))
             && (tasks != Some(false) || org.as_ref().is_none_or(|org| org.tasks.get(&msg.id).is_some_and(|p| !p.global)))
             && sprint.is_none_or(|id| org.as_ref().and_then(|o| o.task_sprints.get(&msg.id)) == Some(&id))
             && channel.is_none_or(|name| name == msg.channel)

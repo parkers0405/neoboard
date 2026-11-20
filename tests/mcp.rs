@@ -39,6 +39,14 @@ impl Peer {
         let init = peer.rpc("initialize", json!({"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":name,"version":"1"}}));
         assert_eq!(init["result"]["protocolVersion"], "2025-06-18");
         assert_eq!(init["result"]["capabilities"]["tools"]["listChanged"], false);
+        let info = &init["result"]["serverInfo"];
+        assert_eq!(info["name"], "neoboard");
+        assert_eq!(info["title"], "NeoBoard");
+        let src = info["icons"][0]["src"].as_str().unwrap();
+        assert!(src.len() <= 32_768); // Neoism's inline icon limit.
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD.decode(src.strip_prefix("data:image/png;base64,").unwrap()).unwrap();
+        assert_eq!(bytes.as_slice(), include_bytes!("../design/NeoBoard.png").as_slice());
         peer.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
         peer
     }
@@ -267,6 +275,7 @@ fn claim_next_timeout_keeps_one_budget_across_unrelated_wakes() {
         });
         let miss = peer.ok("tasks_claim_next", json!({"channel":"work","lease_secs":60,"wait_ms":650}));
         assert!(miss["id"].is_null());
+        assert!(miss.get("owner_guidance").is_none());
         assert!((Duration::from_millis(620)..Duration::from_millis(1150)).contains(&start.elapsed()));
     });
 }
@@ -350,8 +359,19 @@ fn explicit_completion_option() {
     let (_daemon, discovery) = daemon(dir.path());
     let mut peer = Peer::new(&discovery.url, &discovery.token, "neoism");
     let id = peer.ok("tasks_create", json!({"channel":"work","text":"parent"}))["id"].as_u64().unwrap();
-    peer.ok("tasks_create", json!({"channel":"work","text":"child","parent":id}));
-    peer.ok("tasks_claim", json!({"id":id,"lease_secs":60}));
+    let child = peer.ok("tasks_create", json!({"channel":"work","text":"child","parent":id}))["id"].as_u64().unwrap();
+    peer.ok("tasks_claim", json!({"id":child,"lease_secs":60}));
+    peer.ok("tasks_start", json!({"id":child}));
+    let parent_progress = || json!({"thread":id,"state":"in_progress"});
+    let before = peer.ok("tasks_list", parent_progress());
+    let task = &before["messages"][0]["task"];
+    assert!(task["started_at"].is_u64());
+    assert!(task["owner"].is_null());
+    let claim = peer.ok("tasks_claim", json!({"id":id,"lease_secs":60}));
+    assert_eq!(claim["id"], id);
+    assert!(claim["owner_guidance"].as_str().unwrap().contains("tasks_complete"));
+    assert!(claim["owner_guidance"].as_str().unwrap().contains("tasks_start"));
+    assert_eq!(peer.ok("tasks_list", parent_progress())["messages"][0]["task"]["started_at"], task["started_at"]);
     for args in [json!({"id":id,"text":"done"}), json!({"id":id,"text":"done","allow_unfinished":false})] {
         assert_eq!(peer.tool("tasks_complete", args)["structuredContent"]["error"]["code"], "conflict");
     }
@@ -376,7 +396,7 @@ fn two_actors_coordinate_over_stdio_with_private_isolation() {
     assert_eq!(a.rpc("ping", json!({}))["result"], json!({}));
     let catalog = a.rpc("tools/list", json!({}));
     let names: Vec<_> = catalog["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-    assert_eq!(names, ["channels","read","post","reply","wait","tasks_list","tasks_create","tasks_claim","tasks_claim_next","tasks_renew","tasks_complete","tasks_fail","members","tasks_assign","tasks_block","tasks_unblock","tasks_cancel","tasks_placements","tasks_update","tasks_acknowledge","docs_list","docs_read","docs_search","channel_create","edit","labels","react","reactions","attachments","schedule","schedules","cancel_schedule","sprints_list","sprints_create","tasks_set_sprint","sprints_finish"]);
+    assert_eq!(names, ["channels","read","post","reply","wait","tasks_list","tasks_create","tasks_claim","tasks_start","tasks_claim_next","tasks_renew","tasks_complete","tasks_fail","members","tasks_assign","tasks_block","tasks_unblock","tasks_cancel","tasks_placements","tasks_update","tasks_acknowledge","docs_list","docs_read","docs_search","channel_create","edit","labels","react","reactions","attachments","schedule","schedules","cancel_schedule","sprints_list","sprints_create","tasks_set_sprint","sprints_finish"]);
     for tool in catalog["result"]["tools"].as_array().unwrap() {
         assert_eq!(tool["inputSchema"]["additionalProperties"], false);
         assert!(tool["inputSchema"]["properties"].get("area").is_none());
@@ -396,12 +416,21 @@ fn two_actors_coordinate_over_stdio_with_private_isolation() {
     assert_eq!(listed["messages"][0]["id"], id);
 
     // Both attempt to claim; exactly one owns the lease, and ownership is actor-bound.
-    assert_eq!(b.ok("tasks_claim_next", json!({"channel":"work","lease_secs":60,"assignment":"unassigned"}))["id"], id);
+    let claim = b.ok("tasks_claim_next", json!({"channel":"work","lease_secs":60,"assignment":"unassigned"}));
+    assert_eq!(claim["id"], id);
+    assert!(claim["owner_guidance"].as_str().unwrap().contains("tasks_list"));
+    assert!(claim["owner_guidance"].as_str().unwrap().contains("tasks_start"));
     let rejected_claim = a.tool("tasks_claim", json!({"id":id,"lease_secs":60}));
     assert_eq!(rejected_claim["isError"], true);
     assert_eq!(rejected_claim["structuredContent"]["error"]["code"], "conflict");
+    assert!(rejected_claim["structuredContent"].get("owner_guidance").is_none());
     assert_eq!(a.tool("tasks_renew", json!({"id":id,"lease_secs":60}))["isError"], true);
     b.ok("tasks_renew", json!({"id":id,"lease_secs":60}));
+    let progress = json!({"thread":id,"state":"in_progress"});
+    assert_eq!(a.ok("tasks_list", progress.clone())["messages"], json!([]));
+    assert_eq!(a.tool("tasks_start", json!({"id":id}))["isError"], true);
+    b.ok("tasks_start", json!({"id":id}));
+    assert_eq!(a.ok("tasks_list", progress)["messages"][0]["id"], id);
     let events = a.ok("wait", json!({"after":task_cursor,"wait_ms":0,"limit":1}));
     assert_eq!(events["events"][0]["actor"], "bob");
     assert_eq!(events["events"][0]["message"]["sender"], "mcp:Claude Code");

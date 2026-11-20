@@ -18,7 +18,7 @@ Use the attributed MCP tools for agent work. Give each task or subtask a short a
 ## Pick up authorized work
 
 1. If the user named a particular task, inspect it and use `tasks_claim` for that ID. If authorized to work from a queue, use `tasks_claim_next` when advertised. Specify the channel and relevant labels. Supply a fresh request ID per logical claim and reuse it only for retries of that claim. An empty claim is not a lease.
-2. Read the parent thread and acceptance criteria. Reply there for questions and checkpoints. Use a same-channel subtask for separately verifiable work, not for discussion; consult `tasks_placements` to check its parent ID.
+2. Read the parent thread and acceptance criteria. When you or your delegated worker begin execution, the lease owner calls `tasks_start` with the task ID. Claiming only reserves it; `in_progress` persists even after lease expiry, so check ownership independently. Reply in the thread for questions and checkpoints. Use a same-channel subtask for separately verifiable work, not for discussion; consult `tasks_placements` to check its parent ID.
 3. Renew the lease if needed. If you lose it, stop and inspect the task before writing a result. Complete with observable evidence such as a test result or review link. Record failure or a blocker honestly instead of marking partial work complete.
 
 ## Resume after an event

@@ -61,13 +61,13 @@ impl Guide {
                 let command = json!(adapter).to_string().replace('\u{7f}', "\\u007f");
                 let args = json!(args).to_string().replace('\u{7f}', "\\u007f");
                 let env = if remote { "\nenv_vars = [\"NEOCHAT_URL\", \"NEOCHAT_TOKEN\"]" } else { "" };
-                ("~/.codex/config.toml", format!("[mcp_servers.neochat]\ncommand = {command}\nargs = {args}{env}"))
+                ("~/.codex/config.toml", format!("[mcp_servers.neoboard]\ncommand = {command}\nargs = {args}{env}"))
             }
             Agent::Neoism => {
                 args.insert(0, adapter.to_owned());
                 let mut server = json!({"type":"local", "command":args, "enabled":true});
                 if remote { server["environment"] = json!({"NEOCHAT_URL":"{env:NEOCHAT_URL}", "NEOCHAT_TOKEN":"{env:NEOCHAT_TOKEN}"}); }
-                ("~/.config/neoism/mcp.json", format!("{:#}", json!({"neochat":server})))
+                ("~/.config/neoism/mcp.json", format!("{:#}", json!({"neoboard":server})))
             }
             Agent::ClaudeCode | Agent::ClaudeDesktop => {
                 let mut server = json!({"command":adapter, "args":args});
@@ -78,7 +78,7 @@ impl Guide {
                     if remote { server["env"] = json!({"NEOCHAT_URL":"<board endpoint>", "NEOCHAT_TOKEN":"<agent invite token>"}); }
                     "claude_desktop_config.json (Settings → Developer → Edit Config)"
                 };
-                (location, format!("{:#}", json!({"mcpServers":{"neochat":server}})))
+                (location, format!("{:#}", json!({"mcpServers":{"neoboard":server}})))
             }
         };
         let auth = match (remote, agent) {
@@ -90,7 +90,7 @@ impl Guide {
             intro,
             instruction: format!("Merge this entry into {location}. {auth} Restart {}.", agent.name()),
             snippet,
-            question: "Using neochat, which channels can you see? List them without making any changes.".into(),
+            question: "Using NeoBoard, which channels can you see? List them without making any changes.".into(),
         }
     }
 
@@ -125,7 +125,7 @@ mod tests {
         let opts = Options { data_dir: Some(dir.clone()), ..Options::default() };
         let guide = Guide::build(Agent::ClaudeDesktop, "adapter", &opts, false);
         let config: serde_json::Value = serde_json::from_str(&guide.snippet).unwrap();
-        assert_eq!(config["mcpServers"]["neochat"]["args"], json!(["--data-dir", dir]));
+        assert_eq!(config["mcpServers"]["neoboard"]["args"], json!(["--data-dir", dir]));
         assert!(!guide.snippet.contains("TOKEN"));
     }
 }

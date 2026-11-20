@@ -1,12 +1,13 @@
 // Wire names and optionality follow src/protocol.rs. Timestamps are Unix seconds.
 export interface Task {
-  state: 'ready' | 'waiting' | 'claimed' | 'blocked' | 'completed' | 'failed' | 'canceled';
+  state: 'ready' | 'waiting' | 'claimed' | 'in_progress' | 'blocked' | 'completed' | 'failed' | 'canceled';
   needs: number[];
   assignee: string | null;
   owner: string | null;
   finished_by?: string;
   result?: string;
   expires_at: number | null;
+  started_at?: number;
 }
 export interface Message {
   id: number;
@@ -43,5 +44,6 @@ export type Action =
   | { type: 'reply'; thread: number; text: string }
   | { type: 'post_task'; channel: string; text: string; labels?: Record<string, string>; needs?: number[]; assignee?: string; parent?: number; global?: boolean }
   | { type: 'claim' | 'renew'; id: number; lease_secs: number }
+  | { type: 'start'; id: number }
   | { type: 'complete' | 'fail' | 'block'; id: number; text: string };
 export interface Outcome { id: number | null; cursor: number }

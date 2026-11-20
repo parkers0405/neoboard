@@ -20,16 +20,20 @@ export function workerFixture() {
     }
     if (route !== 'POST https://board.invalid/v1/actions') return reject(404);
     const action: Action = JSON.parse(String(init?.body));
-    if (action.type !== 'claim' && action.type !== 'renew' && action.type !== 'complete') return reject(403);
+    if (action.type !== 'claim' && action.type !== 'start' && action.type !== 'renew' && action.type !== 'complete') return reject(403);
     const task = visible.find(row => row.id === action.id)?.task;
     if (!task) return reject(404);
     // Check and mutate in one synchronous step; never grant a lease from a snapshot alone.
-    if (action.type === 'claim' ? task.state !== 'ready' : task.state !== 'claimed' || task.owner !== scope.actor) return reject(409);
-    if (action.type === 'complete') {
+    if (action.type === 'claim' ? task.owner !== null || !['ready', 'in_progress'].includes(task.state) : task.owner !== scope.actor) return reject(409);
+    if (action.type === 'start') {
+      task.started_at ??= now;
+      task.state = 'in_progress';
+    } else if (action.type === 'complete') {
       Object.assign(task, { state: 'completed', owner: null, expires_at: null, finished_by: scope.actor, result: action.text });
     } else if (action.type === 'claim' || action.type === 'renew') {
       if (!Number.isInteger(action.lease_secs) || action.lease_secs < 1 || action.lease_secs > 86400) return reject(400);
-      Object.assign(task, { state: 'claimed', owner: scope.actor, expires_at: now + action.lease_secs });
+      if (task.state === 'ready') task.state = 'claimed';
+      Object.assign(task, { owner: scope.actor, expires_at: now + action.lease_secs });
     }
     return Response.json({ id: action.id, cursor: ++cursor });
   };
@@ -40,7 +44,8 @@ export function workerFixture() {
       now += seconds;
       for (const { task } of rows) {
         if (task?.expires_at != null && task.expires_at <= now) {
-          Object.assign(task, { state: 'ready', owner: null, expires_at: null });
+          if (task.state === 'claimed') task.state = 'ready';
+          Object.assign(task, { owner: null, expires_at: null });
           ++cursor;
         }
       }

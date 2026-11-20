@@ -35,6 +35,7 @@ Finishing checks all explicit members, including tasks in channels you may not s
 ```sh
 task=$(neochat tasks create team/release 'Smoke-test the installer')
 neochat tasks claim "$task"
+neochat tasks start "$task"  # when execution begins
 neochat reply "$task" 'Testing the downloaded build on Windows.'
 neochat tasks complete "$task" 'Installed, launched, and removed successfully.'
 ```
@@ -47,15 +48,17 @@ Use one actor consistently for claim and completion. With multiple workers, use 
 neochat tasks claim-next team/release --label os=linux --assignment eligible --lease-secs 900 --wait-ms 25000
 ```
 
-This selects and leases the lowest-ID ready, non-global task in the exact channel that matches every supplied label. `eligible` means assigned to you or unassigned; choose `mine` or `unassigned` for a narrower queue. An empty result means no match before the deadline, not a failed task. Omit `--wait-ms` for a single immediate attempt. For a retry after a lost response, reuse the original `--request-id`; use a new ID for the next distinct claim. The MCP equivalent is `tasks_claim_next`.
+This selects and leases the lowest-ID unleased, non-global task in `ready` or `in_progress` state in the exact channel that matches every supplied label. `eligible` means assigned to you or unassigned; choose `mine` or `unassigned` for a narrower queue. An empty result means no match before the deadline, not a failed task. Omit `--wait-ms` for a single immediate attempt. For a retry after a lost response, reuse the original `--request-id`; use a new ID for the next distinct claim. The MCP equivalent is `tasks_claim_next`.
 
 ## Claim from a filtered queue
 
-To take the next matching task without a list-then-claim race, run `neochat tasks claim-next team/release --label os=linux --assignment eligible --lease-secs 900`, or call `tasks_claim_next` with `{"channel":"team/release","labels":{"os":"linux"},"assignment":"eligible","lease_secs":900}`. The lowest-ID ready, non-global task in that exact channel matching every supplied label wins. `eligible` (default) includes tasks assigned to your authenticated actor or unassigned; use `mine` or `unassigned` to narrow it. The command prints the claimed ID, or nothing on a miss (`id: null` in JSON).
+To take the next matching task without a list-then-claim race, run `neochat tasks claim-next team/release --label os=linux --assignment eligible --lease-secs 900`, or call `tasks_claim_next` with `{"channel":"team/release","labels":{"os":"linux"},"assignment":"eligible","lease_secs":900}`. The lowest-ID unleased, non-global task in `ready` or `in_progress` state in that exact channel matching every supplied label wins. `eligible` (default) includes tasks assigned to your authenticated actor or unassigned; use `mine` or `unassigned` to narrow it. The command prints the claimed ID, or nothing on a miss (`id: null` in JSON).
 
 Set `--wait-ms 5000` (MCP: `"wait_ms":5000`) to wait up to five seconds. The default is one immediate attempt; the maximum wait is 25000 ms. A visible event wakes the client to try another atomic claim, not to reserve work. If another worker wins, the remaining wait budget still applies. Supply `--request-id` (MCP: `request_id`) before a request you may need to retry. If a write response is lost, retry with the same ID, filters and wait settings to recover the original claim. Use a fresh ID when starting a new independent claim.
 
 ## Read task states
+
+`started_at`, when present, records the first explicit start (Unix seconds). Starting a subtask also records progress on its parent without assigning or renewing a parent lease. Claim and renewal alone do not set this timestamp. A scoped worker needs the `start` grant as well as its active lease to mark progress.
 
 | State | Next question |
 | --- | --- |
@@ -63,9 +66,12 @@ Set `--wait-ms 5000` (MCP: `"wait_ms":5000`) to wait up to five seconds. The def
 | Waiting | Which prerequisite still needs to finish? |
 | Blocked | What manual blocker needs resolving? |
 | Claimed | Who holds the lease and when does it expire? |
+| In progress | Work has started. Does anyone still hold the lease? |
 | Completed, failed, canceled | What outcome or reason was recorded? |
 
 ## Global tasks and filters
+
+A claim reserves a task; it does not mark it in progress. The lease owner calls `tasks_start` with the task ID when execution begins, including delegated execution. Starting does not renew the lease. If the lease expires, the task remains `in_progress` but the former owner no longer has authority to finish. To find started work, use `neochat tasks list --state in_progress` or `tasks_list` with `{"state":"in_progress"}`; inspect `owner` and `expires_at` separately.
 
 Use a global task for a board-wide acknowledgement, not for work that one actor must claim. Create it against the board namespace with `global: true`; each actor acknowledges for themselves. Agent task listings omit global tasks unless `include_global` is set. If a task seems absent, check its channel, filters, and whether it is global.
 

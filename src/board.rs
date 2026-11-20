@@ -98,7 +98,8 @@ impl Board {
             CREATE TABLE IF NOT EXISTS attachments(id INTEGER PRIMARY KEY AUTOINCREMENT, message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE, name TEXT NOT NULL, bytes BLOB NOT NULL CHECK(length(bytes)<=8388608));
             CREATE INDEX IF NOT EXISTS attachment_messages ON attachments(message_id,id);
             CREATE TABLE IF NOT EXISTS schedules(id INTEGER PRIMARY KEY AUTOINCREMENT, credential INTEGER NOT NULL, actor TEXT NOT NULL, channel TEXT NOT NULL, text TEXT NOT NULL, labels TEXT NOT NULL, publish_at INTEGER NOT NULL);
-            CREATE TABLE IF NOT EXISTS schedule_senders(schedule INTEGER PRIMARY KEY REFERENCES schedules(id) ON DELETE CASCADE, sender TEXT NOT NULL);")?;
+            CREATE TABLE IF NOT EXISTS schedule_senders(schedule INTEGER PRIMARY KEY REFERENCES schedules(id) ON DELETE CASCADE, sender TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS schedule_threads(schedule INTEGER PRIMARY KEY REFERENCES schedules(id) ON DELETE CASCADE, thread INTEGER NOT NULL REFERENCES messages(id), internal INTEGER NOT NULL, fired INTEGER NOT NULL DEFAULT 0);")?;
         db.execute("INSERT OR IGNORE INTO credentials(hash,actor,channels) VALUES (?1,'local','[]')", [digest(board_token)])?;
         // Older boards stored file metadata only in the attachment table.
         db.execute("UPDATE messages SET body=json_set(body,'$.attachments',json((
@@ -178,7 +179,7 @@ impl Board {
         tx.commit()?; Ok(())
     }
     fn cancel_pending(tx: &Transaction<'_>, id: u64) -> Result<()> {
-        let schedules = tx.prepare("SELECT id,channel FROM schedules WHERE credential=?1")?.query_map([sql_id(id)?], |r| Ok((r.get::<_,u64>(0)?,r.get::<_,String>(1)?)))?.collect::<std::result::Result<Vec<_>,_>>()?;
+        let schedules = tx.prepare("SELECT id,channel FROM schedules WHERE credential=?1 AND id NOT IN (SELECT schedule FROM schedule_threads WHERE internal=1)")?.query_map([sql_id(id)?], |r| Ok((r.get::<_,u64>(0)?,r.get::<_,String>(1)?)))?.collect::<std::result::Result<Vec<_>,_>>()?;
         for (id,channel) in schedules { emit(tx,"system",&channel,EventKind::ScheduleCanceled { id, channel:channel.clone() })?; }
         tx.execute("DELETE FROM schedules WHERE credential=?1", [sql_id(id)?])?;
         Ok(())
@@ -365,10 +366,10 @@ impl Board {
         let tx = db.transaction()?;
         let identity = Self::identity(&tx, token, Some(Grant::Read))?;
         maintain(&tx)?;
-        let rows = tx.prepare("SELECT id,channel,actor,text,labels,publish_at FROM schedules WHERE credential=?1 ORDER BY publish_at,id")?.query_map([identity.id], |r| Ok((r.get::<_,u64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,u64>(5)?)))?.collect::<std::result::Result<Vec<_>,_>>()?;
+        let rows = tx.prepare("SELECT id,channel,actor,text,labels,publish_at,thread,coalesce(internal,0),coalesce(fired,0) FROM schedules LEFT JOIN schedule_threads ON schedule=id WHERE credential=?1 ORDER BY publish_at,id")?.query_map([identity.id], |r| Ok((r.get::<_,u64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,u64>(5)?,r.get(6)?,r.get(7)?,r.get(8)?)))?.collect::<std::result::Result<Vec<_>,_>>()?;
         let mut result=Vec::new();
-        for (id,channel,author,text,labels,publish_at) in rows {
-            if identity.permits(&channel) { result.push(ScheduledPost { id,channel,author,text,labels:serde_json::from_str(&labels)?,publish_at }); }
+        for (id,channel,author,text,labels,publish_at,thread,internal_only,fired) in rows {
+            if identity.permits(&channel) { result.push(ScheduledPost { id,channel,author,text,labels:serde_json::from_str(&labels)?,publish_at,thread,internal_only,fired }); }
         }
         tx.commit()?; Ok(result)
     }
@@ -556,7 +557,7 @@ fn mutable_task(m: &Message) -> Result<&Task> {
 // A creator may manage unleased work, but must not take another worker's live lease.
 fn require_task_manager(tx: &Transaction<'_>, m: &Message, who: &Identity) -> Result<()> {
     let t = mutable_task(m)?;
-    if t.state == TaskState::Claimed {
+    if t.owner.is_some() {
         if t.owner.as_deref() != Some(&who.actor) { return Err(conflict("only the active lease owner can change claimed work")); }
         Ok(())
     } else { require_creator(tx,m,who) }
@@ -677,8 +678,8 @@ fn apply(tx: &Transaction<'_>, who: &Identity, author: &str, sender: Option<&str
             // and replies are channel-local by construction. Keep board metadata intact.
             tx.execute("DELETE FROM task_placements WHERE message IN (SELECT id FROM messages WHERE channel=?1)", [&channel])?;
             tx.execute("DELETE FROM reactions WHERE message IN (SELECT id FROM messages WHERE channel=?1)", [&channel])?;
-            tx.execute("DELETE FROM messages WHERE channel=?1", [&channel])?;
             tx.execute("DELETE FROM schedules WHERE channel=?1", [&channel])?;
+            tx.execute("DELETE FROM messages WHERE channel=?1", [&channel])?;
             tx.execute("DELETE FROM events WHERE channel=?1", [&channel])?;
             emit(tx,&who.actor,&channel,EventKind::ChannelDeleted { channel:channel.clone() })?;
             Ok(None)
@@ -735,7 +736,7 @@ fn apply(tx: &Transaction<'_>, who: &Identity, author: &str, sender: Option<&str
             for id in &needs { dependency(tx,who,&channel,*id)?; }
             validate_placement(tx,who,&channel,None,&p)?;
             if !global { ensure_channel(tx,who,&channel)?; }
-            let task = Some(Task { state: if global { TaskState::Ready } else { TaskState::Waiting }, needs, assignee, owner: None, expires_at: None, finished_by:None,result:None });
+            let task = Some(Task { state: if global { TaskState::Ready } else { TaskState::Waiting }, needs, assignee, owner: None, expires_at: None, started_at:None, finished_by:None,result:None });
             Ok(Some(insert_with_placement(tx,&who.actor,sender,NewMessage { channel,parent:None,author:author.into(),text,labels,task },Some(&p))?))
         }
         Reply { thread,text } => {
@@ -761,6 +762,7 @@ fn apply(tx: &Transaction<'_>, who: &Identity, author: &str, sender: Option<&str
                 return Err(conflict("thread has subtasks"));
             }
             let audience = message_audience(tx,&root)?;
+            tx.execute("DELETE FROM schedules WHERE id IN (SELECT schedule FROM schedule_threads WHERE thread=?1)",[id])?;
             let ids: Vec<_> = messages.iter().filter(|m| m.id == id || m.parent == Some(id)).map(|m| m.id).collect();
             let ids = serde_json::to_string(&ids)?;
             // Do not leave historical upserts that can resurrect deleted content on replay.
@@ -812,7 +814,7 @@ fn apply(tx: &Transaction<'_>, who: &Identity, author: &str, sender: Option<&str
                     pending.extend(dependency(tx,who,&m.channel,dep)?.needs);
                 }
             }
-            if task.state == TaskState::Claimed && (task.assignee != assignee || task.needs != needs) {
+            if task.owner.is_some() && (task.assignee != assignee || task.needs != needs) {
                 task.state = TaskState::Waiting; task.owner = None; task.expires_at = None;
             }
             task.assignee = assignee;
@@ -843,7 +845,7 @@ fn apply(tx: &Transaction<'_>, who: &Identity, author: &str, sender: Option<&str
             if t.assignee != assignee {
                 t.assignee=assignee;
                 // Handoff releases, rather than transfers, a lease. The recipient must claim.
-                if t.state==TaskState::Claimed { t.state=TaskState::Waiting; t.owner=None; t.expires_at=None; }
+                if t.owner.is_some() { t.state=TaskState::Waiting; t.owner=None; t.expires_at=None; }
                 save(tx,&who.actor,&m)?;
             }
             Ok(Some(id))
@@ -868,6 +870,19 @@ fn apply(tx: &Transaction<'_>, who: &Identity, author: &str, sender: Option<&str
             save(tx,&who.actor,&m)?;
             Ok(Some(id))
         }
+        Start { id } => {
+            let m=message(tx,id,who)?;
+            let t=mutable_task(&m)?;
+            let at=now();
+            if t.owner.as_deref()!=Some(&who.actor) || !t.expires_at.is_some_and(|end| end>at) {
+                return Err(conflict("only the active lease owner can start"));
+            }
+            record_start(tx,&who.actor,m,at)?;
+            if let Some(parent)=placement(tx,id)?.parent {
+                record_start(tx,&who.actor,message(tx,parent,who)?,at)?;
+            }
+            Ok(Some(id))
+        }
         Claim { lease_secs,.. } | ClaimNext { lease_secs,.. } | Renew { lease_secs,.. } => {
             if !(1..=86400).contains(&lease_secs) { return Err(invalid("lease_secs must be 1..86400")); }
             let renew = matches!(action, Renew { .. });
@@ -880,7 +895,7 @@ fn apply(tx: &Transaction<'_>, who: &Identity, author: &str, sender: Option<&str
                     let candidate = tx.query_row("SELECT m.id FROM messages m
                         LEFT JOIN task_placements p ON p.message=m.id
                         WHERE m.channel=?1 AND COALESCE(p.global,0)=0
-                        AND json_extract(m.body,'$.task.state')='ready'
+                        AND json_extract(m.body,'$.task.state') IN ('ready','in_progress') AND json_extract(m.body,'$.task.owner') IS NULL
                         AND ((?2 AND json_extract(m.body,'$.task.assignee') IS NULL)
                           OR (?3 AND json_extract(m.body,'$.task.assignee')=?4))
                         AND NOT EXISTS (SELECT 1 FROM json_each(?5) wanted WHERE NOT EXISTS
@@ -896,19 +911,19 @@ fn apply(tx: &Transaction<'_>, who: &Identity, author: &str, sender: Option<&str
             let mut m = message(tx,id,who)?;
             if is_global(tx,id)? { return Err(conflict("global tasks cannot be claimed or renewed")); }
             let t=m.task.as_mut().ok_or_else(|| invalid("not a task"))?;
-            if renew { if t.state != TaskState::Claimed || t.owner.as_deref()!=Some(&who.actor) { return Err(conflict("only the active lease owner can renew")); } }
+            if renew { if t.owner.as_deref()!=Some(&who.actor) { return Err(conflict("only the active lease owner can renew")); } }
             else {
-                if t.state != TaskState::Ready { return Err(conflict("task is not ready")); }
+                if !matches!(t.state,TaskState::Ready|TaskState::InProgress) || t.owner.is_some() { return Err(conflict("task is not ready")); }
                 if t.assignee.as_ref().is_some_and(|a| a!=&who.actor) { return Err(forbidden()); }
             }
-            t.state=TaskState::Claimed; t.owner=Some(who.actor.clone()); t.expires_at=Some(now()+lease_secs);
+            t.state=if t.started_at.is_some() { TaskState::InProgress } else { TaskState::Claimed }; t.owner=Some(who.actor.clone()); t.expires_at=Some(now()+lease_secs);
             save(tx,&who.actor,&m)?; Ok(Some(id))
         }
         Complete { id,ref text } | CompleteAnyway { id,ref text } | Fail { id,ref text } => {
             let completed=!matches!(action,Fail { .. });
             if !text.is_empty() { validate_text(text)?; }
             let mut m=message(tx,id,who)?; let t=m.task.as_mut().ok_or_else(|| invalid("not a task"))?;
-            if t.state!=TaskState::Claimed || t.owner.as_deref()!=Some(&who.actor) { return Err(conflict("only the active lease owner can finish")); }
+            if t.owner.as_deref()!=Some(&who.actor) { return Err(conflict("only the active lease owner can finish")); }
             if matches!(action,Complete { .. }) && tx.query_row("SELECT EXISTS(SELECT 1 FROM task_placements p JOIN messages m ON m.id=p.message
                 WHERE p.parent=?1 AND json_extract(m.body,'$.task.state') IS NOT 'completed')", [id], |r| r.get::<_,bool>(0))? {
                 return Err(conflict("all subtasks must be completed before completing the parent"));
@@ -931,21 +946,32 @@ fn apply(tx: &Transaction<'_>, who: &Identity, author: &str, sender: Option<&str
             let changed=if remove { tx.execute("DELETE FROM reactions WHERE message=?1 AND actor=?2 AND reaction=?3",params![id,who.actor,reaction])? } else { tx.execute("INSERT OR IGNORE INTO reactions VALUES (?1,?2,?3)",params![id,who.actor,reaction])? };
             if changed>0 { emit(tx,&who.actor,&message_audience(tx,&m)?,EventKind::Reaction { id,channel:m.channel,reaction,remove })?; } Ok(Some(id))
         }
-        Schedule { channel,text,publish_at,labels } => {
+        a @ (Schedule { .. } | ScheduleFollowup { .. }) => {
+            let (channel,text,publish_at,labels,thread,internal) = match a {
+                Schedule { channel,text,publish_at,labels } => (channel,text,publish_at,labels,None,false),
+                ScheduleFollowup { thread,text,publish_at,labels,internal_only } => {
+                    let root = message(tx,thread,who)?;
+                    if root.parent.is_some() { return Err(invalid("follow-up requires a root thread")); }
+                    (root.channel,text,publish_at,labels,Some(thread),internal_only)
+                }
+                _ => unreachable!(),
+            };
             validate_text(&text)?; validate_labels(&labels)?;
             if publish_at<=now() || publish_at>i64::MAX as u64 { return Err(invalid("publish_at must be in the future")); }
-            ensure_channel(tx,who,&channel)?;
+            if thread.is_some() { who.check(&channel)?; } else { ensure_channel(tx,who,&channel)?; }
             tx.execute("INSERT INTO schedules(credential,actor,channel,text,labels,publish_at) VALUES (?1,?2,?3,?4,?5,?6)",params![who.id,author,channel,text,serde_json::to_string(&labels)?,publish_at])?;
             let id=tx.last_insert_rowid() as u64;
             if let Some(sender) = sender { tx.execute("INSERT INTO schedule_senders(schedule,sender) VALUES (?1,?2)", params![id,sender])?; }
-            emit(tx,&who.actor,&channel,EventKind::Scheduled { id,channel:channel.clone(),publish_at })?; Ok(Some(id))
+            if let Some(thread) = thread { tx.execute("INSERT INTO schedule_threads(schedule,thread,internal) VALUES (?1,?2,?3)",params![id,thread,internal])?; }
+            if !internal { emit(tx,&who.actor,&channel,EventKind::Scheduled { id,channel:channel.clone(),publish_at })?; } Ok(Some(id))
         }
         CancelSchedule { id } => {
             let row: Option<(u64,String)> = tx.query_row("SELECT credential,channel FROM schedules WHERE id=?1",[sql_id(id)?],|r| Ok((r.get(0)?,r.get(1)?))).optional()?;
             let (credential,channel)=row.ok_or_else(|| invalid("unknown schedule"))?; who.check(&channel)?;
             if credential!=who.id { return Err(forbidden()); }
+            let internal: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM schedule_threads WHERE schedule=?1 AND internal=1)",[id],|r|r.get(0))?;
             tx.execute("DELETE FROM schedules WHERE id=?1",[id])?;
-            emit(tx,&who.actor,&channel,EventKind::ScheduleCanceled { id,channel:channel.clone() })?; Ok(Some(id))
+            if !internal { emit(tx,&who.actor,&channel,EventKind::ScheduleCanceled { id,channel:channel.clone() })?; } Ok(Some(id))
         }
     }
 }
@@ -957,16 +983,26 @@ fn dependency(tx: &Transaction<'_>, who: &Identity, channel: &str, id: u64) -> R
     m.task.ok_or_else(|| invalid("dependency must be a visible task"))
 }
 
+fn record_start(tx: &Transaction<'_>, actor: &str, mut m: Message, at: u64) -> Result<()> {
+    let t=m.task.as_mut().ok_or_else(|| invalid("not a task"))?;
+    if t.started_at.is_none() {
+        t.started_at=Some(at);
+        if matches!(t.state,TaskState::Ready|TaskState::Claimed) { t.state=TaskState::InProgress; }
+        save(tx,actor,&m)?;
+    }
+    Ok(())
+}
+
 fn settle_tasks(tx: &Transaction<'_>) -> Result<()> {
     let messages=all_messages(tx)?;
     let mut states: BTreeMap<_,_>=messages.iter().filter_map(|m| m.task.as_ref().map(|t|(m.id,t.state))).collect();
     let manual: BTreeSet<u64>=tx.prepare("SELECT message FROM task_blocks")?.query_map([],|r|r.get(0))?.collect::<std::result::Result<_,_>>()?;
     for mut m in messages {
         let Some(t)=m.task.as_mut() else { continue };
-        let expired=t.state==TaskState::Claimed && t.expires_at.is_none_or(|v|v<=now());
-        if !expired && !matches!(t.state,TaskState::Ready|TaskState::Waiting|TaskState::Blocked) { continue; }
+        let expired=t.owner.is_some() && t.expires_at.is_none_or(|v|v<=now());
+        if !expired && (t.owner.is_some() || !matches!(t.state,TaskState::Ready|TaskState::Waiting|TaskState::Blocked|TaskState::InProgress)) { continue; }
         let next=if manual.contains(&m.id) || t.needs.iter().any(|id|matches!(states.get(id),Some(TaskState::Failed|TaskState::Canceled|TaskState::Blocked))) { TaskState::Blocked }
-            else if t.needs.iter().all(|id|states.get(id)==Some(&TaskState::Completed)) { TaskState::Ready } else { TaskState::Waiting };
+            else if t.needs.iter().all(|id|states.get(id)==Some(&TaskState::Completed)) { if t.started_at.is_some() { TaskState::InProgress } else { TaskState::Ready } } else { TaskState::Waiting };
         states.insert(m.id,next);
         if expired || next!=t.state { t.state=next; t.owner=None; t.expires_at=None; save(tx,"system",&m)?; }
     }
@@ -975,12 +1011,14 @@ fn settle_tasks(tx: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 fn maintain(tx: &Transaction<'_>) -> Result<()> {
+    tx.execute("DELETE FROM schedules WHERE id IN (SELECT schedule FROM schedule_threads WHERE internal=1) AND credential IN (SELECT id FROM credentials WHERE revoked=1 OR expires<=?1)",[now()])?;
     let expired=tx.prepare("SELECT s.id,s.channel FROM schedules s JOIN credentials c ON c.id=s.credential WHERE c.revoked=1 OR (c.expires IS NOT NULL AND c.expires<=?1)")?.query_map([now()],|r|Ok((r.get::<_,u64>(0)?,r.get::<_,String>(1)?)))?.collect::<std::result::Result<Vec<_>,_>>()?;
     for (id,channel) in expired { tx.execute("DELETE FROM schedules WHERE id=?1",[id])?; emit(tx,"system",&channel,EventKind::ScheduleCanceled { id,channel:channel.clone() })?; }
-    let rows=tx.prepare("SELECT s.id,s.actor,s.channel,s.text,s.labels,c.actor FROM schedules s JOIN credentials c ON c.id=s.credential WHERE s.publish_at<=?1 AND c.revoked=0 AND (c.expires IS NULL OR c.expires>?1) ORDER BY s.publish_at,s.id")?.query_map([now()],|r|Ok((r.get::<_,u64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?)))?.collect::<std::result::Result<Vec<_>,_>>()?;
-    for (id,author,channel,text,labels,actor) in rows {
+    tx.execute("UPDATE schedule_threads SET fired=1 WHERE internal=1 AND fired=0 AND schedule IN (SELECT id FROM schedules WHERE publish_at<=?1)",[now()])?;
+    let rows=tx.prepare("SELECT s.id,s.actor,s.channel,s.text,s.labels,c.actor,t.thread FROM schedules s JOIN credentials c ON c.id=s.credential LEFT JOIN schedule_threads t ON t.schedule=s.id WHERE s.publish_at<=?1 AND coalesce(t.internal,0)=0 AND c.revoked=0 AND (c.expires IS NULL OR c.expires>?1) ORDER BY s.publish_at,s.id")?.query_map([now()],|r|Ok((r.get::<_,u64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get(6)?)))?.collect::<std::result::Result<Vec<_>,_>>()?;
+    for (id,author,channel,text,labels,actor,parent) in rows {
         let sender: Option<String> = tx.query_row("SELECT sender FROM schedule_senders WHERE schedule=?1", [id], |r| r.get(0)).optional()?;
-        let message_id=insert(tx,&actor,sender.as_deref(),NewMessage { channel:channel.clone(),parent:None,author,text,labels:serde_json::from_str(&labels)?,task:None })?;
+        let message_id=insert(tx,&actor,sender.as_deref(),NewMessage { channel:channel.clone(),parent,author,text,labels:serde_json::from_str(&labels)?,task:None })?;
         tx.execute("DELETE FROM schedules WHERE id=?1",[id])?;
         emit(tx,"system",&channel,EventKind::SchedulePublished { id,channel:channel.clone(),message_id })?;
     }

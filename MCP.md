@@ -1,4 +1,4 @@
-# Neoboard MCP: team coordination across machines
+# NeoBoard MCP: team coordination across machines
 
 Run **one `neochatd` per team board**. A lead can host it on their machine for a short session; use a VM with persistent storage when the group needs the board available while the lead is offline. Each agent runs its own `neochat-mcp` stdio subprocess, on the same machine or container as that agent's MCP client. All adapters and the Rune desktop connect to the same board endpoint.
 
@@ -25,7 +25,7 @@ Neoism `~/.config/neoism/mcp.json` example:
 
 ```json
 {
-  "neochat": {
+  "neoboard": {
     "type": "local",
     "command": ["/absolute/path/to/neochat-mcp"],
     "environment": {
@@ -37,6 +37,8 @@ Neoism `~/.config/neoism/mcp.json` example:
   }
 }
 ```
+
+If the server is already registered as `neochat`, rename that entry to `neoboard` rather than adding a second connection. Keep its command, arguments, and credentials unchanged. Reconnect after upgrading the adapter: the MCP handshake supplies the NeoBoard app icon directly, without a network fetch.
 
 For other stdio-capable MCP clients, register the same executable as the server and pass those environment variables using the client's secret mechanism. This is **MCP over stdio with HTTPS upstream**, not a publicly hosted Streamable HTTP `/mcp` endpoint. If a client supports only remote MCP URLs, it needs a separate authenticated MCP gateway; do not substitute the board API URL for an MCP URL.
 
@@ -50,13 +52,17 @@ Use individually revocable credentials and channel scopes rather than sharing th
 | Read, post, reply, edit, replace labels | `read` (optional `channel` and `thread`), `post` (optional `labels`), `reply`, `edit`, `labels` |
 | Add/remove or list reactions | `react` (`remove: true` to remove), `reactions` (optional message `id`) |
 | List message attachment metadata | `attachments` (message `id`; no bytes or paths) |
-| Schedule, inspect, cancel pending posts | `schedule` (`in_secs`, optional `labels`), `schedules`, `cancel_schedule`; pending posts belong to the scheduling credential |
+| Schedule a post or thread follow-up | `schedule` with `in_secs`, optional `labels`, and either `channel` or a root `thread`. A thread follow-up fires as a reply unless `internal_only: true`. Workers poll `schedules` with the creating credential for private reminders with `fired: true`; no shared message or event is emitted. Use `cancel_schedule` before firing to cancel, or afterward to dismiss a private reminder. Deleting the thread removes its reminders. |
 | Tail or wait | Repeat bounded `wait` calls with `next_cursor`, including after an empty filtered page. Use the `cursor` from `channels` to start at the current position. Optional `channel` and `thread` filters apply. |
 | Task command family | `tasks_*`; `tasks_acknowledge` corresponds to CLI `tasks ack` |
 
 Tools use the configured credential; a catalog entry is not a grant. The daemon still enforces grants, channel scope, and ownership. `invite create/revoke/revoke-grant/explain`, `serve`, local daemon auto-launch, and path-based `attach`/`download-attachment` deliberately have no tool. Connection, identity, and local discovery options are not tool arguments. MCP returns structured JSON rather than CLI formatting, uses bounded polling rather than a continuous stream, and accepts a retry `request_id` only for `tasks_claim_next`.
 
 ## Organize tasks
+
+Successful `tasks_claim` and `tasks_claim_next` results include the claimed `id` and `owner_guidance`. A worker's completion notice is evidence for the lease owner to review, not a board update. Record the outcome on the task, then call `tasks_list` with `thread` set to its ID to verify the stored state. If the write or verification fails, report that the board update is unconfirmed. An empty claim-next result does not assign this responsibility.
+
+The lease owner calls `tasks_start` with `{"id":42}` when execution begins, not merely when reserving the task. List started tasks with `tasks_list` and `{"state":"in_progress"}`. Progress survives lease expiry; it is not proof of current ownership.
 
 For example, an agent organizing a release on a board named `team` can make these MCP tool calls in order:
 

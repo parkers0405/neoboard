@@ -12,8 +12,8 @@ pub(super) fn tools(channel: &Value, text: &Value, id: &Value, offset: &Value, l
         ("react", "Add your reaction, or remove it with remove: true.", json!({"id":id,"reaction":{"type":"string","minLength":1,"maxLength":64},"remove":{"type":"boolean"}}), vec!["id","reaction"]),
         ("reactions", "List visible reactions, optionally for one message.", json!({"id":id,"offset":offset,"limit":limit}), vec![]),
         ("attachments", "List attachment metadata for a visible message, never file contents.", json!({"id":id,"offset":offset,"limit":limit}), vec!["id"]),
-        ("schedule", "Schedule a labeled post in an accessible channel after in_secs seconds.", json!({"channel":channel,"text":text,"in_secs":id,"labels":labels}), vec!["channel","text","in_secs"]),
-        ("schedules", "List pending posts belonging to your credential.", json!({"offset":offset,"limit":limit}), vec![]),
+        ("schedule", "Schedule a post after in_secs seconds. Supply either channel or root thread. For thread reminders, internal_only delivers privately via schedules instead of posting a reply.", json!({"channel":channel,"thread":id,"internal_only":{"type":"boolean"},"text":text,"in_secs":id,"labels":labels}), vec!["text","in_secs"]),
+        ("schedules", "List your pending posts and private reminders. Fired private reminders remain until cancel_schedule dismisses them.", json!({"offset":offset,"limit":limit}), vec![]),
         ("cancel_schedule", "Cancel one of your pending posts.", json!({"id":id}), vec!["id"]),
         ("sprints_list", "List visible sprints, optionally for one board.", json!({"board":channel,"offset":offset,"limit":limit}), vec![]),
         ("sprints_create", "Create a sprint on a board.", json!({"board":channel,"title":text,"description":{"type":"string","maxLength":16384}}), vec!["board","title"]),
@@ -59,7 +59,12 @@ pub(super) fn call(c: &Client, name: &str, a: &Value) -> Option<Result<Value, &'
         "schedule" => {
             let publish_at = SystemTime::now().duration_since(UNIX_EPOCH).ok().and_then(|d| d.as_secs().checked_add(a["in_secs"].as_u64()?));
             let Some(publish_at) = publish_at.filter(|t| *t <= i64::MAX as u64) else { return Some(Err("invalid_arguments")); };
-            Action::Schedule { channel: string("channel"), text: string("text"), labels: match labels() { Ok(v) => v, Err(e) => return Some(Err(e)) }, publish_at }
+            let labels = match labels() { Ok(v) => v, Err(e) => return Some(Err(e)) };
+            match (a["channel"].as_str(),a["thread"].as_u64()) {
+                (Some(channel),None) if a.get("internal_only").is_none() => Action::Schedule { channel:channel.into(),text:string("text"),labels,publish_at },
+                (None,Some(thread)) => Action::ScheduleFollowup { thread,text:string("text"),labels,publish_at,internal_only:a["internal_only"] == true },
+                _ => return Some(Err("invalid_arguments")),
+            }
         }
         "schedules" => return Some(c.schedules().map_err(upstream_error).and_then(|v| list(v.into_iter(), a, name))),
         "cancel_schedule" => Action::CancelSchedule { id: id? },

@@ -30,6 +30,23 @@ test('scoped reads and writes exclude private job; non-owner cannot renew or fin
     await assert.rejects(client.action({ type: 'claim', id: 2, lease_secs: 10 }), { status: 404 });
   }
   await alpha.action({ type: 'claim', id: 1, lease_secs: 10 });
+  await assert.rejects(beta.action({ type: 'start', id: 1 }), { status: 409 });
   await assert.rejects(beta.action({ type: 'renew', id: 1, lease_secs: 10 }), { status: 409 });
   await assert.rejects(beta.action({ type: 'complete', id: 1, text: 'wrong owner' }), { status: 409 });
+});
+
+test('starting records progress independently of the lease', async () => {
+  const { alpha, beta, advance } = workerFixture();
+  const task = async () => (await alpha.snapshot()).messages[0].task;
+  await alpha.action({ type: 'claim', id: 1, lease_secs: 10 });
+  assert.equal((await task()).state, 'claimed');
+  await alpha.action({ type: 'start', id: 1 });
+  const firstStart = (await task()).started_at;
+  assert.equal(typeof firstStart, 'number');
+  advance(10);
+  assert.equal((await task()).state, 'in_progress');
+  assert.equal((await task()).owner, null);
+  await assert.rejects(alpha.action({ type: 'complete', id: 1, text: 'late' }), { status: 409 });
+  assert.equal(await workOnce(beta, async () => advance(1)), 'completed');
+  assert.equal((await task()).started_at, firstStart);
 });

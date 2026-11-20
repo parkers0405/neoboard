@@ -1,0 +1,33 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="NeoBoard" Manufacturer="NeoBoard contributors" Version="$(var.Version)"
+           UpgradeCode="BA6BECB8-74B8-4A0C-915F-C472F47006C9" Scope="perMachine">
+    <MajorUpgrade DowngradeErrorMessage="A newer version of NeoBoard is already installed." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+    <StandardDirectory Id="ProgramMenuFolder" />
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="NeoBoard" />
+    </StandardDirectory>
+    <Feature Id="Main" Title="NeoBoard" Level="1">
+      <ComponentGroupRef Id="Payload" />
+    </Feature>
+  </Package>
+  <Fragment>
+    <ComponentGroup Id="Payload" Directory="INSTALLFOLDER" Source="$(var.BinaryDir)">
+      <Component><File Name="neoboard.exe" /></Component>
+      <Component><File Name="neochat.exe" /></Component>
+      <Component><File Name="neochatd.exe" /></Component>
+      <Component><File Name="neochat-mcp.exe" /></Component>
+      <Component><File Name="neochat-share.exe" /></Component>
+      <Component>
+        <File Name="neochat-desktop.exe">
+          <Shortcut Id="LaunchNeoBoard" Directory="ProgramMenuFolder" Name="NeoBoard" Advertise="yes" WorkingDirectory="INSTALLFOLDER" />
+        </File>
+      </Component>
+      <Component><File Name="LICENSE" /></Component>
+      <Component><File Name="LICENSE-Rune" /></Component>
+      <Component><File Name="LICENSE-winit" /></Component>
+      <Component><File Name="MCP.md" /></Component>
+      <Component><File Name="OFL.GeistMono.txt" /></Component>
+    </ComponentGroup>
+  </Fragment>
+</Wix>

@@ -4,9 +4,9 @@ Neoboard is a self-hosted board for people and coding agents. The Rune desktop a
 
 ## Release downloads
 
-The [GitHub Releases page](https://github.com/parkers0405/neoboard/releases) is the distribution point for native bundles. The target matrix matches Neoism: Linux x86-64, macOS Apple Silicon, and Windows x86-64. Extract the entire archive into a dedicated folder rather than moving just the desktop executable: the local daemon, CLI, and MCP adapter belong together. Configure your agent to use the extracted `neochat-mcp` executable (`neochat-mcp.exe` on Windows).
+Download NeoBoard from [GitHub Releases](https://github.com/parkers0405/neoboard/releases). On macOS Apple Silicon, open the DMG and drag NeoBoard to Applications. On Windows x86-64, run the MSI. On Linux x86-64, extract the tarball and run `neochat-desktop`. Keep all companion binaries together if you use a portable archive instead.
 
-For maintainers, **Actions > NeoBoard release bundles > Run workflow** builds test artifacts without publishing. A `v` tag matching the root package version builds all three platforms and creates a draft release only after every bundle succeeds. Test a fresh install and an upgrade on each target before publishing the draft. NeoBoard's own code is [MIT licensed](LICENSE); bundled dependencies and assets retain their upstream terms.
+For maintainers, **Actions > NeoBoard release bundles > Run workflow** with no tag builds artifacts without publishing. A release tag builds all three platforms and publishes a full release after the required installer and archive checksums pass. NeoBoard's own code is [MIT licensed](LICENSE); bundled dependencies and assets retain their upstream terms.
 
 ## Run locally
 

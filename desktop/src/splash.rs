@@ -32,6 +32,29 @@ fn color(hex:u32)->rune::Color {
 }
 pub(super) fn wordmark_ink() -> rune::Color { color(0xe8e8e8) } // Neoism Dark splash foreground.
 
+pub fn card_title(app: &App, word: &str) -> El {
+    let pixel = 2.15;
+    let width = word.len() as f32 * 8.5 * pixel;
+    let height = 30.;
+    let mut shape = Shape::new().view_box(width,height);
+    for (i,letter) in word.bytes().enumerate() {
+        let Some(g) = splash_art::TITLE_LETTERS.iter().position(|&c|c == letter.to_ascii_lowercase()) else { continue };
+        let x = i as f32 * 8.5 * pixel;
+        for (dx,dy,alpha) in [(1.6,-1.3,0.35),(0.,0.,1.)] {
+            for (r,bits) in splash_art::TITLE_MASKS[g].iter().enumerate() { for c in 0..7 {
+                if bits & (1 << (6-c)) != 0 {
+                    shape = shape.fill(rect_points([x+c as f32*pixel+dx,14.+r as f32*pixel+dy,pixel+0.1,pixel+0.1]).to_vec(),wordmark_ink().alpha(alpha));
+                }
+            }}
+        }
+        splash_art::fire(8+g,app.splash.clock as f32,|_,_,[fx,fy,w,h],tint| {
+            let k=pixel/31.25;
+            shape=std::mem::take(&mut shape).fill(rect_points([x+fx*k,14.+(fy+250.)*k,w*k,h*k]).to_vec(),color(tint));
+        });
+    }
+    canvas(shape).w(width).h(height)
+}
+
 pub fn view(app:&App, max_width: f32)->El {
     let s=&app.splash;
     let width=((app.width-if app.sidebar {200.}else{0.})-52.).clamp(120.,720.).min(max_width);
@@ -78,6 +101,10 @@ mod tests {
         assert_eq!(rt.state.splash.over,Some(7));
         assert!(rt.state.splash.animation.is_active(rt.state.splash.clock));
         let (x,y)=rt.find("home-setup").unwrap();rt.pointer_move(x,y);rt.pointer_down(x,y);rt.pointer_up(x,y);rt.frame(1./60.);
+        for key in ["setup-agent", "setup-agent-Codex"] {
+            let (x,y)=rt.find(key).unwrap();rt.pointer_move(x,y);rt.pointer_down(x,y);rt.pointer_up(x,y);rt.frame(1./60.);
+        }
+        assert_eq!(rt.state.setup_agent.name(), "Codex");
         let (x,y)=rt.find("copy-setup").unwrap();rt.pointer_move(x,y);rt.pointer_down(x,y);rt.pointer_up(x,y);rt.frame(1./60.);
         assert_eq!(rt.state.home_copied,Some("copy-setup"));
     }

@@ -1,5 +1,8 @@
 mod connection;
+#[cfg(test)]
+mod live_organization_test;
 mod profile;
+mod release_update;
 // The shared multiplayer generator's clock helper resolves this module name.
 use profile as cursor_style;
 mod fixture;
@@ -10,6 +13,7 @@ mod splash;
 mod splash_art;
 mod zoom;
 mod onboarding;
+mod setup_guide;
 
 use std::{collections::BTreeMap, sync::{OnceLock, mpsc}, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
 use neochat::protocol::{Action, Message, Snapshot, TaskState, EventKind, Reaction, ScheduledPost, Attachment};
@@ -22,6 +26,7 @@ const ALL_TASKS: usize = FILTERS.len() - 1;
 const OPEN_TASKS: usize = 0;
 
 #[derive(Clone, PartialEq)]
+#[derive(Debug)]
 enum Page { Home, Activity, Tasks, Scheduled, Channel(String) }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -40,6 +45,7 @@ fn preferences_path() -> Option<std::path::PathBuf> {
 }
 
 struct App {
+    release: release_update::Session,
     task_title: TextEdit,
     task_description: TextEdit,
     task_area: TextEdit,
@@ -77,6 +83,8 @@ struct App {
     project_menu: bool,
     home_copied: Option<&'static str>,
     setup_open: bool,
+    setup_agent: setup_guide::Agent,
+    setup_choices: bool,
     splash: splash::Splash,
     filter: usize,
     query: TextEdit,
@@ -109,6 +117,7 @@ struct App {
     positions: BTreeMap<u64, usize>,
     width: f32,
     feed_h: f32,
+    feed_page: (String, usize),
     thread_h: f32,
     reply_owner: Option<u64>,
     reply_drafts: BTreeMap<u64, TextEdit>,
@@ -126,7 +135,7 @@ struct App {
     notice: Option<String>,
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct TaskFilters { channel:Option<String>, assignee:Option<String>, thread:Option<u64> }
 impl TaskFilters {
     fn matches(&self,m:&Message,me:Option<&str>)->bool {
@@ -210,10 +219,11 @@ impl App {
     fn new() -> Self {
         let fixture = OPTIONS.get().is_some_and(|o| o.fixture);
         let mut app = Self {
-            local_name: OPTIONS.get().and_then(|o| o.profile.clone()).unwrap_or_else(|| profile::local_name(fixture)),
+            release: Default::default(),
+            local_name: OPTIONS.get().and_then(|o| o.profile.clone()).unwrap_or_else(|| profile::local_name(fixture || cfg!(test))),
             profiles: profile::Profiles::default(),
             zoom: zoom::Zoom::default(),
-            snapshot: Snapshot { cursor: 0, channels: vec![], messages: vec![] }, board_cache:None,board_extra:Default::default(),page: Page::Home, project:String::new(), options: OPTIONS.get().cloned().unwrap_or_default(), onboarding: Default::default(), project_menu:false, home_copied: None, setup_open:false, splash: Default::default(),
+            snapshot: Snapshot { cursor: 0, channels: vec![], messages: vec![] }, board_cache:None,board_extra:Default::default(),page: Page::Home, project:String::new(), options: OPTIONS.get().cloned().unwrap_or_default(), onboarding: Default::default(), project_menu:false, home_copied: None, setup_open:false, setup_agent:Default::default(), setup_choices:false, splash: Default::default(),
             share:Default::default(), saved_boards:BTreeMap::new(), me:None, personal_name:edit(""), member_list:None, pick_assignee:false, details_picker:None, task_filters:Default::default(), aliases:BTreeMap::new(),
             filter: ALL_TASKS, query: edit(""), channel: edit(""), draft: edit(""), reply: edit(""),
             labels: edit(""), needs: edit(""), assignee: edit(""), new_channel: edit(""), creating_channel: None,
@@ -221,7 +231,7 @@ impl App {
             new_area: edit(""), creating_area: None, task_parent: None, task_global: false, organization: Default::default(), group_by_area: false, area_filter: None,
             dialog: None, compact: true, compose_file_open: false, compose_file_owner: None, compose_file: edit(""), sidebar: true, oldest: true, thread: None, task_menu:None,hover_row:None,row_menu:None,row_anchor:[0.;4], status: "connecting".into(), error: None,
             pending: false, commands: None, updates: None, now: 0, fixture, seen: BTreeMap::new(), positions: BTreeMap::new(),
-            width: 1252.0, feed_h: 400.0, thread_h: 400.0,
+            width: 1252.0, feed_h: 400.0, feed_page: Default::default(), thread_h: 400.0,
             reply_owner: None, reply_drafts: BTreeMap::new(),
             reply_labels: BTreeMap::new(), sent_reply_labels: None,
             reactions: vec![], schedules: vec![], schedule_at: edit(""), show_schedule: false,
@@ -253,6 +263,7 @@ impl App {
         if let Err(e)=result {self.error=Some(format!("Could not save preferences: {e}"));}
     }
     fn navigate(&mut self, page: Page) {
+        self.feed_page = Default::default();
         self.project_menu=false;
         self.home_copied=None;
         self.row_menu=None;self.hover_row=None;
@@ -551,6 +562,7 @@ impl App {
 }
 
 fn setup(app: &mut App, wake: rune::Waker) {
+    app.release.start(app.fixture, wake.clone());
     if app.fixture { return; }
     let (commands, updates) = connection::start(app.options.clone(), wake);
     app.commands = Some(commands);
@@ -691,7 +703,7 @@ fn main() {
     rune::App::new(AppSpec {
         fonts: &[include_bytes!("../assets/fonts/GeistMono-Regular.otf")],
         families: ("Geist Mono", "Geist Mono"),
-        setup: Some(setup), poll: Some(poll), min_size: Some((620.0, 420.0)),
+        setup: Some(setup), poll: Some(|a, t, tx| a.release.poll(t, tx) | poll(a, t, tx)), min_size: Some((620.0, 420.0)),
         on_key: Some(|app, e, tx| {
             let scale = app.zoom.factor();
             if app.zoom.key(e, tx) {
@@ -700,6 +712,7 @@ fn main() {
                 }
                 return true;
             }
+            if !matches!(app.release.stage, release_update::Stage::Hidden) && e.key == Key::Escape { app.release.dismiss(); return true; }
             if app.onboarding_visible() && e.key == Key::Escape { return true; }
             if e.key == Key::Escape {
                 if app.project_menu {app.project_menu=false;return true;}
@@ -714,6 +727,8 @@ fn main() {
         }),
         scenes: &[("tasks-sparse", |a| fixture::load(a, false)), ("tasks-dense", |a| fixture::load(a, true)),
             ("settings", |a| {fixture::load(a,true); a.dialog=Some(Dialog::Settings);}),
+            ("update-offer", |a| {fixture::load(a,true); a.release.stage=release_update::Stage::Offer(semver::Version::new(1,2,0));}),
+            ("update-running", |a| {fixture::load(a,true); a.release.stage=release_update::Stage::Running;}),
             ("personal", |a| {fixture::load(a,true);a.dialog=Some(Dialog::Personal);}),
             ("task-filters", |a| {fixture::load(a,true);a.dialog=Some(Dialog::Filters);}),
             ("task-status-menu", |a| { fixture::load(a,true); a.dialog = Some(Dialog::Filters); a.details_picker = Some("filter-status"); }),
@@ -771,6 +786,23 @@ mod tests {
         assert_eq!(parse_labels(&format_labels(&labels)).unwrap(), labels);
         assert!(parse_labels("a=1 a=2").is_err());
         assert!(parse_labels("a=\"oops").is_err());
+    }
+    #[test] fn long_feeds_extend_at_the_scroll_edge() {
+        for page in [Page::Tasks, Page::Activity] {
+            let mut app = App::new(); fixture::load(&mut app, false);
+            let sample = app.snapshot.messages[0].clone();
+            app.snapshot.messages = (1..=95).map(|id| Message { id, ..sample.clone() }).collect();
+            let history = page == Page::Activity;
+            app.page = page; app.oldest = true;
+            let mut rt = rune::Runtime::new(app,view::root,(900.,650.),rune::Env::new(true,1.));
+            for _ in 0..8 { rt.frame(1./60.); }
+            let row = if history { "message-55" } else { "task-41" };
+            assert!(!rt.elements().iter().any(|e|e.key.as_deref()==Some(row)));
+            let feed = rt.elements().into_iter().filter_map(|e|e.key).find(|k|k.starts_with("paged-")).unwrap();
+            rt.update(move |_,tx|tx.scroll_to_instant(feed,0.,if history {0.} else {100000.}));
+            for _ in 0..8 { rt.frame(1./60.); }
+            assert!(rt.elements().iter().any(|e|e.key.as_deref()==Some(row)), "missing {row}");
+        }
     }
     #[test] fn parent_navigation_and_search() {
         let mut app = App::new(); fixture::load(&mut app, true);

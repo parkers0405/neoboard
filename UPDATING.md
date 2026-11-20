@@ -1,0 +1,15 @@
+# Updating a Neoboard release
+
+Run `neoboard update` from the installed bundle to install the **latest published release**, even if it is the same version. Stop the desktop, daemon, sharing and MCP processes first. Keep board data outside the install directory; back it up before starting a new daemon version. The updater does not start programs, migrate databases, or read tokens. Use a dedicated directory in a trusted, writable parent, not a shared `bin` directory, Cargo checkout or build tree. Don't run concurrent installers or modify the directory during an update.
+
+**Linux x86-64 / Apple Silicon macOS:** the updater verifies and extracts into a sibling directory, then swaps the two directories with one filesystem operation. If the filesystem does not support atomic exchange, it fails rather than falling back to per-file replacement. Restart your processes from the normal path. The printed sibling path contains the complete previous bundle. For binary rollback, stop everything and launch from that directory instead. Keep the backup until the new release is confirmed; binary rollback is not a database restore.
+
+**Windows x86-64:** `neoboard.exe update` prints the path of a complete, verified sibling bundle. It does not overwrite or rename the running `.exe`. After the updater exits, stop all Neoboard processes and services, including `neochatd.exe`, close MCP clients, and change PATH, shortcuts and service executable paths to the printed folder. Open a new terminal and use `where.exe neoboard` and `where.exe neochatd` to confirm the new folder takes precedence before restarting. To roll back, point them back to the original folder. Never merge the directories.
+
+## Release inputs and trust
+
+Only `https://github.com/parkers0405/neoboard/releases/latest/download/` is used as the release source (HTTPS redirects for GitHub's asset hosting). The filenames are `neoboard-linux-x86_64.zip`, `neoboard-darwin-aarch64.zip` and `neoboard-windows-x86_64.zip`, each with an appended `.sha256` sidecar. The sidecar must contain one hex SHA-256, optionally followed by the matching basename (GNU text or binary format). This detects damaged or mismatched downloads; it is not an independent publisher signature. If a release changes between requests and hashes differ, rerun the command.
+
+Use a flat, single-disk, non-ZIP64 stored/deflated ZIP containing `neoboard`, `neochat`, `neochatd`, `neochat-share`, `neochat-mcp`, and `neochat-desktop` (all with `.exe` on Windows), plus `LICENSE`. The allowlist includes the packager's `MCP.md`, `LICENSE-Rune`, `LICENSE-winit`, and `OFL.GeistMono.txt`, and optional `README`, `README.md`, `LICENSE.txt`, `NOTICE`, `NOTICE.txt`. Coordinate new filenames before publishing. No nested paths, links, empty entries or duplicate names. Maximums: 1 KiB sidecar, 256 MiB ZIP, 16 entries, 192 MiB per entry and 512 MiB expanded total. Unknown files in the installed directory cause refusal rather than data removal.
+
+Offline verification: `cargo test --locked --offline --bin neoboard`. Fixtures use temporary directories and never fetch or execute release assets.

@@ -377,7 +377,7 @@ fn dialog(app:&App, page:Dialog, viewport: [f32; 2], filter_anchor: Option<[f32;
                     }
                 }
             }
-            let selector=|key:&'static str,title:String|button(format!("{title}  ▾"),move|a|{a.pick_assignee=false;a.details_picker=if a.details_picker==Some(key){None}else{Some(key)};}).key(key).border(1.,gray(60)).radius(7.);
+            let selector=|key:&'static str,title:String|select_trigger(title,app.details_picker==Some(key),move|a|{a.pick_assignee=false;a.details_picker=if a.details_picker==Some(key){None}else{Some(key)};}).key(key);
             if page == NewTask && app.creating_task { panel } else {
             let channel = if current.is_empty() {"Choose a channel".into()} else {format!("#{}",current.split_once('/').map_or(current.as_str(),|(_,s)|s))};
             let locked_channel = page == NewTask && (app.editing_task.is_some() || app.task_parent.is_some());
@@ -467,9 +467,9 @@ fn dialog(app:&App, page:Dialog, viewport: [f32; 2], filter_anchor: Option<[f32;
             let mut p=panel.child(muted("Search")).child(form_input(&app.query,"filter","Words or labels").on_edit(|a:&mut App|&mut a.query));
             let selector = |key: &'static str, title: &str, value: String| {
                 row().w_full().items_center().child(muted(title)).child(spacer())
-                    .child(button(format!("{value}  ▾"), move |a| {
+                    .child(select_trigger(value,app.details_picker==Some(key), move |a| {
                         a.details_picker = if a.details_picker == Some(key) { None } else { Some(key) };
-                    }).key(key).border(1.,gray(52)).radius(7.))
+                    }).key(key))
             };
             if app.page==Page::Tasks {
                 let filters=&app.task_filters;
@@ -620,6 +620,26 @@ fn thread(app: &App, root: &Message) -> El {
         .child(composer(app, true))
 }
 
+fn select_trigger(value:String,open:bool,action:impl Fn(&mut App)+'static)->El {
+    row().h(30.).px(10.).gap(10.).items_center().radius(6.).border(1.,gray(if open{96}else{58})).fill(gray(22)).hover(gray(35))
+        .child(label(value).truncate()).child(spacer()).child(muted(if open{"▴"}else{"▾"})).on_press(action)
+}
+
+fn agent_picker(app:&App)->El {
+    let mut picker = col().w_full().gap(4.)
+        .child(select_trigger(app.setup_agent.name().into(),app.setup_choices,|a| a.setup_choices = !a.setup_choices).w_full().key("setup-agent"));
+    if app.setup_choices {
+        let mut choices = col().w_full().padding(4.).radius(6.).fill(gray(17)).border(1.,gray(55));
+        for agent in setup_guide::Agent::ALL {
+            choices = choices.child(row().w_full().h(28.).px(8.).items_center().radius(4.).hover(gray(36)).child(label(agent.name())).child(spacer()).children((app.setup_agent==agent).then(||muted("✓"))).on_press(move |a:&mut App| {
+                a.setup_agent = agent; a.setup_choices = false; a.home_copied = None;
+            }).key(format!("setup-agent-{}",agent.name())));
+        }
+        picker = picker.child(choices);
+    }
+    picker
+}
+
 fn setup_drawer(app:&App, width: f32)->El {
     let step = |index: &str, title: &str, description: &str, body: El| row().w_full().gap(12.)
         .child(col().w(24.).items_center().child(el().size(24.,24.).center().radius(5.).border(1.,gray(48)).child(muted(index))).child(el().w(1.).grow(1.).fill(gray(35))))
@@ -631,34 +651,14 @@ fn setup_drawer(app:&App, width: f32)->El {
         .child(row().child(spacer()).child(copy(key,title,contents.clone())))
         .child(el().w_full().scroll_x().child(label(contents).font(TextStyle::new(11.,400.))));
     let p=app.project.as_str();
-    let config = if app.remote() { r#"{
-  "neochat": {
-    "type": "local",
-    "command": ["/path/to/neochat-mcp"],
-    "environment": {
-      "NEOCHAT_URL": "{env:NEOCHAT_URL}",
-      "NEOCHAT_TOKEN": "{env:NEOCHAT_TOKEN}"
-    },
-    "enabled": true
-  }
-}"# } else { r#"{
-  "neochat": {
-    "type": "local",
-    "command": ["/path/to/neochat-mcp"],
-    "environment": {
-      "NEOCHAT_DATA_DIR": "{env:NEOCHAT_DATA_DIR}"
-    },
-    "enabled": true
-  }
-}"# };
+    let guide = setup_guide::Guide::new(app);
+    let picker = agent_picker(app);
     let mut cards=col().w_full().padding(16.).gap(12.)
         .child(row().w_full().gap(5.).items_center().child(label("Follow these steps").wrap().w(0.).grow(1.))
-            .child(copy("copy-setup","Copy prompt",onboarding::prompt(p))))
-        .child(step("1","Build the MCP adapter","From the Neoism checkout, build the NeoBoard adapter on the machine running your agent.",
-            block("copy-mcp-build","Copy command","cargo build --locked --manifest-path neoboard/Cargo.toml --bin neochat-mcp".into())))
-        .child(step("2","Configure Neoism",if app.remote() {"Merge this entry into ~/.config/neoism/mcp.json. Set the board URL and the agent's own scoped token in Neoism's environment."} else {"Merge this entry into ~/.config/neoism/mcp.json. Set NEOCHAT_DATA_DIR to the local board's data directory."},
-            block("copy-mcp-config","Copy JSON",config.into())))
-        .child(step("3","Verify the connection","Replace the binary path, restart the MCP client, then ask the agent to list channels for this board. Creating a task does not start an agent.", el()));
+            .child(copy("copy-setup","Copy for agent",guide.copy_text())))
+        .child(step("1","Connect to this board",&guide.intro,el()))
+        .child(step("2","Connect MCP","Choose your agent to see its configuration.",picker.child(muted(&guide.instruction).wrap()).child(block("copy-mcp-config","Copy",guide.snippet))))
+        .child(step("3","See available channels",&guide.question, el()));
     cards = cards.child(row().gap(4.).flex_wrap().children((!app.remote()).then(|| button("Share this board", |a| { a.setup_open = false; a.open_share(); })))
         .child(button("Join another board", |a| { a.setup_open = false; a.begin_add_board(); a.onboarding.joining = true; })));
     let panel=col().key("setup-drawer").w(width.min(490.)).h_full().fill(gray(0)).border(1.,gray(48))
@@ -670,7 +670,7 @@ fn home(app:&App, [width,height]:[f32;2])->El {
     let width=width-if app.sidebar{200.}else{0.};
     let narrow=width<540.;
     if narrow || height < 480. {
-        let shortcut = |title, key| button(title, |_| {}).key(key).w_full().border(1.,gray(48)).radius(7.).hover(gray(24));
+        let shortcut = |title, key| el().key(key).w_full().h(34.).center().child(splash::card_title(app,title)).border(1.,gray(48)).radius(7.).hover(gray(24));
         return col().w_full().h(0.).grow(1.).items_center().padding(10.).gap(5.)
             .child(crate::splash::view(app,(width-20.).min((height-166.).max(0.)*3.)))
             .child(shortcut("Setup", "home-setup").on_press(|a: &mut App|{a.setup_open=true;a.home_copied=None;}))
@@ -679,7 +679,7 @@ fn home(app:&App, [width,height]:[f32;2])->El {
     }
     let module=|key:&str| col().key(key).padding(14.).gap(7.).radius(12.).border(1.,gray(52)).hover(gray(18));
     let top=|tile:El| tile.w(0.).grow(1.).min_h(136.);
-    let setup=module("home-setup").child(muted("01 / GET STARTED")).child(label("Setup").font(TextStyle::new(18.,600.)))
+    let setup=module("home-setup").child(muted("01 / GET STARTED")).child(splash::card_title(app,"Setup"))
         .child(muted("Connect an agent, invite a teammate, or join a board.").wrap()).child(spacer()).child(label("Open guide  ›"))
         .on_press(|a:&mut App|{a.setup_open=true;a.home_copied=None;});
     let preview=|tasks:bool| {
@@ -691,7 +691,7 @@ fn home(app:&App, [width,height]:[f32;2])->El {
             if pos<3 {items.insert(pos,(rank,m));items.truncate(3);}
         }
         let mut panel=module(if tasks{"home-tasks"}else{"home-activity"}).child(muted(if tasks{"02 / WORK"}else{"03 / FEED"}))
-            .child(row().w_full().items_center().child(label(if tasks{"Tasks"}else{"Activity"}).font(TextStyle::new(18.,600.))).child(spacer()).child(muted("View all ›"))).child(line());
+            .child(row().w_full().items_center().child(splash::card_title(app,if tasks{"Tasks"}else{"Activity"})).child(spacer()).child(muted("View all ›"))).child(line());
         if items.is_empty(){panel=panel.child(muted(if tasks{"No open tasks."}else{"No activity in this project yet."}).wrap());}
         for (_,m) in items {let prefix=if tasks{format!("{:?}",m.task.as_ref().unwrap().state)}else{app.actor_label(&m.author).to_string()};panel=panel.child(row().w_full().gap(6.).child(muted(prefix)).child(label(m.text.lines().next().unwrap_or("")).grow(1.).w(0.).truncate()));}
         panel.on_press(move|a:&mut App|{a.query=edit("");a.filter=ALL_TASKS;a.navigate(if tasks{Page::Tasks}else{Page::Activity});})
@@ -708,7 +708,7 @@ fn onboarding_panel(app: &App) -> El {
     let (step, title, detail) = match o.step {
         Step::Name => ("01 / PROFILE", "Welcome to NeoBoard", "Choose the name teammates will see on the board."),
         Step::Board => ("02 / BOARD", if o.adding { "Add a board" } else { "Join or create a board" }, "Create a local board or join one with a private invite."),
-        Step::Connect => ("03 / AGENT SETUP", "Connect your agent", "Copy this prompt into Neoism to connect the MCP adapter to this board. You can also do this later from Home."),
+        Step::Connect => ("03 / AGENT SETUP", "Connect your agent", "Choose your agent and copy its setup guide. You can also do this later from Home."),
     };
     let mut panel = col().w_full().padding(18.).gap(10.)
         .child(muted(step)).child(label(title).font(TextStyle::new(20., 600.)).color(splash::wordmark_ink()).wrap())
@@ -758,9 +758,9 @@ fn onboarding_panel(app: &App) -> El {
             });
         }
         Step::Connect => {
-            let prompt = onboarding::prompt(&app.project);
-            panel = panel.child(chip(app.project.clone())).child(row().gap(8.)
-                .child(button(if app.home_copied == Some("onboarding-copy") { "Copied!" } else { "Copy MCP prompt" }, |_| {})
+            let prompt = setup_guide::Guide::new(app).copy_text();
+            panel = panel.child(chip(app.project.clone())).child(agent_picker(app)).child(row().gap(8.)
+                .child(button(if app.home_copied == Some("onboarding-copy") { "Copied!" } else { "Copy for agent" }, |_| {})
                     .key("onboarding-copy").on_press_tx(move |a: &mut App, tx| { tx.copy(prompt.clone()); a.home_copied = Some("onboarding-copy"); }))
                 .child(button("Open board", |a| a.onboarding = Default::default()).key("onboarding-open")));
         }
@@ -771,6 +771,31 @@ fn onboarding_panel(app: &App) -> El {
 
 fn onboarding_layer(app: &App, viewport: [f32; 2]) -> El {
     modal_frame("board-onboarding", viewport, 460., None, onboarding_panel(app), None, |_| {})
+}
+
+fn update_layer(app: &App, viewport: [f32; 2]) -> Option<El> {
+    use release_update::Stage;
+    let (title, detail) = match &app.release.stage {
+        Stage::Hidden => return None,
+        Stage::Offer(version) => ("Update available", format!("Neoboard {version} is available. You’re running {}. Update now or dismiss until the next launch.", env!("CARGO_PKG_VERSION"))),
+        Stage::Running => ("Updating Neoboard", "The packaged updater is running. It does not report download progress.".into()),
+        Stage::Finished(Ok(detail)) if cfg!(windows) => ("Update staged", format!("Your running installation has not been replaced. Finish your drafts before switching to the new bundle.\n\n{detail}")),
+        Stage::Finished(Ok(detail)) => ("Updater finished", format!("Finish your drafts before restarting Neoboard and its services.\n\n{detail}")),
+        Stage::Finished(Err(error)) => ("Update not confirmed", format!("{error} Finish your drafts. Close Neoboard and run the packaged neoboard update command in a terminal for details.")),
+    };
+    let mut body = col().w_full().padding(20.).gap(12.).child(label(title).font(TextStyle::new(16.,600.))).child(muted(detail).wrap());
+    if matches!(app.release.stage, Stage::Running) {
+        body = body.child(el().key("update-indeterminate").w(160.).h(5.).radius(2.).fill(gray(53))
+            .child(el().absolute(112.*app.release.pulse,0.).w(48.).h(5.).radius(2.).fill(gray(200))));
+    } else {
+        let mut actions = row().gap(8.).child(dialog_action(button("Dismiss", |a| a.release.dismiss())));
+        if matches!(app.release.stage, Stage::Offer(_)) {
+            if cfg!(windows) { body = body.child(muted("Windows locks running programs. The updater stages a separate bundle; you choose when to switch to it.").wrap()); }
+            actions = actions.child(dialog_action(button("Update", |a| a.release.accept())));
+        }
+        body = body.child(actions);
+    }
+    Some(modal_frame("release-update", viewport, 416., None, body, None, |a| a.release.dismiss()))
 }
 
 pub fn root(app: &App, cx: &mut Cx<App>) -> El {
@@ -786,15 +811,29 @@ pub fn root(app: &App, cx: &mut Cx<App>) -> El {
     });
     let shell = col().w_full().h_full().fill(gray(0)).children(titlebar);
     if first_run {
-        let content = el().w_full().h_full().child(onboarding_layer(app, viewport));
+        let content = el().w_full().h_full().child(onboarding_layer(app, viewport)).children(update_layer(app, viewport));
         return shell.child(zoom::wrap(app, cx, content));
     }
     app.profiles.begin_view();
     let mut main = col().key("main").w(0.0).grow(1.0).h_full().clip_soft(0.0).child(header(app)).child(line());
     if app.page==Page::Home {main=main.child(home(app,viewport));} else {
     let messages = app.visible();
+    let paged = matches!(app.page, Page::Tasks | Page::Activity);
+    let scope = format!("{:?}:{:?}:{:?}:{}:{}:{:?}:{:?}:{}",app.page,app.project,app.query.text,app.oldest,app.filter,app.task_filters,app.area_filter,app.group_by_area);
+    let limit = if !paged { usize::MAX } else if app.feed_page.0 == scope { app.feed_page.1 } else { 40 };
+    let older_above = app.page == Page::Activity && app.oldest;
+    let start = if older_above { messages.len().saturating_sub(limit) } else { 0 };
+    let more = messages.len() > limit;
+    let sentinel = || {
+        let scope = scope.clone();
+        let anchor = older_above.then(|| format!("message-{}",messages[start].id));
+        el().key(format!("page-edge-{scope}-{limit}")).w_full().h(4.).on_visible(move |a:&mut App,on,tx| {
+            if on { if let Some(key) = &anchor { tx.keep_on_screen(key.clone()); } a.feed_page = (scope.clone(),limit.saturating_add(40)); }
+        })
+    };
     let mut list = col().w_full();
     if matches!(app.page,Page::Activity | Page::Channel(_)) && app.oldest { list = list.min_h(app.feed_h).child(spacer()); }
+    if more && older_above { list = list.child(sentinel()); }
     if app.page == Page::Scheduled {
         list = list.child(muted("Your pending scheduled posts · UTC (not local time)").wrap().padding(20.0));
         let query = app.query.text.to_lowercase();
@@ -815,16 +854,21 @@ pub fn root(app: &App, cx: &mut Cx<App>) -> El {
         list = list.child(muted(if app.status == "connecting" { "connecting to board…" } else { "No messages match this view." }).padding(20.0));
     } else if app.page == Page::Tasks && app.group_by_area {
         let mut groups = BTreeMap::<(u8,&str),Vec<_>>::new();
-        for m in messages { groups.entry(app.task_group(m)).or_default().push(m); }
+        for &m in &messages { groups.entry(app.task_group(m)).or_default().push(m); }
+        let mut remaining = limit;
         for ((_,name),tasks) in groups {
+            if remaining == 0 { break; }
             list = list.child(row().key(format!("area-group-{name}")).w_full().h(33.).px(16.).gap(8.).items_center().fill(gray(14))
                 .child(label(name).truncate()).child(muted(tasks.len().to_string())));
-            for m in tasks { list = list.child(task_row(app,m)); }
+            let shown = remaining.min(tasks.len());
+            for m in tasks.into_iter().take(shown) { list = list.child(task_row(app,m)); }
+            remaining -= shown;
         }
     } else {
-        for m in messages { list = list.child(if app.page == Page::Tasks { task_row(app,m) } else { message(app,m,false) }); }
+        for m in messages.iter().skip(start).take(limit) { list = list.child(if app.page == Page::Tasks { task_row(app,m) } else { message(app,m,false) }); }
     }
-    main = main.child(col().key(format!("feed-{:?}-{}", match &app.page { Page::Home => "home", Page::Activity => "activity", Page::Tasks => "tasks", Page::Scheduled => "scheduled", Page::Channel(c) => c }, app.filter))
+    if more && !older_above { list = list.child(sentinel()); }
+    main = main.child(col().key(if paged {format!("paged-{scope}")} else { format!("feed-{:?}-{}", match &app.page { Page::Home => "home", Page::Activity => "activity", Page::Tasks => "tasks", Page::Scheduled => "scheduled", Page::Channel(c) => c }, app.filter) })
         .w_full().grow(1.0).h(0.0).scroll(ScrollSpec { stick_bottom: matches!(app.page,Page::Activity | Page::Channel(_)) && app.oldest })
         .on_layout(|a: &mut App, r| a.feed_h = r[3]).child(list));
     if let Some(error) = &app.error { main = main.child(label(error).color(rune::oklch(0.75,0.1,20.0)).wrap().padding(12.0)); }
@@ -857,7 +901,8 @@ pub fn root(app: &App, cx: &mut Cx<App>) -> El {
     if app.setup_open {root=root.child(setup_drawer(app,viewport[0]));}
     app.profiles.end_view();
     if app.onboarding_visible() { root = root.child(onboarding_layer(app, viewport)); }
-    let menu = if app.project_menu && app.sidebar && (app.width >= 900.0 || app.thread.is_none()) {
+    root = root.children(update_layer(app, viewport));
+    let menu = if matches!(app.release.stage, release_update::Stage::Hidden) && app.project_menu && app.sidebar && (app.width >= 900.0 || app.thread.is_none()) {
         cx.layout("projects-toggle").map(|[x, y, _, h]| board_menu(app, x, y + h - height, viewport, height))
     } else { None };
     shell.child(zoom::wrap(app, cx, root)).children(menu)

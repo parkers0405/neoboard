@@ -31,6 +31,8 @@ The worker owns the blocking client, network parsing, file reads, and file write
 
 ## Verification and screenshots
 
+A packaged release checks GitHub once at launch for a newer stable Neoboard version. Dismiss skips the offer until the next session. Update runs only the `neoboard update` executable alongside the desktop; the moving bar means the CLI is busy, not a percentage. No process is restarted automatically. On Windows the updater stages a separate directory and the dialog shows the CLI’s instructions. Source/debug builds, fixtures, and scenes do not contact GitHub. Preview the modal with `--scene update-offer` or `--scene update-running`.
+
 Use the pinned Rust toolchain; no release build is required.
 
 ```sh
@@ -38,6 +40,9 @@ cargo check --offline
 cargo test --offline
 # Optional real-service worker roundtrip, using an existing up-to-date debug daemon:
 NEOCHAT_DESKTOP_TEST_DAEMON=/absolute/path/to/neochatd cargo test --offline worker_live_roundtrip -- --ignored
+# Real stdio MCP writes into a temporary board while the headless desktop view is open:
+cargo build --locked --manifest-path ../Cargo.toml --bin neochatd --bin neochat-mcp
+cargo test --locked live_mcp_organization_reaches_open_desktop -- --ignored
 cargo run -- --scene tasks-sparse --snap /tmp/neochat-rune-sparse.png --size 1252x674 --scale 2 --at 1
 cargo run -- --scene tasks-dense --snap /tmp/neochat-rune-tasks.png --size 1252x674 --scale 2 --at 1
 cargo run -- --scene activity --snap /tmp/neochat-rune-activity.png --size 1252x674 --scale 2 --at 1

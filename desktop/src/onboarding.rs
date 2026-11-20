@@ -30,10 +30,6 @@ impl Default for Onboarding {
     }
 }
 
-pub fn prompt(board: &str) -> String {
-    format!("Help me connect my Neoism agent to the Neoboard `{board}` using the `neochat-mcp` stdio adapter. Build or locate `neochat-mcp` (see `neoboard/MCP.md`), then show me the proposed entry in Neoism's `~/.config/neoism/mcp.json` before editing it. Ask whether the board is local to the MCP process or hosted. For a local board I own, use its explicit data directory (`NEOCHAT_DATA_DIR`). For a hosted board, use `NEOCHAT_URL` and a separate board-scoped `NEOCHAT_TOKEN` from the client's secret environment. Never ask me to paste a token or invite into chat. After I approve the configuration, list channels and verify access to `{board}` only. Do not post or claim work until I ask.")
-}
-
 impl App {
     pub fn open_share(&mut self) {
         self.open_board_share(&self.project.clone());

@@ -22,6 +22,13 @@ pub(super) const MASKS: [[u8; 7]; 8] = [
 ];
 
 const GRID: f32 = 31.25;
+pub(super) const TITLE_LETTERS: &[u8] = b"setupak civy";
+pub(super) const TITLE_MASKS: [[u8;7];12] = [
+    [0,0,63,96,62,3,126], MASKS[1], [24,24,126,24,24,27,14],
+    [0,0,99,99,99,103,59], [0,126,99,99,126,96,96], MASKS[5],
+    [96,96,102,108,120,108,102], [0;7], [0,0,62,99,96,99,62],
+    [24,0,56,24,24,24,60], [0,0,99,99,54,54,28], [0,99,99,63,3,99,62],
+];
 const CELL: f32 = GRID / 2.0;
 const ABOVE: usize = 13;
 const FRAMES: usize = 32;
@@ -41,10 +48,10 @@ pub(super) fn fire(
     time: f32,
     mut cell: impl FnMut(usize, usize, [f32; 4], u32),
 ) {
-    if letter >= MASKS.len() || !time.is_finite() || time < 0.0 {
+    if letter >= MASKS.len() + TITLE_MASKS.len() || !time.is_finite() || time < 0.0 {
         return;
     }
-    static FIRE: OnceLock<[PixelFire; 8]> = OnceLock::new();
+    static FIRE: OnceLock<[PixelFire; 8 + TITLE_MASKS.len()]> = OnceLock::new();
     let flames = FIRE.get_or_init(|| std::array::from_fn(PixelFire::new));
     let flame = &flames[letter];
     let frame = (time as f64 * FPS).rem_euclid(FRAMES as f64) as usize;
@@ -80,7 +87,7 @@ struct PixelFire {
 impl PixelFire {
     fn new(letter: usize) -> Self {
         let tops: [Option<usize>; 7] = std::array::from_fn(|column| {
-            MASKS[letter]
+            MASKS.get(letter).unwrap_or_else(|| &TITLE_MASKS[letter - MASKS.len()])
                 .iter()
                 .position(|row| row & (1 << (6 - column)) != 0)
         });

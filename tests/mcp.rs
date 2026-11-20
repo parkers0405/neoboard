@@ -200,8 +200,10 @@ fn two_actors_coordinate_over_stdio_with_private_isolation() {
 
 #[test]
 fn explicit_credentials_and_safe_transport_required_without_secret_logging() {
+    let empty = tempfile::tempdir().unwrap();
     for (url, token) in [(None, None), (Some("https://example.invalid"), None), (None, Some("SECRET_SENTINEL")), (Some("http://example.invalid"), Some("SECRET_SENTINEL")), (Some("https://user:SECRET_SENTINEL@example.invalid"), Some("SECRET_SENTINEL"))] {
         let mut command = Peer::command();
+        command.env("NEOCHAT_DATA_DIR", empty.path());
         if let Some(url) = url { command.env("NEOCHAT_URL",url); }
         if let Some(token) = token { command.env("NEOCHAT_TOKEN",token); }
         let output = command.output().unwrap();

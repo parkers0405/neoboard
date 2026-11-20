@@ -23,7 +23,7 @@ fn main() {
     let args = Args::parse();
     let client = match (&args.url, &args.token, &args.data_dir) {
         (Some(url), Some(token), _) => Client::new(url, token, None),
-        (None, None, Some(dir)) => Client::discover(Some(dir), None),
+        (None, None, dir) => Client::discover(dir.as_deref(), None),
         _ => {
             eprintln!("provide both NEOCHAT_URL and NEOCHAT_TOKEN (or --url/--token), or --data-dir for local discovery");
             std::process::exit(2);

@@ -1,6 +1,6 @@
 use axum::http::StatusCode;
 use neochat::{board::random_token, protocol::*, Board};
-use rusqlite::Connection;
+use neochat::storage::Connection;
 use std::collections::BTreeMap;
 
 struct Fixture { dir: tempfile::TempDir, board: Board, token: String, admin: String }

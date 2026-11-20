@@ -42,7 +42,7 @@ fn sqlite_authorization_quotas_and_restart() {
     assert_eq!(board.attachments(TOKEN,quota).unwrap().len(),4);
     let expired = board.create_invite(ADMIN,InviteRequest { actor:"expired".into(),channels:vec![],expires_at:Some(neochat::board::now()+3600) }).unwrap();
     // Deterministic expiration without a wall-clock sleep.
-    rusqlite::Connection::open(&path).unwrap().execute("UPDATE credentials SET expires=0 WHERE actor='expired'",[]).unwrap();
+    neochat::storage::Connection::open(&path).unwrap().execute("UPDATE credentials SET expires=0 WHERE actor='expired'",[]).unwrap();
     assert_eq!(board.attach(&expired.token,id,"x",vec![]).unwrap_err().0,401);
     assert_eq!(board.attachments(&expired.token,id).unwrap_err().0,401);
     assert_eq!(board.download_attachment(&expired.token,a.id).unwrap_err().0,401);

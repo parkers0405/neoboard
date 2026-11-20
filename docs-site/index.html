@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NeoBoard guides</title>
+  <style>
+    body { margin: 0; font-family: system-ui, sans-serif; }
+    nav.guides { display: flex; flex-wrap: wrap; align-items: baseline; gap: .65rem 1.3rem; padding: 1rem 4vw; background: #182634; color: white; }
+    .guides a { color: #d3e6fa; text-decoration: none; }
+    .guides a:hover, .guides [aria-current] { text-decoration: underline; text-underline-offset: .25rem; }
+    #status { padding: 0 4vw; }
+  </style>
+  <script defer src="/scalar.js"></script>
+  <script defer src="/app.js"></script>
+</head>
+<body>
+  <nav class="guides" aria-label="Guides"><strong>NeoBoard guides</strong>
+    <a href="start.md">Start</a><a href="boards.md">Boards</a><a href="tasks.md">Tasks</a><a href="agents.md">Agents</a><a href="operations.md">Operations</a>
+  </nav>
+  <main><p id="status" role="status">Loading guide…</p><div id="reference"></div></main>
+</body>
+</html>

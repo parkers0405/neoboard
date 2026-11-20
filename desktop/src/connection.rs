@@ -51,14 +51,14 @@ impl Options {
             Client::new(endpoint, &self.token, self.profile.as_deref()).map_err(|e| e.to_string())
         } else {
             connect_local(self.data_dir.as_deref(), self.profile.as_deref()).map_err(|e| e.to_string())
-        }
+        }.map(|c|c.with_sender("desktop"))
     }
 }
 
 pub enum Command {
     CreateBoard { id: String, name: String },
     JoinBoard { invite: JoinSource, name: String },
-    ShareBoard { id: String, actor: String },
+    Host { id: String, request: u64, operation: HostOp },
     SwitchBoard { id: String, path: Option<PathBuf> },
     Members(String),
     Personal(String),
@@ -71,9 +71,33 @@ pub enum Command {
 pub type BoardSetup = (String, Snapshot, neochat::protocol::Member, Option<PathBuf>);
 pub enum JoinSource { File(PathBuf), Link(neochat::invite_file::InviteFile) }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum HostOp { Inspect, Create, Stop }
+
+pub struct HostState { pub route: neochat::sharing::RouteState, pub link: Option<String> }
+
+fn host_control(dir: Option<&std::path::Path>, id: &str, op: HostOp) -> Result<HostState, String> {
+    use neochat::sharing::{self, RouteState};
+    match op {
+        HostOp::Stop => sharing::stop_local(dir)?,
+        HostOp::Create => {
+            let invite = sharing::share_desktop_local(dir, id)?;
+            return Ok(HostState { route: RouteState::Connected, link: Some(invite.to_link()?) });
+        }
+        HostOp::Inspect => {}
+    }
+    let status = sharing::status_local(dir).map_err(|e| format!("Couldn't check the host tunnel. If the daemon is older, update and restart neochatd. {e}"))?;
+    let link = if status.state == RouteState::Connected {
+        sharing::lookup_local(dir, id)?.filter(|invite| invite.project.as_deref() == Some(id)
+            && status.endpoint.as_deref().and_then(|e| neochat::invite_file::https_endpoint(e).ok()) == neochat::invite_file::https_endpoint(&invite.endpoint).ok())
+            .and_then(|invite| invite.to_link().ok())
+    } else { None };
+    Ok(HostState { route: status.state, link })
+}
+
 pub enum Update {
     BoardSetup(Result<BoardSetup, String>),
-    Shared(Result<String, String>),
+    Host(u64, Result<HostState, String>),
     Members(String,Result<Vec<neochat::protocol::Member>,String>),
     Names(String,Vec<neochat::protocol::Member>),
     Personal(Result<neochat::protocol::Member,String>),
@@ -84,6 +108,7 @@ pub enum Update {
     Done(Option<(Option<u64>, String)>, Result<(), String>),
     Extra(Result<(Vec<Reaction>, Vec<ScheduledPost>), String>),
     Organization(neochat::protocol::Organization),
+    SprintCreated(u64),
     Attachments(u64, Result<Vec<Attachment>, String>),
     FileDone(Result<String, String>),
 }
@@ -119,7 +144,7 @@ fn join_board(source: JoinSource, name: Option<&str>, expected: Option<&str>, pr
         JoinSource::File(path) => (neochat::invite_file::InviteFile::read(&path)?, Some(path)),
         JoinSource::Link(invite) => (invite, None),
     };
-    let client = Client::new(&invite.endpoint, &invite.token, profile).map_err(|e| e.to_string())?;
+    let client = Client::new(&invite.endpoint, &invite.token, profile).map_err(|e| e.to_string())?.with_sender("desktop");
     let snapshot = client.snapshot().map_err(|e| e.to_string())?;
     let available = crate::projects::available(&snapshot, true);
     let id = match invite.project.clone() {
@@ -142,6 +167,19 @@ pub fn start(mut opts: Options, wake: rune::Waker) -> (mpsc::SyncSender<Command>
     let local_opts = Options { invite: None, endpoint: None, project: None, ..opts.clone() };
     let (commands, rx) = mpsc::sync_channel::<Command>(16);
     let (tx, updates) = mpsc::sync_channel(8);
+    // Provisioning can take much longer than an event poll. Serialize host operations
+    // separately so a reopened panel observes earlier changes without delaying the feed.
+    let (host_tx, host_rx) = mpsc::sync_channel::<(String, u64, HostOp)>(4);
+    let host_updates = tx.clone();
+    let host_wake = wake.clone();
+    let dir = opts.data_dir.clone();
+    std::thread::spawn(move || {
+        for (id, request, op) in host_rx {
+            let result = host_control(dir.as_deref(), &id, op);
+            if host_updates.send(Update::Host(request, result)).is_err() { break; }
+            host_wake();
+        }
+    });
     std::thread::spawn(move || {
         let send = |update| {
             if tx.send(update).is_err() { return false; }
@@ -177,7 +215,7 @@ pub fn start(mut opts: Options, wake: rune::Waker) -> (mpsc::SyncSender<Command>
                     match rx.recv_timeout(Duration::from_secs(2)) {
                         Ok(Command::JoinBoard { invite, name }) => if !change_board(&mut opts, Some(invite), Some(&name), None).0 { break; },
                         Ok(Command::SwitchBoard { id, path }) => if !change_board(&mut opts, path.map(JoinSource::File), None, Some(id)).0 { break; },
-                        Ok(Command::ShareBoard { .. }) => if !send(Update::Shared(Err("The local board is offline.".into()))) { break; },
+                        Ok(Command::Host { request, .. }) => if !send(Update::Host(request, Err("The local board is offline.".into()))) { break; },
                         Ok(Command::CreateBoard { .. }) => if !send(Update::BoardSetup(Err(e.to_string()))) { break; },
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
                         _ => {},
@@ -198,7 +236,7 @@ pub fn start(mut opts: Options, wake: rune::Waker) -> (mpsc::SyncSender<Command>
                     match rx.recv_timeout(Duration::from_secs(2)) {
                         Ok(Command::JoinBoard { invite, name }) => if !change_board(&mut opts, Some(invite), Some(&name), None).0 { break; },
                         Ok(Command::SwitchBoard { id, path }) => if !change_board(&mut opts, path.map(JoinSource::File), None, Some(id)).0 { break; },
-                        Ok(Command::ShareBoard { .. }) => if !send(Update::Shared(Err("The local board is offline.".into()))) { break; },
+                        Ok(Command::Host { request, .. }) => if !send(Update::Host(request, Err("The local board is offline.".into()))) { break; },
                         Ok(Command::CreateBoard { .. }) => if !send(Update::BoardSetup(Err(e.to_string()))) { break; },
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
                         _ => {},
@@ -224,14 +262,13 @@ pub fn start(mut opts: Options, wake: rune::Waker) -> (mpsc::SyncSender<Command>
                                 if !sent { return; }
                                 if success { continue 'connection; }
                             }
-                            Command::ShareBoard { id, actor } => {
-                                let data_dir = opts.data_dir.clone();
-                                let updates = tx.clone();
-                                let wake = wake.clone();
-                                std::thread::spawn(move || {
-                                    let result = neochat::sharing::share_local(data_dir.as_deref(), &id, &actor).and_then(|invite| invite.to_link());
-                                    if updates.send(Update::Shared(result)).is_ok() { wake(); }
-                                });
+                            Command::Host { id, request, operation } => {
+                                let error = if opts.invite.is_some() || opts.endpoint.is_some() {
+                                    "Host controls are unavailable on a joined board."
+                                } else if host_tx.try_send((id, request, operation)).is_err() {
+                                    "Host controls are busy. Try again shortly."
+                                } else { continue; };
+                                if !send(Update::Host(request, Err(error.into()))) { return; }
                             }
                             Command::CreateBoard { id, name } => {
                                 let result = (|| -> Result<_, String> {
@@ -265,12 +302,14 @@ pub fn start(mut opts: Options, wake: rune::Waker) -> (mpsc::SyncSender<Command>
                                 }
                             }
                             Command::Action { action, draft } => {
-                                let refresh = matches!(action, Action::CreateArea {..} | Action::PostTask {..} | Action::UpdateTask {..} | Action::AcknowledgeTask {..});
-                                let result = client.action(&action).map(|_| ()).map_err(|e| e.to_string());
+                                let create_sprint = matches!(action, Action::CreateSprint {..});
+                                let refresh = matches!(action, Action::PostTask {..} | Action::UpdateTask {..} | Action::AcknowledgeTask {..} | Action::CreateSprint {..} | Action::SetTaskSprint {..} | Action::FinishSprint {..} | Action::PostSprintTask {..});
+                                let result = client.action(&action).map_err(|e| e.to_string());
                                 if refresh && result.is_ok() && let Ok(organization) = client.organization() {
                                     if !send(Update::Organization(organization)) { return; }
                                 }
-                                if !send(Update::Done(draft, result)) { return; }
+                                if create_sprint && let Ok(response) = &result && let Some(id) = response.id && !send(Update::SprintCreated(id)) { return; }
+                                if !send(Update::Done(draft, result.map(|_| ()))) { return; }
                             }
                             Command::Attachments(id) => {
                                 if !send(Update::Attachments(id, client.attachments(id).map_err(|e| e.to_string()))) { return; }
@@ -299,8 +338,9 @@ pub fn start(mut opts: Options, wake: rune::Waker) -> (mpsc::SyncSender<Command>
                 match client.events(cursor, 250) {
                     Ok(events) => {
                         let refresh = events.iter().any(|e| matches!(e.kind, neochat::protocol::EventKind::Reaction { .. } | neochat::protocol::EventKind::Scheduled { .. } | neochat::protocol::EventKind::ScheduleCanceled { .. } | neochat::protocol::EventKind::SchedulePublished { .. }));
-                        let organization_changed = events.iter().any(|e| matches!(&e.kind, neochat::protocol::EventKind::Message { message } if message.task.is_some()) || matches!(e.kind, neochat::protocol::EventKind::OrganizationChanged {..} | neochat::protocol::EventKind::ThreadDeleted {..}));
+                        let organization_changed = events.iter().any(|e| matches!(&e.kind, neochat::protocol::EventKind::Message { message } if message.task.is_some()) || matches!(e.kind, neochat::protocol::EventKind::OrganizationChanged {..} | neochat::protocol::EventKind::ThreadDeleted {..} | neochat::protocol::EventKind::ChannelDeleted {..}));
                         for event in events {
+                            if let neochat::protocol::EventKind::ChannelDeleted { channel } = &event.kind { directories.remove(channel); }
                             if let neochat::protocol::EventKind::Message{message}=&event.kind {directories.entry(message.channel.clone()).or_insert(None);}
                             cursor = cursor.max(event.cursor);
                             if !send(Update::Event(event)) { return; }

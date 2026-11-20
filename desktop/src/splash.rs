@@ -16,9 +16,8 @@ impl Default for Splash {
 impl Splash {
     pub fn tick(&mut self,now:f64,visible:bool,tx:&mut Tx)->bool {
         if !visible || self.reduced {self.last=None;self.over=None;self.hover=[0.;8];return false;}
-        tx.wake_after(Duration::from_millis(32));
+        tx.wake_after(Duration::ZERO);
         let dt=self.last.map_or(0.,|v|(now-v).clamp(0.,0.1));
-        if self.last.is_some() && dt<1./32. {return false;}
         self.last=Some(now);self.clock+=dt;
         let alpha=1.-(-14.*dt as f32).exp();
         for (i,h) in self.hover.iter_mut().enumerate(){*h+=((self.over==Some(i)) as u8 as f32-*h)*alpha;}

@@ -28,6 +28,9 @@ pub struct Message {
     pub channel: String,
     pub parent: Option<u64>,
     pub author: String,
+    /// Self-reported client metadata, never an authenticated identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender: Option<String>,
     pub text: String,
     pub labels: BTreeMap<String, String>,
     pub created_at: u64,
@@ -53,12 +56,31 @@ pub struct Task {
 #[serde(rename_all = "snake_case")]
 pub enum TaskState { Ready, Waiting, Claimed, Blocked, Completed, Failed, Canceled }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, clap::ValueEnum, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaimAssignment { #[default] Eligible, Mine, Unassigned }
+
 /// Board namespaces are the first segment of channel paths. Organization is
 /// fetched separately from Snapshot and contains only visible tasks/boards.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Organization {
     pub areas: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub area_owners: BTreeMap<String, BTreeMap<String, String>>,
     pub tasks: BTreeMap<u64, TaskPlacement>,
+    #[serde(default)]
+    pub sprints: BTreeMap<u64, Sprint>,
+    #[serde(default)]
+    pub task_sprints: BTreeMap<u64, u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Sprint {
+    pub id: u64,
+    pub board: String,
+    pub title: String,
+    pub description: String,
+    pub finished: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -83,6 +105,17 @@ pub enum Action {
         #[serde(default)] assignee: Option<String>,
     },
     CreateArea { board: String, name: String },
+    CreateSprint { board: String, title: String, description: String },
+    SetTaskSprint { id: u64, sprint: Option<u64> },
+    FinishSprint { id: u64, allow_unfinished: bool },
+    PostSprintTask {
+        channel: String, text: String,
+        #[serde(default)] labels: BTreeMap<String, String>,
+        #[serde(default)] needs: Vec<u64>,
+        #[serde(default)] assignee: Option<String>,
+        sprint: u64,
+    },
+    SetAreaOwner { board: String, name: String, owner: Option<String> },
     PostTask {
         channel: String,
         text: String,
@@ -95,11 +128,16 @@ pub enum Action {
     },
     /// Replace editable task fields, preserving whether the task is global.
     UpdateTask { id: u64, text: String, labels: BTreeMap<String, String>, needs: Vec<u64>, assignee: Option<String>, area: Option<String>, parent: Option<u64> },
+    /// Edit current fields without overwriting legacy placement metadata.
+    UpdateTaskFields { id: u64, text: String, labels: BTreeMap<String, String>, needs: Vec<u64>, assignee: Option<String>, parent: Option<u64> },
     AcknowledgeTask { id: u64, done: bool },
     Reply { thread: u64, text: String },
     ReplyWithLabels { thread: u64, text: String, #[serde(default)] labels: BTreeMap<String, String> },
     CreateChannel { channel: String },
+    /// Host only. Board namespace roots and their default general channel are protected.
+    DeleteChannel { channel: String },
     Claim { id: u64, lease_secs: u64 },
+    ClaimNext { channel: String, #[serde(default)] labels: BTreeMap<String, String>, #[serde(default)] assignment: ClaimAssignment, lease_secs: u64 },
     Renew { id: u64, lease_secs: u64 },
     /// Creator manages unleased work; a live lease holder may hand off their own
     /// task. A changed assignment releases the lease; the recipient must claim.
@@ -111,6 +149,8 @@ pub enum Action {
     /// Dependencies are still authoritative and may leave the task blocked.
     Unblock { id: u64 },
     Complete { id: u64, text: String },
+    /// Complete the leased task without requiring its subtasks to be completed.
+    CompleteAnyway { id: u64, text: String },
     Fail { id: u64, text: String },
     Cancel { id: u64 },
     Edit { id: u64, text: String },
@@ -144,11 +184,13 @@ pub struct Event {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EventKind {
     Message { message: Message },
-    /// Refetch Organization when a board's Area catalog changes. Task placement
+    /// Refetch Organization when a board's area or sprint catalog changes. Task placement
     /// and acknowledgement changes instead emit a Message upsert.
     OrganizationChanged { board: String },
     ThreadDeleted { id: u64, channel: String },
     ChannelCreated { channel: String },
+    /// Drop the exact channel and all its local content, not descendant channels.
+    ChannelDeleted { channel: String },
     Reaction { id: u64, channel: String, reaction: String, remove: bool },
     Scheduled { id: u64, channel: String, publish_at: u64 },
     ScheduleCanceled { id: u64, channel: String },
@@ -178,7 +220,55 @@ pub struct ScheduledPost {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Discovery { pub url: String, pub token: String }
 
+/// An upper bound on operations, never a replacement for resource authorization.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+#[value(rename_all = "snake_case")]
+pub enum Grant {
+    Read, Attach, DisplayName, Post, PostTask, Reply, EditTask,
+    CreateSprint, FinishSprint,
+    #[value(skip)] CreateArea,
+    #[value(skip)] SetAreaOwner,
+    AcknowledgeTask, CreateChannel, Claim, ClaimNext, Renew, Assign, Block, Unblock,
+    Complete, Fail, Cancel, Edit, DeleteThread, SetLabels, React, Schedule, CancelSchedule,
+}
+impl Action {
+    pub fn grant(&self) -> Option<Grant> {
+        use Action::*;
+        Some(match self {
+            DeleteChannel { .. } => return None, // host only
+            Post { task:false,.. } => Grant::Post,
+            Post { task:true,.. } | PostTask { .. } | PostSprintTask { .. } => Grant::PostTask,
+            SetTaskSprint { .. } => Grant::EditTask,
+            CreateSprint { .. } => Grant::CreateSprint,
+            FinishSprint { .. } => Grant::FinishSprint,
+            Reply { .. } | ReplyWithLabels { .. } => Grant::Reply,
+            EditTask { .. } | UpdateTask { .. } | UpdateTaskFields { .. } => Grant::EditTask,
+            CreateArea { .. } => Grant::CreateArea,
+            SetAreaOwner { .. } => Grant::SetAreaOwner,
+            AcknowledgeTask { .. } => Grant::AcknowledgeTask,
+            CreateChannel { .. } => Grant::CreateChannel,
+            Claim { .. } => Grant::Claim,
+            ClaimNext { .. } => Grant::ClaimNext,
+            Renew { .. } => Grant::Renew,
+            Assign { .. } => Grant::Assign,
+            Block { .. } => Grant::Block,
+            Unblock { .. } => Grant::Unblock,
+            Complete { .. } | CompleteAnyway { .. } => Grant::Complete,
+            Fail { .. } => Grant::Fail,
+            Cancel { .. } => Grant::Cancel,
+            Edit { .. } => Grant::Edit,
+            DeleteThread { .. } => Grant::DeleteThread,
+            SetLabels { .. } => Grant::SetLabels,
+            React { .. } => Grant::React,
+            Schedule { .. } => Grant::Schedule,
+            CancelSchedule { .. } => Grant::CancelSchedule,
+        })
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InviteRequest {
     pub actor: String,
     /// Empty means all channels; otherwise exact channels plus optional `<project>/*`

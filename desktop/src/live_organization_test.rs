@@ -20,7 +20,7 @@ fn mcp(dir: &Path, name: &str, args: Value) -> Value {
         .arg("--data-dir").arg(dir).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
     let mut input = peer.stdin.take().unwrap();
     for request in [
-        json!({"id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"desktop-test","version":"1"}}}),
+        json!({"id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"neoism","version":"1"}}}),
         json!({"method":"notifications/initialized"}),
         json!({"id":2,"method":"tools/call","params":{"name":name,"arguments":args}}),
     ] {
@@ -69,19 +69,22 @@ fn live_mcp_organization_reaches_open_desktop() {
     let client = Client::new(&discovery.url, &discovery.token, None).unwrap();
     let channel = "test/general";
     client.action(&Action::CreateChannel { channel: channel.into() }).unwrap();
-    // Barrier: wait for the initial organization fetch, not just the first snapshot.
-    client.action(&Action::CreateArea { board: "test".into(), name: "Baseline".into() }).unwrap();
     let mut app = App::new();
     app.options.endpoint = Some(discovery.url);
     app.options.token = discovery.token;
     app.project = "test".into();
     app.navigate(Page::Tasks);
-    app.group_by_area = true;
     let (wake_tx, wakes) = mpsc::sync_channel(1);
     setup(&mut app, Arc::new(move || { let _ = wake_tx.try_send(()); }));
     let mut rt = rune::Runtime::new(app, view::root, (1440., 1000.), rune::Env::new(true, 1.));
-    until(&mut rt, "initial organization", |rt| rt.state.areas().contains("Baseline"));
-    rt.update(|a, _| { a.dialog = Some(Dialog::Filters); a.details_picker = Some("filter-area"); });
+    until(&mut rt, "connected to local board", |rt| rt.state.snapshot.channels.iter().any(|c| c == channel));
+    let click = |rt: &mut rune::Runtime<App>, key: &str| {
+        // Layout can move when a live update inserts a row; wait until it wins hit testing.
+        until(rt, key, |rt| rt.find(key).is_some_and(|(x,y)| rt.element_at(x,y)
+            .is_some_and(|hit| hit.path().split('/').any(|part| part == key))));
+        let (x, y) = rt.find(key).unwrap();
+        rt.pointer_move(x,y); rt.pointer_down(x,y); rt.pointer_up(x,y); rt.frame(1./60.);
+    };
     // Model an idle window: each external write must wake it before we drive poll again.
     let write = |name, args| {
         while wakes.try_recv().is_ok() {}
@@ -89,13 +92,22 @@ fn live_mcp_organization_reaches_open_desktop() {
         wakes.recv_timeout(Duration::from_secs(10)).expect("worker did not wake desktop");
         result
     };
-    write("tasks_create_area", json!({"board":"test","name":"Alpha"}));
-    until(&mut rt, "empty area in open filter picker", |rt| shown(rt, "Alpha"));
-    rt.update(|a, _| { a.dialog = None; a.details_picker = None; });
-    let parent = write("tasks_create", json!({"channel":channel,"text":"MCP parent","area":"Alpha"}))["id"].as_u64().unwrap();
-    until(&mut rt, "parent in area group", |rt| rt.find("area-group-Alpha").is_some() && shown(rt, "MCP parent"));
-    rt.update(|a, _| a.open_thread(parent));
-    until(&mut rt, "parent thread before child exists", |rt| shown(rt, "No subtasks yet"));
-    let child = write("tasks_create", json!({"channel":channel,"text":"MCP child","area":"Alpha","parent":parent}))["id"].as_u64().unwrap();
-    until(&mut rt, "child in already-open parent thread", |rt| shown(rt, &format!("#{child} MCP child")) && shown(rt, "0 of 1 complete"));
+    let parent = write("tasks_create", json!({"channel":channel,"text":"MCP parent"}))["id"].as_u64().unwrap();
+    click(&mut rt, &format!("task-{parent}"));
+    until(&mut rt, "parent thread before child exists", |rt| rt.find("add-subtask").is_some());
+    let reply = write("reply", json!({"thread":parent,"text":"Which build should I verify?"}))["id"].as_u64().unwrap();
+    until(&mut rt, "live reply with framework byline", |rt| rt.state.snapshot.messages.iter().any(|m|m.id==reply && m.sender.as_deref()==Some("mcp:Neoism") && shown(rt,&rt.state.sender_label(m))));
+    let child = write("tasks_create", json!({"channel":channel,"text":"MCP child","parent":parent}))["id"].as_u64().unwrap();
+    until(&mut rt, "child in open parent panel", |rt| rt.find(&format!("open-subtask-{child}")).is_some() && shown(rt, "0 of 1 complete"));
+    assert!(rt.find(&format!("task-{parent}")).is_some());
+    assert!(rt.find(&format!("task-{child}")).is_none());
+    click(&mut rt, &format!("open-subtask-{child}"));
+    until(&mut rt, "child panel", |rt| rt.state.thread == Some(child) && rt.find("parent-task-link").is_some());
+    click(&mut rt, "subtask-back");
+    until(&mut rt, "returned to parent panel", |rt| rt.state.thread == Some(parent) && shown(rt, "0 of 1 complete"));
+    for (slot,dx,dy) in [(0,30.,0.),(1,-30.,0.),(2,0.,-30.)] {
+        let before=rt.state.pane_sizes[slot];let (x,y)=rt.find(&format!("pane-divider-{slot}")).unwrap();
+        rt.pointer_move(x,y);rt.pointer_down(x,y);rt.pointer_move(x+dx,y+dy);rt.pointer_up(x+dx,y+dy);rt.frame(1./60.);
+        assert_ne!(rt.state.pane_sizes[slot],before,"divider {slot}");
+    }
 }

@@ -28,7 +28,7 @@ fn directory_uses_active_credentials_and_literal_channel_scopes_without_posts() 
     board.revoke_invite(ADMIN, revoked.id).unwrap();
     let expired = invite(&board, "expired", &["a_b/*"]);
     // Deterministic expiry at the inclusive boundary; no clock-dependent sleep.
-    rusqlite::Connection::open(&path).unwrap().execute("UPDATE credentials SET expires=?1 WHERE id=?2", rusqlite::params![now(), expired.id]).unwrap();
+    neochat::storage::Connection::open(&path).unwrap().execute("UPDATE credentials SET expires=?1 WHERE id=?2", neochat::params![now(), expired.id]).unwrap();
 
     assert!(board.snapshot(TOKEN).unwrap().messages.is_empty());
     assert_eq!(actors(&board, &exact.token, "a_b/tasks"), ["exact", "local", "scoped", "unrestricted"]);

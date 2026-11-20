@@ -20,7 +20,7 @@ fn event_channel(event: &Event) -> &str {
     match &event.kind {
         EventKind::Message { message } => &message.channel,
         EventKind::OrganizationChanged { board } => board,
-        EventKind::ChannelCreated { channel } | EventKind::Reaction { channel, .. }
+        EventKind::ChannelCreated { channel } | EventKind::ChannelDeleted { channel } | EventKind::Reaction { channel, .. }
         | EventKind::Scheduled { channel, .. } | EventKind::ScheduleCanceled { channel, .. }
         | EventKind::SchedulePublished { channel, .. } | EventKind::ThreadDeleted { channel, .. } => channel,
     }
@@ -188,7 +188,7 @@ fn persisted_scopes_filter_maintenance_publications_and_revocation_events() {
     let before = board.snapshot(&scoped.token).unwrap().cursor;
     drop(board);
     // Deterministic maintenance on reopening, without waiting for wall-clock expiry.
-    rusqlite::Connection::open(&path).unwrap().execute("UPDATE schedules SET publish_at=0", []).unwrap();
+    neochat::storage::Connection::open(&path).unwrap().execute("UPDATE schedules SET publish_at=0", []).unwrap();
     let board = Board::open(&path, TOKEN, ADMIN).unwrap();
     let events = board.events(&scoped.token, before).unwrap();
     assert_eq!(events.len(), 2);

@@ -5,7 +5,7 @@ use semver::Version;
 const LATEST: &str = "https://api.github.com/repos/parkers0405/neoboard/releases/latest";
 const LIMIT: u64 = 256 * 1024;
 
-fn newer(body: impl Read, current: &Version) -> Option<Version> {
+fn stable_version(body: impl Read) -> Option<Version> {
     #[derive(serde::Deserialize)]
     struct Release { tag_name: String, draft: bool, prerelease: bool }
     let mut data = Vec::new();
@@ -14,7 +14,7 @@ fn newer(body: impl Read, current: &Version) -> Option<Version> {
     let release: Release = serde_json::from_slice(&data).ok()?;
     let tag = release.tag_name.strip_prefix('v').unwrap_or(&release.tag_name);
     let version = Version::parse(tag).ok()?;
-    (!release.draft && !release.prerelease && version.pre.is_empty() && version.cmp_precedence(current).is_gt()).then_some(version)
+    (!release.draft && !release.prerelease && version.pre.is_empty()).then_some(version)
 }
 
 fn latest() -> Option<Version> {
@@ -23,7 +23,7 @@ fn latest() -> Option<Version> {
         .user_agent(concat!("neoboard-desktop/", env!("CARGO_PKG_VERSION"))).build().ok()?;
     let response = client.get(LATEST).send().ok()?;
     if response.status() != reqwest::StatusCode::OK { return None; }
-    newer(response, &Version::parse(env!("CARGO_PKG_VERSION")).ok()?)
+    stable_version(response)
 }
 
 fn binary(name: &str) -> String { format!("{name}{}", std::env::consts::EXE_SUFFIX) }
@@ -88,7 +88,7 @@ fn install(exe: &Path) -> Result<String, String> {
 }
 
 #[derive(Default)]
-pub enum Stage { #[default] Hidden, Offer(Version), Running, Finished(Result<String, String>) }
+pub enum Stage { #[default] Hidden, Checking, Notice(String), Offer(Version), Running, Finished(Result<String, String>) }
 
 #[derive(Default)]
 pub struct Session {
@@ -97,26 +97,45 @@ pub struct Session {
     inbox: Option<mpsc::Receiver<Stage>>,
     consent: Option<mpsc::Sender<()>>,
     started: bool,
+    wake: Option<rune::Waker>,
 }
 
 impl Session {
     pub fn start(&mut self, fixture: bool, wake: rune::Waker) {
+        self.wake = Some(wake.clone());
         if fixture || cfg!(any(test, debug_assertions)) || self.started { return; }
         self.started = true;
+        self.check(false,wake);
+    }
+    pub fn manual(&mut self) {
+        if !matches!(self.stage,Stage::Hidden) {return;}
+        if let Some(wake)=self.wake.clone() { self.stage=Stage::Checking; self.check(true,wake); }
+    }
+    fn check(&mut self, manual:bool, wake:rune::Waker) {
         let (send, recv) = mpsc::channel();
         let (approve, wait) = mpsc::channel();
         let worker = std::thread::Builder::new().name("desktop-update".into()).spawn(move || -> Option<()> {
-            let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
-            package_cli(&exe)?;
-            let version = latest()?;
-            send.send(Stage::Offer(version)).ok()?;
+            let exe = std::env::current_exe().ok().and_then(|p|p.canonicalize().ok()).filter(|p|package_cli(p).is_some());
+            if !manual && exe.is_none(){return None;}
+            let current=Version::parse(env!("CARGO_PKG_VERSION")).ok()?;
+            let stage=match latest() {
+                Some(v) if v.cmp_precedence(&current).is_gt() && exe.is_some()=>Stage::Offer(v),
+                Some(v) if v.cmp_precedence(&current).is_gt()=>Stage::Notice(format!("Version {v} is available. This development build cannot update itself.")),
+                Some(_) => Stage::Notice(format!("You're up to date (version {current}).")),
+                None => Stage::Notice("Couldn't check GitHub Releases. Check your connection and try again.".into()),
+            };
+            let offered=matches!(stage,Stage::Offer(_));
+            if !manual && !offered{return None;}
+            send.send(stage).ok()?;
             wake();
+            if !offered{return None;}
             wait.recv().ok()?;
-            send.send(Stage::Finished(install(&exe))).ok()?;
+            send.send(Stage::Finished(install(&exe?))).ok()?;
             wake();
             Some(())
         });
         if worker.is_ok() { self.inbox = Some(recv); self.consent = Some(approve); }
+        else if manual {self.stage=Stage::Notice("Could not start the update check.".into());}
     }
     pub fn accept(&mut self) {
         if !matches!(self.stage, Stage::Offer(_)) { return; }
@@ -167,12 +186,12 @@ mod tests {
             ("latest", false, false, false),
         ] {
             let json = serde_json::json!({"tag_name": tag, "draft":draft, "prerelease":prerelease}).to_string();
-            assert_eq!(newer(json.as_bytes(), &current).is_some(), offer, "{tag}");
+            assert_eq!(stable_version(json.as_bytes()).is_some_and(|v|v.cmp_precedence(&current).is_gt()), offer, "{tag}");
         }
         let valid = br#"{"tag_name":"v2.0.0","draft":false,"prerelease":false}"#;
         let mut oversized = valid.to_vec();
         oversized.resize(LIMIT as usize + 1, b' ');
-        assert!(newer(&oversized[..], &current).is_none());
+        assert!(stable_version(&oversized[..]).is_none());
     }
 
     #[test]

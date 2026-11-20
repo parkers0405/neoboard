@@ -2,7 +2,7 @@ use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::{fs::File, io::Read, path::Path};
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InviteFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -3,3 +3,10 @@
 !Cargo.lock
 !src/
 !src/**
+!docs/
+docs/*
+!docs/start.md
+!docs/boards.md
+!docs/tasks.md
+!docs/agents.md
+!docs/operations.md

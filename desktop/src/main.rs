@@ -5,10 +5,12 @@ mod profile;
 mod release_update;
 // The shared multiplayer generator's clock helper resolves this module name.
 use profile as cursor_style;
+mod framework;
 mod fixture;
 mod view;
 mod calendar;
 mod projects;
+mod channel_actions;
 mod splash;
 mod splash_art;
 mod zoom;
@@ -30,7 +32,7 @@ const OPEN_TASKS: usize = 0;
 enum Page { Home, Activity, Tasks, Scheduled, Channel(String) }
 
 #[derive(Clone, Copy, PartialEq)]
-enum Dialog { Settings, Personal, BoardView, Connection, Share, Tags, NewTask, ReplyTags(u64), Filters, Schedule, NewChannel, DeleteThread(u64) }
+enum Dialog { Settings, Personal, BoardView, Connection, Share, Tags, NewTask, NewSprint, ReplyTags(u64), Filters, Schedule, NewChannel, DeleteChannel, DeleteThread(u64) }
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Preferences {
@@ -45,28 +47,27 @@ fn preferences_path() -> Option<std::path::PathBuf> {
 }
 
 struct App {
+    sprint: view::sprints::State,
     release: release_update::Session,
     task_title: TextEdit,
     task_description: TextEdit,
-    task_area: TextEdit,
-    new_area: TextEdit,
-    creating_area: Option<String>,
     task_parent: Option<u64>,
     task_global: bool,
     organization: neochat::protocol::Organization,
-    group_by_area: bool,
-    area_filter: Option<(u8, String)>,
     task_channel: String,
     task_labels: TextEdit,
     task_file: Option<std::path::PathBuf>,
     creating_task: bool,
     editing_task: Option<u64>,
     share: onboarding::Share,
+    connection_wake: Option<rune::Waker>,
     local_name: String,
     me: Option<neochat::protocol::Member>,
     personal_name: TextEdit,
     member_list: Option<(String,Result<Vec<neochat::protocol::Member>,String>)>,
     pick_assignee:bool,
+    task_search: TextEdit,
+    task_advanced: bool,
     details_picker:Option<&'static str>,
     task_filters: TaskFilters,
     aliases:BTreeMap<String,String>,
@@ -85,6 +86,7 @@ struct App {
     setup_open: bool,
     setup_agent: setup_guide::Agent,
     setup_choices: bool,
+    filter_choice_search: rune::TextEdit,
     splash: splash::Splash,
     filter: usize,
     query: TextEdit,
@@ -96,6 +98,7 @@ struct App {
     assignee: TextEdit,
     new_channel: TextEdit,
     creating_channel: Option<String>,
+    channel_actions: channel_actions::State,
     dialog: Option<Dialog>,
     compact: bool,
     compose_file_open: bool,
@@ -118,6 +121,9 @@ struct App {
     width: f32,
     feed_h: f32,
     feed_page: (String, usize),
+    reply_limit: usize,
+    pane_sizes:[f32;3],
+    confirm_parent_completion: Option<u64>,
     thread_h: f32,
     reply_owner: Option<u64>,
     reply_drafts: BTreeMap<u64, TextEdit>,
@@ -224,14 +230,16 @@ impl App {
             profiles: profile::Profiles::default(),
             zoom: zoom::Zoom::default(),
             snapshot: Snapshot { cursor: 0, channels: vec![], messages: vec![] }, board_cache:None,board_extra:Default::default(),page: Page::Home, project:String::new(), options: OPTIONS.get().cloned().unwrap_or_default(), onboarding: Default::default(), project_menu:false, home_copied: None, setup_open:false, setup_agent:Default::default(), setup_choices:false, splash: Default::default(),
-            share:Default::default(), saved_boards:BTreeMap::new(), me:None, personal_name:edit(""), member_list:None, pick_assignee:false, details_picker:None, task_filters:Default::default(), aliases:BTreeMap::new(),
+            share:Default::default(), connection_wake:None, saved_boards:BTreeMap::new(), me:None, personal_name:edit(""), member_list:None, pick_assignee:false, details_picker:None, task_filters:Default::default(), aliases:BTreeMap::new(),
             filter: ALL_TASKS, query: edit(""), channel: edit(""), draft: edit(""), reply: edit(""),
             labels: edit(""), needs: edit(""), assignee: edit(""), new_channel: edit(""), creating_channel: None,
-            task_title: edit(""), task_description: edit(""), task_area: edit(""), task_channel: String::new(), task_labels: edit(""), task_file: None, creating_task: false, editing_task: None,
-            new_area: edit(""), creating_area: None, task_parent: None, task_global: false, organization: Default::default(), group_by_area: false, area_filter: None,
+            channel_actions: Default::default(),
+            task_title: edit(""), task_description: edit(""), task_channel: String::new(), task_labels: edit(""), task_file: None, creating_task: false, editing_task: None,
+            sprint: Default::default(), task_parent: None, task_global: false, organization: Default::default(),
+            task_search: edit(""), task_advanced: false,
             dialog: None, compact: true, compose_file_open: false, compose_file_owner: None, compose_file: edit(""), sidebar: true, oldest: true, thread: None, task_menu:None,hover_row:None,row_menu:None,row_anchor:[0.;4], status: "connecting".into(), error: None,
             pending: false, commands: None, updates: None, now: 0, fixture, seen: BTreeMap::new(), positions: BTreeMap::new(),
-            width: 1252.0, feed_h: 400.0, feed_page: Default::default(), thread_h: 400.0,
+            width: 1252.0, feed_h: 400.0, feed_page: Default::default(), reply_limit:40, pane_sizes:[199.,400.,270.], filter_choice_search:edit(""), confirm_parent_completion:None, thread_h: 400.0,
             reply_owner: None, reply_drafts: BTreeMap::new(),
             reply_labels: BTreeMap::new(), sent_reply_labels: None,
             reactions: vec![], schedules: vec![], schedule_at: edit(""), show_schedule: false,
@@ -263,6 +271,8 @@ impl App {
         if let Err(e)=result {self.error=Some(format!("Could not save preferences: {e}"));}
     }
     fn navigate(&mut self, page: Page) {
+        self.sprint.reset_view();
+        self.channel_actions.menu = None;
         self.feed_page = Default::default();
         self.project_menu=false;
         self.home_copied=None;
@@ -294,13 +304,12 @@ impl App {
                 Page::Activity => true,
                 Page::Scheduled => false,
                 Page::Channel(c) => &m.channel == c && m.parent.is_none(),
-                Page::Tasks => m.parent.is_none() && m.task.as_ref().is_some_and(|t| matches_filter(&t.state, self.filter))
-                    && self.area_filter.as_ref().is_none_or(|(kind,name)| self.task_group(m) == (*kind,name.as_str())),
+                Page::Tasks => m.parent.is_none() && self.organization.tasks.get(&m.id).is_none_or(|p|p.parent.is_none()) && m.task.as_ref().is_some_and(|t| matches_filter(&t.state, self.filter)),
             };
             in_page && projects::contains(&self.project,&m.channel) && (self.page!=Page::Tasks || self.task_filters.matches(m,self.me.as_ref().map(|u|u.actor.as_str()))) && (query.is_empty() || format!("{} {} {} {:?}", m.id, m.author, m.text, m.labels).to_lowercase().contains(&query))
         }).collect();
         messages.sort_by_key(|m| (m.created_at, m.id));
-        if !self.oldest { messages.reverse(); }
+        if self.page == Page::Tasks || (self.page == Page::Activity && !self.oldest) { messages.reverse(); }
         messages
     }
     fn open_thread(&mut self, id: u64) {
@@ -311,7 +320,21 @@ impl App {
             self.reply = self.reply_drafts.remove(&root).unwrap_or_else(|| edit(""));
             self.reply_owner = Some(root);
         }
+        if self.thread != Some(root) {self.reply_limit=40;self.confirm_parent_completion=None;}
         self.thread = Some(root);
+    }
+    fn sender_label(&self, message:&Message)->String {
+        let author=self.actor_label(&message.author);
+        match message.sender.as_deref() {
+            Some("desktop") => format!("{author} · Desktop"),
+            Some("mcp") => format!("{}’s agent",self.actor_label(message.author.split('/').next().unwrap_or(&message.author))),
+            Some(source) if source.starts_with("mcp:") || source.starts_with("cli:") => {
+                let account=self.actor_label(message.author.split('/').next().unwrap_or(&message.author));
+                let framework=&source[4..];
+                if account.eq_ignore_ascii_case(framework) {framework.to_owned()} else {format!("{account}’s {framework}")}
+            }
+            _ => author.to_owned(),
+        }
     }
     fn actor_label<'a>(&'a self, author:&'a str)->&'a str {
         let actor=author.split('/').next().unwrap_or(author);
@@ -323,9 +346,6 @@ impl App {
             })
     }
     fn show_assignees(&mut self){
-        self.details_picker=None;
-        self.pick_assignee=!self.pick_assignee;
-        if !self.pick_assignee{return;}
         let channel = self.task_channel.clone();
         self.member_list=None;
         if let Some(tx)=&self.commands {if tx.try_send(Command::Members(channel.clone())).is_ok(){return;}}
@@ -337,7 +357,8 @@ impl App {
         if self.pending || !self.draft.text.trim().is_empty() || self.compose_file_open {
             self.error=Some("Finish or clear your current draft before switching projects.".into());return;
         }
-        self.project=project.into();self.thread=None;self.query=edit("");self.filter=ALL_TASKS;self.task_filters=Default::default();self.area_filter=None;
+        self.project=project.into();self.thread=None;self.query=edit("");self.filter=ALL_TASKS;self.task_filters=Default::default();
+        self.sprint = Default::default();
         self.row_menu=None;self.hover_row=None;
         if self.board_cache.is_none(){self.board_cache=Some(self.snapshot.clone());}
         self.refresh_project();self.refresh_extra();
@@ -384,12 +405,12 @@ impl App {
     }
 
     fn clear_task_draft(&mut self) {
+        self.task_advanced = false;
+        self.sprint.clear_draft();
         self.task_title = edit("");
         self.task_description = edit("");
-        self.task_area = edit("");
         self.task_parent = None;
         self.task_global = false;
-        self.new_area = edit("");
         self.task_channel.clear();
         self.task_labels = edit("");
         self.task_file = None;
@@ -398,40 +419,12 @@ impl App {
         self.needs = edit("");
     }
 
-    fn task_group<'a>(&'a self, message: &'a Message) -> (u8, &'a str) {
-        if self.organization.tasks.get(&message.id).is_some_and(|p| p.global) { return (0, "Global"); }
-        self.organization.tasks.get(&message.id).and_then(|p| p.area.as_deref())
-            .or_else(|| message.labels.get("area").map(String::as_str)).filter(|s| !s.is_empty())
-            .map_or((2, "No area"), |area| (1, area))
-    }
-
-    fn areas(&self) -> std::collections::BTreeSet<&str> {
-        self.organization.areas.get(&self.project).into_iter().flatten().map(String::as_str)
-            .chain(self.snapshot.messages.iter().filter_map(|m| {
-                m.task.as_ref()?;
-                let (kind, name) = self.task_group(m);
-                (kind == 1).then_some(name)
-            })).collect()
-    }
-
-
-    fn add_area(&mut self) {
-        if self.pending { return; }
-        let name = self.new_area.text.trim().to_owned();
-        if name.is_empty() { self.error = Some("Enter an area name.".into()); return; }
-        self.send_action(Action::CreateArea { board: self.project.clone(), name: name.clone() }, None, None);
-        if self.pending { self.creating_area = Some(name); }
-    }
-
     fn add_subtask(&mut self, id: u64) {
         if self.pending { return; }
         let Some(m) = self.snapshot.messages.iter().find(|m| m.id == id) else { return; };
         let channel = m.channel.clone();
-        let (kind, area) = self.task_group(m);
-        let area = if kind == 1 { area.to_owned() } else { String::new() };
         self.clear_task_draft();
         self.task_channel = channel;
-        self.task_area = edit(&area);
         self.task_parent = Some(id);
         self.details_picker = None;
         self.pick_assignee = false;
@@ -442,13 +435,13 @@ impl App {
     fn open_task_editor(&mut self, id: u64) {
         if self.pending { return; }
         if self.editing_task != Some(id) {
+            self.task_advanced = false;
             let Some(m) = self.snapshot.messages.iter().find(|m| m.id == id) else { return; };
             let Some(task) = &m.task else { return; };
             let (title, description) = m.text.split_once('\n').unwrap_or((&m.text, ""));
             let mut labels = m.labels.clone();
-            let legacy = labels.remove("area");
+            labels.remove("area");
             let placement = self.organization.tasks.get(&id);
-            self.task_area = edit(placement.and_then(|p| p.area.as_deref()).or(legacy.as_deref()).unwrap_or(""));
             self.task_parent = placement.and_then(|p| p.parent);
             self.task_global = placement.is_some_and(|p| p.global);
             self.task_title = edit(title.trim());
@@ -459,6 +452,7 @@ impl App {
             self.needs = edit(&task.needs.iter().map(u64::to_string).collect::<Vec<_>>().join(", "));
             self.task_file = None;
             self.editing_task = Some(id);
+            self.sprint.clear_draft();
         }
         self.error = None;
         self.task_menu = None;
@@ -482,14 +476,27 @@ impl App {
         let channel = projects::channel(&self.project, channel);
         let mut labels = match parse_labels(&self.task_labels.text) { Ok(v) => v, Err(e) => { self.error = Some(e); return; } };
         labels.remove("area");
-        let area = (!self.task_global && !self.task_area.text.is_empty()).then(|| self.task_area.text.clone());
         let parent = if self.task_global { None } else { self.task_parent };
         let needs = if self.task_global { vec![] } else { match parse_needs(&self.needs.text) { Ok(v) => v, Err(e) => { self.error = Some(e); return; } } };
         let assignee = (!self.task_global && !self.assignee.text.is_empty()).then(|| self.assignee.text.clone());
         if let Some(id) = self.editing_task {
-            self.send_action(Action::UpdateTask { id, text, labels, needs, assignee, area, parent }, None, None);
+            // Preserve placement and the legacy label independently; neither is editable here.
+            if let Some(value) = self.snapshot.messages.iter().find(|m| m.id == id).and_then(|m| m.labels.get("area")) {
+                labels.insert("area".into(), value.clone());
+            }
+            let placement = self.organization.tasks.get(&id);
+            let action = if parent == placement.and_then(|p| p.parent) {
+                // Let the server retain placement even if the organization snapshot is stale.
+                Action::EditTask { id, text, labels, needs, assignee }
+            } else {
+                let area = placement.and_then(|p| p.area.clone());
+                Action::UpdateTask { id, text, labels, needs, assignee, area, parent }
+            };
+            self.send_action(action, None, None);
+        } else if let Some(sprint) = self.sprint.assignment.filter(|_| parent.is_none() && !self.task_global) {
+            self.send_action(Action::PostSprintTask { channel, text, labels, needs, assignee, sprint }, None, self.task_file.clone());
         } else {
-            self.send_action(Action::PostTask { channel, text, labels, needs, assignee, area, parent, global: self.task_global }, None, self.task_file.clone());
+            self.send_action(Action::PostTask { channel, text, labels, needs, assignee, area: None, parent, global: self.task_global }, None, self.task_file.clone());
         }
         self.creating_task = self.pending;
     }
@@ -564,6 +571,7 @@ impl App {
 fn setup(app: &mut App, wake: rune::Waker) {
     app.release.start(app.fixture, wake.clone());
     if app.fixture { return; }
+    app.connection_wake = Some(wake.clone());
     let (commands, updates) = connection::start(app.options.clone(), wake);
     app.commands = Some(commands);
     app.updates = Some(updates);
@@ -571,6 +579,11 @@ fn setup(app: &mut App, wake: rune::Waker) {
 fn poll(app: &mut App, seconds: f64, tx: &mut Tx) -> bool {
     let started = Instant::now();
     let mut changed = false;
+    if app.share.busy && matches!(app.dialog, Some(Dialog::Share | Dialog::Connection)) {
+        app.share.pulse = ((seconds * 2.4).cos() as f32 + 1.) * 0.5;
+        tx.wake_after(Duration::from_millis(40));
+        changed = true;
+    }
     for index in 0..16 {
         if started.elapsed() >= Duration::from_millis(1) { tx.wake_after(Duration::ZERO); break; }
         let Some(update) = app.updates.as_ref().and_then(|rx| rx.try_recv().ok()) else { break; };
@@ -579,11 +592,19 @@ fn poll(app: &mut App, seconds: f64, tx: &mut Tx) -> bool {
         match update {
             Update::BoardSetup(result) => app.finish_board_setup(result),
             Update::Organization(organization) => app.organization = organization,
-            Update::Shared(result) => {
+            Update::SprintCreated(id) => app.sprint_created(id),
+            Update::Host(request, result) => {
+                if !matches!(app.dialog, Some(Dialog::Share | Dialog::Connection)) || request != app.share.request || !app.can_share_board(&app.share.board) || app.status != "live" { continue; }
                 app.share.busy = false;
                 app.share.result = Some(result);
+                if app.share.operation.take() == Some(connection::HostOp::Create) && let Some(link) = app.host_link() {
+                    tx.copy(link.to_owned()); app.share.copied = true;
+                }
             }
             Update::Snapshot(mut snapshot) => {
+                // A reconnect can skip deletion events entirely.
+                let missing: Vec<_> = app.board_cache.as_ref().unwrap_or(&app.snapshot).channels.iter().filter(|c| !snapshot.channels.contains(c)).cloned().collect();
+                for c in missing { app.invalidate_channel(&c); }
                 snapshot.messages.sort_by_key(|m|m.id);
                 app.board_cache = Some(snapshot);
                 app.resolve_project();
@@ -612,6 +633,7 @@ fn poll(app: &mut App, seconds: f64, tx: &mut Tx) -> bool {
                         if app.dialog==Some(Dialog::DeleteThread(id)){app.dialog=None;}
                         if app.row_menu==Some(id){app.row_menu=None;}
                     }
+                    EventKind::ChannelDeleted { channel } => app.invalidate_channel(&channel),
                     EventKind::ChannelCreated { channel } => {
                         if let Some(board)=&mut app.board_cache && !board.channels.contains(&channel){board.channels.push(channel.clone());}
                         if app.project.is_empty() && !app.onboarding.busy && app.onboarding.step == onboarding::Step::Name {
@@ -623,7 +645,11 @@ fn poll(app: &mut App, seconds: f64, tx: &mut Tx) -> bool {
                     _ => {} // Separate worker fetches hydrate reaction/schedule state.
                 }
             }
-            Update::Status(status) => app.status = status,
+            Update::Status(status) => {
+                if status != "live" { app.share.request += 1; app.share.busy = false; app.share.confirm_stop = false; app.share.result = None; }
+                app.status = status;
+                if matches!(app.dialog, Some(Dialog::Share | Dialog::Connection)) && app.share.result.is_none() { app.host_request(connection::HostOp::Inspect); }
+            }
             Update::Extra(result) => match result {
                 Ok(extra) => {app.board_extra=extra;app.refresh_extra();}
                 Err(e) => app.error = Some(format!("Could not refresh reactions/scheduled posts: {e}")),
@@ -644,10 +670,13 @@ fn poll(app: &mut App, seconds: f64, tx: &mut Tx) -> bool {
                 app.notice=Some(message);
             }
             Update::Done(draft, result) => {
-                if let Some(name) = app.creating_area.take() && result.is_ok() {
-                    app.task_area = edit(&name);
-                    app.new_area = edit("");
-                    app.details_picker = None;
+                if let Some(channel) = app.channel_actions.sending.take() {
+                    app.pending = false;
+                    match result {
+                        Ok(()) => { app.invalidate_channel(&channel); app.notice = Some(format!("Deleted #{channel}.")); }
+                        Err(e) => app.error = Some(format!("Could not delete #{channel}: {e}. Check the board before retrying.")),
+                    }
+                    continue;
                 }
                 if std::mem::take(&mut app.creating_task) && result.is_ok() {
                     app.clear_task_draft();
@@ -713,9 +742,16 @@ fn main() {
                 return true;
             }
             if !matches!(app.release.stage, release_update::Stage::Hidden) && e.key == Key::Escape { app.release.dismiss(); return true; }
+            if e.key == Key::Escape && app.setup_choices {app.setup_choices=false;return true;}
+            if e.key == Key::Escape && app.dialog==Some(Dialog::Filters) && app.details_picker.take().is_some(){return true;}
             if app.onboarding_visible() && e.key == Key::Escape { return true; }
             if e.key == Key::Escape {
+                if app.dialog == Some(Dialog::NewTask) && app.details_picker.is_some() {
+                    if !(app.details_picker == Some("new-sprint") && app.pending) { app.details_picker = None; }
+                    return true;
+                }
                 if app.project_menu {app.project_menu=false;return true;}
+                if app.channel_actions.menu.take().is_some(){return true;}
                 if app.row_menu.take().is_some(){return true;}
                 if app.setup_open {app.setup_open=false;return true;}
                 if app.dialog.take().is_some() { return true; }
@@ -737,16 +773,19 @@ fn main() {
             ("edit-task", |a| {fixture::load(a,true);a.open_thread(1);a.open_task_editor(1);}),
             ("add-board", |a| {fixture::load(a,false);a.begin_add_board();}),
             ("new-channel", |a| {fixture::load(a,true);a.dialog=Some(Dialog::NewChannel);}),
+            ("channel-options", channel_actions::menu_scene),
+            ("delete-channel", |a| {channel_actions::menu_scene(a); a.channel_actions.target=a.channel_actions.menu.take(); a.dialog=Some(Dialog::DeleteChannel);}),
             ("home", |a| {fixture::load(a,true);a.navigate(Page::Home);}),
             ("onboarding", |a| { a.project.clear(); a.onboarding.adding = true; }),
             ("join-board", |a| { a.onboarding.adding = true; a.onboarding.joining = true; a.onboarding.step = onboarding::Step::Board; }),
             ("home-setup", |a| {fixture::load(a,true);a.navigate(Page::Home);a.setup_open=true;}),
-            ("share-board", |a| { fixture::load(a, false); a.navigate(Page::Home); a.open_share(); }),
+            ("share-board", |a| { fixture::load(a, false); a.navigate(Page::Home); a.open_share(); a.status="live".into(); a.share.result=Some(Ok(connection::HostState { route: neochat::sharing::RouteState::Stopped, link:None })); }),
+            ("share-loading", |a| { fixture::load(a, false); a.navigate(Page::Home); a.open_share(); a.share.busy=true; }),
             ("schedule-compact", |a| { fixture::load(a, false); a.dialog = Some(Dialog::Schedule); a.zoom = zoom::Zoom::maximum(); }),
             ("channel-thread", |a| {fixture::load(a,true);a.navigate(Page::Channel(projects::channel(&a.project,"dev/rune")));a.open_thread(1);}),
             ("preferences", |a| {fixture::load(a,true); a.dialog=Some(Dialog::BoardView);}),
             ("activity", |a| { fixture::load(a, true); a.page = Page::Activity; }),
-            ("thread", |a| { fixture::load(a, true); a.page = Page::Activity; a.open_thread(1); }),
+            ("thread", |a| { fixture::load(a, true); a.aliases.insert("parker".into(),"Parker".into()); if let Some(reply)=a.snapshot.messages.iter_mut().find(|m|m.id==100){reply.author="parker".into();} a.page = Page::Activity; a.open_thread(1); }),
             ("reply-labels", |a| { fixture::load(a,true);a.page=Page::Activity;a.open_thread(1);a.reply_labels.insert(1,edit("area=\"desktop UI\""));a.dialog=Some(Dialog::ReplyTags(1)); }),
             ("completed-task", |a| {fixture::load(a,true);a.filter=5;a.open_thread(7);}),
             ("attachments", |a| { fixture::load(a, true); a.page = Page::Activity; a.open_thread(1); a.attachment_message = Some(1); a.download_id = Some(1); }),
@@ -905,6 +944,30 @@ mod tests {
         updates.send(Update::Done(Some((Some(1),"next reply".into())),Ok(()))).unwrap();rt.update(|a,tx|{poll(a,0.,tx);});
         assert_eq!(rt.state.reply_labels[&1].text,"area=new");
     }
+    #[test] fn editing_legacy_task_preserves_hidden_area_metadata() {
+        for reparent in [false, true] {
+            let mut app = App::new(); fixture::load(&mut app, false);
+            let (tx, rx) = mpsc::sync_channel(1); app.commands = Some(tx);
+            app.snapshot.messages[0].labels.insert("area".into(), "old label".into());
+            app.organization.tasks.entry(1).or_default().area = Some("stored placement".into());
+            app.open_task_editor(1);
+            assert!(!parse_labels(&app.task_labels.text).unwrap().contains_key("area"));
+            app.task_labels = edit("priority=low");
+            if reparent { app.task_parent = Some(2); }
+            app.create_task();
+            let Command::Action { action, .. } = rx.try_recv().unwrap() else { panic!("expected task edit") };
+            let labels = match action {
+                Action::EditTask { labels, .. } if !reparent => labels,
+                Action::UpdateTask { labels, area, parent: Some(2), .. } if reparent => {
+                    assert_eq!(area.as_deref(), Some("stored placement")); labels
+                }
+                _ => panic!("unexpected task edit"),
+            };
+            assert_eq!(labels["area"], "old label");
+            assert_eq!(labels["priority"], "low");
+        }
+    }
+
     #[test] fn tasks_use_new_task_dialog_and_preserve_draft_on_failure() {
         let mut app = App::new(); fixture::load(&mut app, false);
         let (tx, rx) = mpsc::sync_channel(4); app.commands = Some(tx);
@@ -919,10 +982,10 @@ mod tests {
         assert!(rx.try_recv().is_err());
         rt.update(|a,_| {
             a.task_title = edit("Polish sidebar"); a.task_description = edit("Keep keyboard focus.");
-            a.task_area = edit("Desktop UI"); a.assignee = edit("maya"); a.create_task();
+            a.assignee = edit("maya"); a.create_task();
         });
-        assert!(matches!(rx.try_recv().unwrap(), Command::Action { action: Action::PostTask { text, area: Some(area), assignee: Some(actor), .. }, .. }
-            if text == "Polish sidebar\n\nKeep keyboard focus." && area == "Desktop UI" && actor == "maya"));
+        assert!(matches!(rx.try_recv().unwrap(), Command::Action { action: Action::PostTask { text, area: None, assignee: Some(actor), .. }, .. }
+            if text == "Polish sidebar\n\nKeep keyboard focus." && actor == "maya"));
         updates.send(Update::Done(None,Err("offline".into()))).unwrap();
         rt.update(|a,tx| { poll(a,0.,tx); });
         assert_eq!(rt.state.task_title.text,"Polish sidebar");

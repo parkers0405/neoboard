@@ -2,9 +2,13 @@ use super::*;
 
 #[derive(Default)]
 pub struct Share {
+    pub request: u64,
+    pub operation: Option<connection::HostOp>,
+    pub confirm_stop: bool,
+    pub pulse: f32,
     pub board: String,
     pub busy: bool,
-    pub result: Option<Result<String, String>>,
+    pub result: Option<Result<connection::HostState, String>>,
     pub copied: bool,
 }
 
@@ -40,24 +44,55 @@ impl App {
     }
 
     pub fn open_board_share(&mut self, id: &str) {
-        if !self.can_share_board(id) || (self.share.busy && self.share.board != id) { return; }
-        if self.share.board != id {
-            self.share = Share { board: id.into(), ..Default::default() };
-        }
+        if !self.can_share_board(id) && !(self.remote() && self.project == id) { return; }
+        self.share = Share { board: id.into(), request: self.share.request + 1, ..Default::default() };
         self.project_menu = false;
         self.dialog = Some(Dialog::Share);
+        self.host_request(connection::HostOp::Inspect);
     }
 
-    pub fn share_board(&mut self) {
+    pub fn host_request(&mut self, op: connection::HostOp) {
+        use connection::HostOp::*;
         if self.share.busy || !self.can_share_board(&self.share.board) { return; }
-        let actor = format!("guest-{}", &neochat::board::random_token()[..12]);
-        let command = Command::ShareBoard { id: self.share.board.clone(), actor };
+        if self.status != "live" { return; }
+        let state = self.share.result.as_ref().and_then(|r| r.as_ref().ok());
+        if op == Stop && !(self.share.confirm_stop && state.is_some_and(|s| s.route != neochat::sharing::RouteState::Stopped)) { return; }
+        if op == Create && (state.is_none() || self.host_link().is_some()) { return; }
+        self.share.confirm_stop = false;
+        self.share.request += 1;
+        self.share.operation = Some(op);
+        let command = Command::Host { id: self.share.board.clone(), request: self.share.request, operation: op };
         self.share.copied = false;
         self.share.result = None;
         if self.commands.as_ref().is_some_and(|tx| tx.try_send(command).is_ok()) {
             self.share.busy = true;
         } else {
             self.share.result = Some(Err("The local board connection isn't ready yet.".into()));
+        }
+    }
+    pub fn host_link(&self) -> Option<&str> {
+        if self.status != "live" || !self.can_share_board(&self.share.board) { return None; }
+        let state = self.share.result.as_ref()?.as_ref().ok()?;
+        let link = state.link.as_deref()?;
+        (state.route == neochat::sharing::RouteState::Connected && neochat::invite_file::InviteFile::from_link(link).ok()?.project.as_deref() == Some(&self.share.board)).then_some(link)
+    }
+
+    pub fn disconnect_guest(&mut self) {
+        if !self.remote() { return; }
+        if self.pending || self.onboarding.busy { self.error = Some("Wait for the pending change before disconnecting.".into()); return; }
+        // Drop the worker and its update stream. In-flight reads cannot update this session.
+        self.commands = None;
+        self.updates = None;
+        self.status = "disconnected".into();
+    }
+
+    pub fn reconnect_guest(&mut self) {
+        if !self.remote() || self.status != "disconnected" { return; }
+        if let Some(wake) = self.connection_wake.clone() {
+            let (commands, updates) = connection::start(self.options.clone(), wake);
+            self.commands = Some(commands);
+            self.updates = Some(updates);
+            self.status = "connecting".into();
         }
     }
     pub fn remote(&self) -> bool { self.options.endpoint.is_some() || self.options.invite.is_some() }
@@ -270,6 +305,7 @@ mod tests {
         let mut app = App::new();
         fixture::load(&mut app, false);
         let active = app.project.clone();
+        app.status = "live".into();
         let mut board = app.snapshot.clone();
         board.channels.push("another/general".into());
         app.board_cache = Some(board);
@@ -282,13 +318,97 @@ mod tests {
         click(&mut rt, "share-board-another");
         assert_eq!(rt.state.project, active);
         assert_eq!(rt.state.share.board, "another");
+        let Ok(Command::Host { id, operation: connection::HostOp::Inspect, .. }) = requests.try_recv() else { panic!("expected status lookup"); };
+        assert_eq!(id, "another");
+        assert!(rt.find("create-share-link").is_none());
+        rt.update(|a, _| {
+            a.share.busy = false;
+            a.share.result = Some(Ok(connection::HostState { route: neochat::sharing::RouteState::Connected, link: None }));
+        });
+        rt.frame(1. / 60.);
         click(&mut rt, "create-share-link");
-        assert!(matches!(requests.try_recv(), Ok(Command::ShareBoard { id, .. }) if id == "another"));
+        assert!(matches!(requests.try_recv(), Ok(Command::Host { id, operation: connection::HostOp::Create, .. }) if id == "another"));
         rt.update(|a, _| a.dialog = None);
         rt.frame(1. / 60.);
         click(&mut rt, "collapse-sidebar");
         assert!(rt.find("projects-toggle").is_none());
         assert!(rt.find("share-board-another").is_none());
+    }
+
+    #[test]
+    fn guest_panel_disconnects_only_this_session_and_keeps_saved_board() {
+        let mut app = App::new();
+        fixture::load(&mut app, false);
+        let path = std::path::PathBuf::from("/fixture/never-opened.neochat");
+        app.options.invite = Some(path.clone());
+        app.saved_boards.insert(app.project.clone(), Some(path.clone()));
+        app.status = "live".into();
+        let (commands, requests) = mpsc::sync_channel(4);
+        app.commands = Some(commands);
+        app.open_share();
+        let mut rt = rune::Runtime::new(app, view::root, (850., 600.), rune::Env::new(true, 1.));
+        rt.frame(1. / 60.);
+        assert!(rt.find("guest-status").is_some());
+        for key in ["disconnect-host", "create-share-link", "copy-share-link"] { assert!(rt.find(key).is_none()); }
+        click(&mut rt, "disconnect-guest");
+        assert_eq!(rt.state.status, "disconnected");
+        assert!(rt.find("reconnect-guest").is_some());
+        assert_eq!(rt.state.saved_boards.get(&rt.state.project), Some(&Some(path)));
+        assert!(matches!(requests.try_recv(), Err(mpsc::TryRecvError::Disconnected)));
+    }
+
+    #[test]
+    fn host_panel_discards_stale_results_recovers_scoped_link_and_confirms_stop() {
+        use connection::{HostOp, HostState};
+        use neochat::sharing::RouteState::*;
+        let mut app = App::new();
+        fixture::load(&mut app, false);
+        app.status = "live".into();
+        let (commands, requests) = mpsc::sync_channel(8);
+        let (updates, rx) = mpsc::channel();
+        app.commands = Some(commands);
+        app.updates = Some(rx);
+        app.open_share();
+        let first = app.share.request;
+        app.open_share();
+        let second = app.share.request;
+        for _ in 0..2 { assert!(matches!(requests.try_recv(), Ok(Command::Host { operation: HostOp::Inspect, .. }))); }
+        let mut rt = rune::Runtime::new(app, view::root, (850., 600.), rune::Env::new(true, 1.));
+        let apply = |rt: &mut rune::Runtime<App>, update| {
+            updates.send(update).unwrap();
+            rt.update(|a, tx| { poll(a, 0., tx); });
+            rt.frame(1. / 60.);
+        };
+        apply(&mut rt, Update::Host(first, Ok(HostState { route: Stopped, link: None })));
+        assert!(rt.state.share.busy);
+        let link = format!("https://fixture.invalid/#neoboard={}&expires=4102444800&key=private-fixture-key", rt.state.project);
+        apply(&mut rt, Update::Host(second, Ok(HostState { route: Connected, link: Some(link) })));
+        click(&mut rt, "copy-share-link");
+        assert!(rt.state.share.copied);
+        for _ in 0..8 { rt.frame(1. / 60.); }
+        click(&mut rt, "disconnect-host");
+        assert!(rt.state.share.confirm_stop, "disconnect must request confirmation");
+        for _ in 0..5 { rt.frame(1. / 60.); }
+        assert!(requests.try_recv().is_err());
+        click(&mut rt, "confirm-stop-host");
+        let Ok(Command::Host { operation: HostOp::Stop, request, .. }) = requests.try_recv() else { panic!("expected confirmed stop"); };
+        apply(&mut rt, Update::Host(request, Ok(HostState { route: Stopped, link: None })));
+        assert!(rt.find("disconnect-host").is_none());
+        assert!(rt.find("copy-share-link").is_none());
+        assert!(rt.find("create-share-link").is_some());
+        click(&mut rt, "create-share-link");
+        let Ok(Command::Host { operation: HostOp::Create, request, .. }) = requests.try_recv() else { panic!("expected explicit create"); };
+        let link = format!("https://fixture.invalid/#neoboard={}&expires=4102444800&key=fixture", rt.state.project);
+        apply(&mut rt, Update::Host(request, Ok(HostState { route: Connected, link: Some(link) })));
+        assert!(rt.state.share.copied);
+        apply(&mut rt, Update::Status("offline".into()));
+        assert!(rt.find("copy-share-link").is_none());
+        assert!(rt.find("disconnect-host").is_none());
+        apply(&mut rt, Update::Status("live".into()));
+        let Ok(Command::Host { operation: HostOp::Inspect, request, .. }) = requests.try_recv() else { panic!("expected refresh after reconnect"); };
+        apply(&mut rt, Update::Host(request, Err("Unsupported by fixture daemon".into())));
+        assert!(rt.find("retry-host").is_some());
+        assert!(rt.find("create-share-link").is_none());
     }
 
     #[test]

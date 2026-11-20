@@ -17,12 +17,13 @@ pub fn load(app: &mut App, dense: bool) {
     let messages = titles.iter().take(if dense { 12 } else { 2 }).enumerate().map(|(i, title)| Message {
         id: i as u64 + 1, channel: if i % 3 == 0 { "dev/rune" } else { "dev" }.into(), parent: None,
         author: if i % 2 == 0 { "parker" } else { "codex" }.into(), text: title.to_string(),
+        sender: Some(["desktop", "mcp:Codex", "mcp:Claude Code", "mcp:OpenCode", "mcp:Neoism", "mcp:Custom Agent"][i % 6].into()),
         labels: [("priority".into(), if i % 3 == 0 { "high" } else { "normal" }.into())].into(),
         created_at: 1_790_000_000,
         attachments: if i == 0 { vec![Attachment { id: 1, message_id: 1, name: "layout-notes.txt".into(), size: 128 }] } else { vec![] },
         task: Some(Task { state: states[i % states.len()].clone(), needs: if i == 3 { vec![1, 3] } else { vec![] },
              assignee: (i == 2).then(|| "codex".into()), owner: (i == 2).then(|| "codex".into()), expires_at: (i == 2).then_some(app.now + 300),finished_by:(i==6).then(||"parker".into()),result:(i==6).then(||"Verified authenticated discovery.".into()) }),
-    }).chain(std::iter::once(Message { id: 100, channel: "dev/rune".into(), parent: Some(1), author: "codex".into(),
+    }).chain(std::iter::once(Message { id: 100, channel: "dev/rune".into(), parent: Some(1), author: "codex".into(), sender:Some("mcp:Codex".into()),
         text: "Rune window is ready for a layout pass. Can someone check the narrow-window view?".into(), labels: BTreeMap::new(), created_at: 1_790_000_010, task: None, attachments: vec![] })).collect();
     app.snapshot = Snapshot { cursor: 100, channels: vec!["dev".into(), "dev/rune".into(), "releases".into()], messages };
     app.channel = edit("dev");

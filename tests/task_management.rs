@@ -27,6 +27,77 @@ impl Fixture {
 }
 
 #[test]
+fn claim_next_selects_first_eligible_match_and_replays_the_same_lease() {
+    use ClaimAssignment::*;
+    let f = Fixture::new();
+    let worker = f.invite("worker", &["work"]);
+    let other = f.invite("other", &["work"]);
+    let labels = BTreeMap::from([("os".into(), "linux".into()), ("job.kind".into(), "build".into())]);
+    let next = |assignment| Action::ClaimNext { channel:"work".into(), labels:labels.clone(), assignment, lease_secs:60 };
+    let post = |channel: &str, assignee: Option<&str>, needs, labels| f.act(&f.token, Action::Post {
+        channel:channel.into(), text:"candidate".into(), task:true, labels, needs, assignee:assignee.map(str::to_owned),
+    }).id.unwrap();
+    let foreign = post("work", Some("other"), vec![], labels.clone());
+    post("work", None, vec![foreign], labels.clone());
+    post("work/private", None, vec![], labels.clone());
+    post("work", None, vec![], BTreeMap::from([("os".into(), "linux".into())]));
+    let free = post("work", None, vec![], labels.clone());
+    let mut extra = labels.clone(); extra.insert("extra".into(), "ok".into());
+    let mine = post("work", Some("worker"), vec![], extra);
+    let later = post("work", None, vec![], labels.clone());
+
+    let take = || f.board.action(&worker.token, Some("other"), Some("retry"), next(Eligible)).unwrap();
+    let first = take(); assert_eq!(first.id, Some(free)); assert_eq!(take(), first);
+    assert_eq!(f.task(free).owner.as_deref(), Some("worker"));
+    assert!(f.task(free).expires_at.unwrap() <= now() + 60);
+    f.denied(&other.token, Action::Renew { id:free, lease_secs:60 }, StatusCode::CONFLICT);
+    assert_eq!(f.act(&worker.token, next(Unassigned)).id, Some(later));
+    assert_eq!(f.act(&worker.token, next(Mine)).id, Some(mine));
+    let before = f.board.snapshot(&f.token).unwrap();
+    assert_eq!(f.act(&worker.token, next(Eligible)).id, None);
+    assert_eq!(f.board.snapshot(&f.token).unwrap(), before);
+    // Expiry is settled in the claim transaction, without a separate tick.
+    let db = neochat::storage::Connection::open(f.dir.path().join("board.db")).unwrap();
+    db.execute("UPDATE messages SET body=json_set(body,'$.task.expires_at',0) WHERE id=?1", [free]).unwrap();
+    assert_eq!(f.act(&other.token, next(Unassigned)).id, Some(free));
+}
+
+#[test]
+fn claim_next_checks_scope_credential_global_exclusion_and_lease_bounds_even_on_miss() {
+    let f = Fixture::new();
+    let guest = f.invite("guest", &["work/room"]);
+    f.act(&f.token, Action::PostTask { channel:"work".into(), text:"ack".into(), labels:BTreeMap::new(), needs:vec![], assignee:None, area:None, parent:None, global:true });
+    let next = |channel: &str, lease_secs| Action::ClaimNext { channel:channel.into(), labels:BTreeMap::new(), assignment:ClaimAssignment::Eligible, lease_secs };
+    assert_eq!(f.act(&f.token, next("work",1)).id, None);
+    f.denied(&guest.token, next("work",1), StatusCode::FORBIDDEN);
+    for seconds in [0, 86401] { f.denied(&guest.token, next("work/room", seconds), StatusCode::BAD_REQUEST); }
+    f.board.revoke_invite(&f.admin,guest.id).unwrap();
+    f.denied(&guest.token, next("work/room",60), StatusCode::UNAUTHORIZED);
+}
+
+#[test]
+fn simultaneous_claim_next_has_one_winner_and_one_event() {
+    let f = Fixture::new();
+    let id = f.post("work", vec![]);
+    let a = f.invite("alpha", &["work"]);
+    let b = f.invite("beta", &["work"]);
+    let cursor = f.board.snapshot(&f.token).unwrap().cursor;
+    let gate = std::sync::Barrier::new(2);
+    let take = |token: &str| { gate.wait(); f.act(token, Action::ClaimNext {
+        channel:"work".into(), labels:BTreeMap::new(), assignment:ClaimAssignment::Eligible, lease_secs:60,
+    }).id };
+    let (left,right) = std::thread::scope(|s| {
+        let left = s.spawn(|| take(&a.token));
+        let right = take(&b.token);
+        (left.join().unwrap(), right)
+    });
+    let winner = match (left,right) { (Some(n),None) if n==id => "alpha", (None,Some(n)) if n==id => "beta", pair => panic!("unexpected claims {pair:?}") };
+    assert_eq!(f.task(id).owner.as_deref(), Some(winner));
+    let events = f.board.events(&f.token,cursor).unwrap();
+    assert_eq!(events.len(),1); assert_eq!(events[0].actor,winner);
+}
+
+#[test]
 fn edit_task_is_atomic_and_rejects_dependency_cycles() {
     let f = Fixture::new();
     let id = f.post("project/tasks", vec![]);
@@ -58,8 +129,8 @@ fn assignment_validates_live_scoped_identity_and_prevents_stealing() {
     let outside=f.invite("outside",&["other/*"]); let revoked=f.invite("revoked",&[]);
     f.board.revoke_invite(&f.admin,revoked.id).unwrap();
     let expired=f.invite("expired",&[]);
-    let db=rusqlite::Connection::open(f.dir.path().join("board.db")).unwrap();
-    db.execute("UPDATE credentials SET expires=?1 WHERE id=?2",rusqlite::params![now()-1,expired.id]).unwrap();
+    let db=neochat::storage::Connection::open(f.dir.path().join("board.db")).unwrap();
+    db.execute("UPDATE credentials SET expires=?1 WHERE id=?2",neochat::params![now()-1,expired.id]).unwrap();
     for actor in ["unknown","outside","revoked","expired","worker/profile",""] {
         f.denied(&f.token,Action::Assign { id,assignee:Some(actor.into()) },StatusCode::BAD_REQUEST);
         f.denied(&f.token,Action::Post { channel:"project/tasks".into(),text:"bad assignment".into(),labels:BTreeMap::new(),task:true,needs:vec![],assignee:Some(actor.into()) },StatusCode::BAD_REQUEST);
@@ -132,7 +203,7 @@ fn block_authority_lease_release_terminal_and_validation() {
     f.act(&f.token,Action::Unblock { id });
     // Deterministic expiry: maintenance must remove lease authority before assignment.
     f.act(&worker.token,Action::Claim { id,lease_secs:60 });
-    let db=rusqlite::Connection::open(f.dir.path().join("board.db")).unwrap();
+    let db=neochat::storage::Connection::open(f.dir.path().join("board.db")).unwrap();
     db.execute("UPDATE messages SET body=json_set(body,'$.task.expires_at',0) WHERE id=?1",[id]).unwrap();
     f.denied(&worker.token,Action::Assign { id,assignee:None },StatusCode::FORBIDDEN);
     f.act(&f.token,Action::Assign { id,assignee:Some("peer".into()) });

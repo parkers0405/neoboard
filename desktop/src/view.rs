@@ -1,4 +1,8 @@
 use super::*;
+#[path = "task_form.rs"]
+mod task_form;
+#[path = "sprints.rs"]
+pub(crate) mod sprints;
 use rune::{Color, Cx, El, ScrollSpec, TextStyle, col, el, row, text, text_input};
 
 pub(super) const TITLEBAR_H: f32 = 30.0;
@@ -11,10 +15,21 @@ fn gray(v: u8) -> Color {
 fn font() -> TextStyle { TextStyle::new(12.0, 400.0) }
 fn label(value: impl Into<String>) -> El { text(value.into()).font(font()).color(gray(210)) }
 fn muted(value: impl Into<String>) -> El { label(value).color(gray(144)) }
+fn marked_sender(m: &Message, text: El) -> El {
+    match framework::mark(m.sender.as_deref()) {
+        Some(mark) => row().gap(4.).items_center().shrink().child(text.shrink()).child(mark),
+        None => text,
+    }
+}
 fn line() -> El { el().w_full().h(1.0).fill(gray(35)) }
 fn spacer() -> El { el().grow(1.0) }
+fn menu_action(title:&str,glyph:&str,danger:bool)->El {
+    let ink=if danger{rune::oklch(0.77,0.12,24.)}else{gray(215)};
+    row().w_full().h(28.).px(8.).items_center().gap(8.).radius(4.).hover(gray(39))
+        .child(label(glyph).w(16.).color(if danger{ink}else{gray(150)})).child(label(title).color(ink))
+}
 fn button(value: impl Into<String>, action: impl Fn(&mut App) + 'static) -> El {
-    el().px(8.0).h(28.0).center().child(label(value)).on_press(action)
+    el().px(8.0).h(28.0).center().child(text(value.into()).font(font()).color(gray(210))).on_press(action)
 }
 fn age(app: &App, m: &Message) -> String {
     let secs = app.now.saturating_sub(m.created_at);
@@ -42,18 +57,31 @@ fn nav(value: String, count: Option<usize>, active: bool, page: Page) -> El {
     if let Some(count) = count.filter(|n| *n > 0) { item = item.child(spacer()).child(muted(count.to_string())); }
     item
 }
+fn board_icon(remote:bool, size:f32)->El {
+    static FOLDER:rune::Icon=rune::Icon{name:"Local board",view:24.,body:r#"<path d="M3 7V5h7l2 3h9v12H3z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>"#};
+    static CLOUD:rune::Icon=rune::Icon{name:"Remote board",view:24.,body:r#"<path d="M7 19a5 5 0 0 1-1-9.9 7 7 0 0 1 13.1-1A5.5 5.5 0 0 1 18 19Z" fill="none" stroke="currentColor" stroke-width="1.8"/>"#};
+    rune::icon(if remote{&CLOUD}else{&FOLDER},size).color(gray(170))
+}
 fn board_picker(app: &App, scale: f32) -> El {
     let name = if app.project.is_empty() { "Boards" } else { &app.project };
     let font = TextStyle::new(12. * scale, 600.);
     row().key("projects-toggle").max_w(170. * scale).h(26. * scale).px(8. * scale).gap(8. * scale)
         .items_center().radius(5.).hover_alone().hover(gray(34))
+        .children((!app.project.is_empty()).then(||board_icon(app.remote(),15.*scale)))
         .child(label(name).font(font.clone()).color(splash::wordmark_ink()).truncate().shrink())
         .child(muted("▾").font(font))
         .on_press(|a: &mut App| a.project_menu = !a.project_menu)
 }
 
-fn sidebar(app: &App) -> El {
-    let mut side = col().key("sidebar").w(199.0).h_full().fill(gray(0));
+fn divider(slot:usize,value:f32,min:f32,max:f32)->El {
+    let vertical=slot==2;
+    let bar=if vertical {el().w_full().h(7.).center().child(line()).cursor(rune::Cursor::ResizeRow)}else{el().w(7.).h_full().center().child(el().w(1.).h_full().fill(gray(35))).cursor(rune::Cursor::ResizeColumn)};
+    bar.key(format!("pane-divider-{slot}")).hover(gray(46)).on_drag(move|a:&mut App,d:&mut rune::Drag,tx:&mut rune::Tx|{
+        tx.instant(); match d.phase {rune::Phase::Down=>d.data=value,rune::Phase::Move=>{let delta=match slot{0=>d.dx,1=>-d.dx,_=>d.dy};a.pane_sizes[slot]=(d.data+delta/a.zoom.factor()).clamp(min,max).round();},rune::Phase::Up=>if d.cancelled(){a.pane_sizes[slot]=d.data;}}
+    })
+}
+fn sidebar(app: &App, width:f32) -> El {
+    let mut side = col().key("sidebar").w(width).h_full().fill(gray(0));
     side = side.child(row().w_full().h(45.0).px(16.0).gap(3.).items_center()
         .child(board_picker(app, 1.).shrink())
         .child(spacer())
@@ -61,7 +89,7 @@ fn sidebar(app: &App) -> El {
     let mut channels = col().w_full().padding(8.0)
         .child(nav("Home".into(), None, app.page == Page::Home, Page::Home))
         .child(nav("Activity".into(), None, app.page == Page::Activity, Page::Activity))
-        .child(nav("Tasks".into(), Some(app.snapshot.messages.iter().filter(|m| m.task.as_ref().is_some_and(|t| matches_filter(&t.state, OPEN_TASKS))).count()), app.page == Page::Tasks, Page::Tasks))
+        .child(nav("Tasks".into(), Some(app.snapshot.messages.iter().filter(|m| projects::contains(&app.project,&m.channel) && m.parent.is_none() && app.organization.tasks.get(&m.id).is_none_or(|p|p.parent.is_none()) && m.task.as_ref().is_some_and(|t| matches_filter(&t.state, OPEN_TASKS))).count()), app.page == Page::Tasks, Page::Tasks))
         .child(row().h(46.0).px(8.0).items_center().child(muted("channels").grow(1.0)).child(el().key("add-channel").size(28.,28.).center().radius(7.).hover(gray(40)).child(label("+")).on_press_tx(|a:&mut App,tx| {a.error=None;a.new_channel=edit("");a.dialog=Some(Dialog::NewChannel);tx.focus("new-channel",false);} )));
     let mut names = app.snapshot.channels.clone();
     names.sort_by_key(|c| (c.contains('/'), c.clone()));
@@ -69,7 +97,10 @@ fn sidebar(app: &App) -> El {
         if !projects::contains(&app.project,&channel) {continue;}
         let leaf=channel.split_once('/').map_or(channel.as_str(),|(_,path)|path);
         let unread = app.snapshot.messages.iter().filter(|m| m.channel == channel && m.id > *app.seen.get(&channel).unwrap_or(&0)).count();
-        channels = channels.child(nav(format!("#{leaf}"), Some(unread), app.page == Page::Channel(channel.clone()), Page::Channel(channel)));
+        let item = nav(format!("#{leaf}"), Some(unread), app.page == Page::Channel(channel.clone()), Page::Channel(channel.clone()));
+        channels = channels.child(row().w_full().items_center().child(item.w(0.).grow(1.))
+            .child(el().key(format!("channel-options-{channel}")).size(26.,28.).center().radius(5.).hover(gray(40)).child(muted("⋯"))
+                .on_press(move |a:&mut App| a.channel_actions.menu = Some(channel.clone()))));
     }
     side.child(col().grow(1.0).w_full().scroll(ScrollSpec { stick_bottom: false }).child(channels))
         .child(row().key("local-profile").w_full().h(40.).px(16.).gap(8.).items_center()
@@ -83,23 +114,29 @@ fn header(app: &App) -> El {
     if !app.sidebar || (app.width < 900.0 && app.thread.is_some()) {
         header = header.child(button("›", |a| { a.sidebar = true; a.save_preferences(); if a.width < 900.0 { a.thread = None; } }));
     }
-    header = header.child(label(title).color(gray(232)));
+    header = if app.page == Page::Tasks { sprints::tabs(app,header) } else { header.child(label(title).color(gray(232))) };
     if app.page==Page::Home {return header;}
     header = header.child(spacer());
-    if app.page == Page::Tasks {
-        static PLUS: rune::Icon = rune::Icon { name:"New task", view:24., body:r#"<path d="M12 5v14M5 12h14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>"# };
-        header = header.child(el().key("new-task").size(32.,32.).center().radius(8.).hover(gray(40))
-            .child(rune::icon(&PLUS,18.).color(gray(189)))
+    if app.page == Page::Tasks && app.sprint.show && sprints::current(app).is_none() {
+        header = header.child(button("+ New sprint", sprints::new_sprint).key("new-sprint-action").radius(4.).hover(gray(24)));
+    } else if app.page == Page::Tasks && !sprints::current(app).is_some_and(|s| s.finished) {
+        header = header.child(el().key("new-task").px(10.).h(28.).center().radius(4.).hover(gray(24))
+            .child(label("+ New task"))
             .on_press_tx(|a: &mut App, tx| {
                 if !a.creating_task { a.error = None; a.details_picker = None; a.pick_assignee = false; }
                 if !a.creating_task && (a.editing_task.is_some() || a.task_parent.is_some()) { a.clear_task_draft(); }
+                if !a.creating_task && let Some(sprint) = sprints::current(a) {
+                    a.sprint.assignment = Some(sprint.id);
+                    a.task_global = false;
+                }
                 if a.task_channel.is_empty() { a.task_channel = a.channel.text.clone(); }
                 a.dialog = Some(Dialog::NewTask);
                 if !a.creating_task { tx.focus("task-title", false); }
             }));
     }
+    if app.page == Page::Tasks && app.sprint.show { return header; }
     static FILTER: rune::Icon = rune::Icon{name:"Filters",view:24.,body:r#"<path d="M3 5h18M6 12h12M10 19h4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>"#};
-    header.child(el().key("filters").size(32.,32.).center().radius(8.).fill(gray(if !app.query.text.is_empty() || app.page==Page::Tasks && (app.task_filters.active() || app.filter != ALL_TASKS || app.area_filter.is_some() || app.group_by_area){40}else{0})).hover(gray(40)).child(rune::icon(&FILTER,18.).color(gray(189))).on_press_tx(|a:&mut App,tx|{a.details_picker=None;a.dialog=Some(Dialog::Filters);tx.focus("filter",false);} ))
+    header.child(el().key("filters").size(32.,32.).center().radius(8.).fill(gray(if !app.query.text.is_empty() || app.page==Page::Tasks && (app.task_filters.active() || app.filter != ALL_TASKS){40}else{0})).hover(gray(40)).child(rune::icon(&FILTER,18.).color(gray(189))).on_press_tx(|a:&mut App,tx|{a.details_picker=None;a.dialog=Some(Dialog::Filters);tx.focus("filter",false);} ))
 }
 fn task_status(state:TaskState)->El {
     static DONE:rune::Icon=rune::Icon{name:"Completed",view:24.,body:r#"<g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"><circle cx="12" cy="12" r="9.5"/><path d="m8 12 2.7 2.7 5.3-5.4"/></g>"#};
@@ -119,9 +156,9 @@ fn task_row(app: &App, m: &Message) -> El {
     let id = m.id;
     let split=app.thread.is_some();let mut title=row().w_full().items_center().gap(6.).clip_soft(0.)
         .child(muted(format!("#{id}"))).child(label(m.text.lines().next().unwrap_or("")).truncate().shrink());
-    for(k,v)in m.labels.iter().take(if split{2}else{4}){title=title.child(chip(format!("{k}={v}")));}
-    let mut body=col().grow(1.).w(0.).gap(3.).child(title);
-    if app.task_group(m).0 == 0 { body = body.child(muted("Assigned to Everyone")); }
+    for(k,v)in m.labels.iter().filter(|(k,_)| k.as_str() != "area").take(if split{2}else{4}){title=title.child(chip(format!("{k}={v}")));}
+    let mut body=col().grow(1.).w(0.).gap(3.).child(title).children(m.sender.as_ref().map(|_|marked_sender(m, muted(app.sender_label(m)).truncate())));
+    if app.organization.tasks.get(&m.id).is_some_and(|p| p.global) { body = body.child(muted("Assigned to Everyone")); }
     else if let Some(actor)=&task.owner {body=body.child(muted(format!("Claimed by {}{}",app.actor_label(actor),task.expires_at.map_or(String::new(),|t|format!(" · {}",lease(app,t))))).truncate());}
     else if let Some(actor)=&task.assignee {body=body.child(muted(format!("Assigned to {}",app.actor_label(actor))).truncate());}
     else if !task.needs.is_empty(){body=body.child(muted(format!("needs {}",task.needs.iter().map(|id|format!("#{id}")).collect::<Vec<_>>().join(", "))).truncate());}
@@ -132,21 +169,21 @@ fn task_row(app: &App, m: &Message) -> El {
 fn message(app: &App, m: &Message, in_thread: bool) -> El {
     let id = m.id;
     let mut body = col().grow(1.0).w(0.0).gap(5.0);
-    let byline = row().gap(8.0).items_center().child(muted(app.actor_label(&m.author)))
+    let byline = row().w_full().gap(8.0).items_center().child(marked_sender(m, muted(app.sender_label(m)).truncate().shrink()))
             .child(muted(if in_thread { String::new() } else { format!("{} #{}", if m.parent.is_some() { "replied in" } else { "in" }, m.channel) }))
             .child(muted(age(app, m)).font(TextStyle::new(10.0, 400.0)));
     if let Some(task) = &m.task {
         let (title, description) = m.text.split_once('\n').unwrap_or((&m.text, ""));
-        body = body.child(label(title).font(TextStyle::new(17., 650.)).color(gray(240)).wrap().w_full())
+        body = body.child(label(title).selectable(true).font(TextStyle::new(17., 650.)).color(gray(240)).wrap().w_full())
             .child(row().w_full().flex_wrap().gap(8.).items_center().child(metadata_chip(state_name(&task.state).into())).child(byline));
         if !description.trim().is_empty() {
-            body = body.child(label(description.trim()).wrap().w_full());
+            body = body.child(label(description.trim()).selectable(true).wrap().w_full());
         }
     } else {
-        body = body.child(byline).child(label(&m.text).wrap().w_full());
+        body = body.child(byline).child(label(&m.text).selectable(true).wrap().w_full());
     }
     if !m.labels.is_empty() {
-        body = body.child(row().w_full().gap(4.).flex_wrap().children(m.labels.iter().map(|(k,v)| {
+        body = body.child(row().w_full().gap(4.).flex_wrap().children(m.labels.iter().filter(|(k,_)| m.task.is_none() || k.as_str() != "area").map(|(k,v)| {
             metadata_chip(format!("{k}={v}")).key(format!("message-label-{id}-{k}"))
         })));
     }
@@ -174,7 +211,7 @@ fn message(app: &App, m: &Message, in_thread: bool) -> El {
         if let Some(last)=last {
             body=body.child(row().w_full().child(row().key(format!("open-replies-{id}")).h(27.).px(8.).gap(8.).items_center().shrink()
                 .radius(5.).fill(gray(26)).border(1.,gray(48)).hover(gray(39))
-                .child(label(format!("{} replied",app.actor_label(&last.author))).key(format!("reply-by-{id}")).font(TextStyle::new(12.,600.)).truncate().shrink())
+                .child(marked_sender(last, label(format!("{} replied",app.sender_label(last))).key(format!("reply-by-{id}")).font(TextStyle::new(12.,600.)).truncate().shrink()))
                 .children((count > 1).then(|| muted(format!("{count} replies"))))
                 .on_press(move |a:&mut App|a.open_thread(id))));
         }
@@ -286,7 +323,7 @@ fn composer(app: &App, reply: bool) -> El {
 
 fn modal_frame(key: &str, viewport: [f32; 2], width: f32, header: Option<El>, body: El, footer: Option<El>, dismiss: impl Fn(&mut App) + 'static) -> El {
     let [w, h] = viewport;
-    let panel = col().key(key.to_owned()).w(width.min((w - 24.).max(1.))).max_h((h - 24.).max(1.))
+    let panel = col().selection_group(true).key(key.to_owned()).w(width.min((w - 24.).max(1.))).max_h((h - 24.).max(1.))
         .fill(gray(0)).border(1., gray(48)).radius(12.).clip_soft(12.)
         .children(header)
         .child(col().key("modal-body").w_full().min_h(0.).shrink().scroll(ScrollSpec { stick_bottom: false }).child(body))
@@ -301,32 +338,59 @@ fn dialog_action(button: El) -> El {
 
 fn dialog(app:&App, page:Dialog, viewport: [f32; 2], filter_anchor: Option<[f32;4]>)->El {
     use Dialog::*;
-    let title=match page {Settings=>"Settings",Personal=>"Personal",BoardView=>"Board View",Connection=>"Connection",Share=>"Share board",Tags=>"Message details",NewTask if app.editing_task.is_some()=>"Edit task",NewTask if app.task_global=>"New global task",NewTask if app.task_parent.is_some()=>"New subtask",NewTask=>"New task",ReplyTags(_)=>"Reply labels",Filters=>"Filters",Schedule=>"Schedule delivery",NewChannel=>"New channel",DeleteThread(_)=>"Delete thread?"};
+    if page == NewTask && app.details_picker == Some("new-sprint") { return sprints::create_dialog(app, viewport); }
+    if page == NewTask {
+        if let Some(key) = app.details_picker { return task_form::chooser(app, viewport, key); }
+    }
+    let title=match page {NewSprint=>return sprints::create_dialog(app,viewport),Settings=>"Settings",Personal=>"Personal",BoardView=>"Board View",Connection|Share=>"Board connection",Tags=>"Message details",NewTask if app.editing_task.is_some()=>"Edit task",NewTask if app.task_global=>"New global task",NewTask if app.task_parent.is_some()=>"New subtask",NewTask=>"New task",ReplyTags(_)=>"Reply labels",Filters=>"Filters",Schedule=>"Schedule delivery",NewChannel=>"New channel",DeleteThread(_)=>"Delete thread?",DeleteChannel=>"Delete channel?"};
     let nav=|name:&str, detail:&str, dest:Dialog| row().w_full().h(58.).px(14.).items_center().radius(10.).fill(gray(0)).border(1.,gray(55)).hover(gray(48))
-        .child(col().gap(3.).child(label(name)).child(muted(detail).font(TextStyle::new(10.,400.)))).child(spacer()).child(muted("›")).on_press(move |a:&mut App| {if dest==Personal{a.personal_name=edit(a.me.as_ref().and_then(|m|m.display_name.as_deref()).unwrap_or(""));a.error=None;}a.dialog=Some(dest);});
+        .child(col().gap(3.).child(label(name)).child(muted(detail).font(TextStyle::new(10.,400.)))).child(spacer()).child(muted("›")).on_press(move |a:&mut App| {if dest==Personal{a.personal_name=edit(a.me.as_ref().and_then(|m|m.display_name.as_deref()).unwrap_or(""));a.error=None;}if dest==Connection {a.open_share();}a.dialog=Some(dest);});
     let back = matches!(page, BoardView|Connection|Personal).then(|| button("‹ Back",|a|a.dialog=Some(Settings)).radius(7.).hover(gray(52)));
     let top=row().w_full().px(12.).h(40.).gap(8.).items_center().border_sides([0.,0.,1.,0.],gray(35)).children(back).child(label(title).font(TextStyle::new(15.,600.)).truncate().shrink()).child(spacer())
-        .child(el().w(62.).h(30.).center().child(dialog_action(button(if matches!(page,NewChannel|NewTask|DeleteThread(_)){"Cancel"}else{"Done"},|a|a.dialog=None).key("dialog-close"))));
+        .child(el().w(62.).h(30.).center().child(dialog_action(button(if page==Share{"Close"}else if matches!(page,NewChannel|NewTask|DeleteThread(_)|DeleteChannel){"Cancel"}else{"Done"},|a|a.dialog=None).key("dialog-close"))));
     let mut panel=col().w_full().padding(16.).gap(10.);
     let pref=|name:&str, value:&str, change:fn(&mut App)| row().w_full().h(44.).px(14.).items_center().hover(gray(49))
         .child(label(name)).child(spacer()).child(muted(value)).on_press(move |a:&mut App|{change(a);a.save_preferences();});
     panel=match page {
-        Share => {
+        NewSprint => unreachable!("rendered above"),
+        DeleteChannel => {
+            let channel = app.channel_actions.target.as_deref().unwrap_or("");
+            let mut p = panel.child(label(format!("#{channel}")).wrap())
+                .child(muted("Deleting this channel removes its threads, replies, tasks, attachments and scheduled posts for everyone. This cannot be undone.").wrap());
+            if let Some(error) = &app.error { p = p.child(label(error).wrap()); }
+            p.child(row().child(spacer()).child(menu_action(if app.pending {"Deleting…"} else {"Delete channel"}, "×", true)
+                .w(160.).key("confirm-delete-channel").on_press(App::confirm_channel_delete)))
+        }
+        Connection | Share => {
+            use connection::HostOp;
+            use neochat::sharing::RouteState::*;
             let s = &app.share;
-            let mut p = panel.child(label(&s.board)).child(muted("OpenTunnel makes this board reachable over HTTPS. Only people with a valid board invite can open it.").wrap());
-            if s.busy { p = p.child(muted("Starting OpenTunnel… This can take a few minutes.").wrap()); }
-            else if app.can_share_board(&s.board) {
-                match &s.result {
-                    Some(Ok(link)) => {
-                        let link = link.clone();
-                        p = p.child(muted("Send the link privately. It expires after 24 hours. The host must stay online.").wrap())
-                            .child(dialog_action(button(if s.copied { "Copied!" } else { "Copy invite link" }, |_| {}).key("copy-share-link")
-                                .on_press_tx(move |a: &mut App, tx| { tx.copy(link.clone()); a.share.copied = true; })))
-                            .child(button("Create another invite", App::share_board));
-                    }
-                    Some(Err(error)) => { p = p.child(muted(error).wrap()).child(dialog_action(button("Try again", App::share_board))); }
-                    None => { p = p.child(dialog_action(button("Create invite link", App::share_board).key("create-share-link"))); }
+            let mut p = panel.child(label(&s.board));
+            if app.remote() {
+                p = p.child(label(match app.status.as_str() { "live" => "Joined", "connecting" => "Connecting…", _ => "Disconnected" }).key("guest-status"))
+                    .child(muted("Disconnecting affects only this desktop. Your board stays saved and the host stays online.").wrap());
+                if app.status == "disconnected" { p = p.child(dialog_action(button("Reconnect", App::reconnect_guest).key("reconnect-guest"))); }
+                else { p = p.child(dialog_action(button("Disconnect this desktop", App::disconnect_guest).key("disconnect-guest"))); }
+            } else if s.busy {
+                p = p.child(muted(match s.operation { Some(HostOp::Create) => "Creating invite link…", Some(HostOp::Stop) => "Stopping host tunnel…", _ => "Checking host status…" })).child(el().key("share-progress").w(160.).h(5.).radius(2.).fill(gray(53)).child(el().absolute(112.*s.pulse,0.).w(48.).h(5.).radius(2.).fill(gray(200))));
+            } else if app.status != "live" { p = p.child(muted(if app.status == "connecting" {"Connecting to local board…"} else {"Local board offline"})); }
+            else if let Some(Ok(state)) = &s.result {
+                p = p.child(label(match state.route { Connected => "Hosting", Stopped => "Local", Connecting => "Tunnel connecting…", Reconnecting => "Tunnel reconnecting…" }).key("host-status"));
+                if s.confirm_stop {
+                    p = p.child(muted("Stop the host-wide tunnel? Guests on every board shared by this host will lose remote access. Local boards stay available.").wrap())
+                        .child(dialog_action(button("Stop host-wide tunnel", |a| a.host_request(HostOp::Stop)).key("confirm-stop-host")))
+                        .child(dialog_action(button("Cancel", |a| a.share.confirm_stop = false)));
+                } else {
+                    if app.host_link().is_some() {
+                        p = p.child(dialog_action(button(if s.copied {"Copied!"} else {"Copy invite link"}, |_| {}).key("copy-share-link").on_press_tx(|a: &mut App, tx| { if let Some(link) = a.host_link() { tx.copy(link.to_owned()); a.share.copied = true; } })));
+                    } else if matches!(state.route, Connected | Stopped) {
+                        p = p.child(dialog_action(button(if state.route == Connected { "Create and copy invite link" } else { "Start hosting and copy invite link" }, |a| a.host_request(HostOp::Create)).key("create-share-link")));
+                    } else { p = p.child(dialog_action(button("Refresh status", |a| a.host_request(HostOp::Inspect)))); }
+                    if state.route != Stopped { p = p.child(dialog_action(button("Disconnect host tunnel…", |a| a.share.confirm_stop = true).key("disconnect-host"))); }
                 }
+            } else {
+                if let Some(Err(error)) = &s.result { p = p.child(muted(error).wrap()); }
+                p = p.child(dialog_action(button("Retry status check", |a| a.host_request(HostOp::Inspect)).key("retry-host")));
             }
             p
         }
@@ -345,154 +409,48 @@ fn dialog(app:&App, page:Dialog, viewport: [f32; 2], filter_anchor: Option<[f32;
             if let Some(error)=&app.error {p=p.child(muted(error).wrap());}
             p.child(row().w_full().child(spacer()).child(button(if app.creating_channel.is_some(){"Creating…"}else{"Create channel"},App::create_channel).key("create-channel").radius(7.).fill(gray(0)).border(1.,gray(55))))
         },
-        Settings=>panel.child(nav("Personal","Your display name on this board",Personal)).child(nav("Board View","Task density, sort order and sidebar",BoardView)).child(nav("Connection","Current board and connection status",Connection)),
+        Settings=>panel.child(nav("Personal","Your display name on this board",Personal)).child(nav("Board View","Task density, sort order and sidebar",BoardView)).child(dialog_action(button("Check for updates",|a|a.release.manual()).key("check-updates"))),
         Personal=>{let mut p=panel.child(muted("Display name")).child(form_input(&app.personal_name,"personal-name",&app.local_name).on_edit(|a:&mut App|&mut a.personal_name))
             .child(muted(format!("System name: {}. Leave blank to use it again.",app.local_name)).wrap());
             if let Some(e)=&app.error{p=p.child(muted(e).wrap());}
             p.child(row().child(spacer()).child(button("Save name",|a|{a.error=None;a.queue_file(Command::Personal(a.personal_name.text.trim().into()),false);})))},
         BoardView=>panel.child(col().w_full().fill(gray(0)).border(1.,gray(55)).radius(10.)
             .child(pref("Task spacing",if app.compact{"Compact"}else{"Comfortable"},|a|a.compact=!a.compact)).child(line())
-            .child(pref("Sort order",if app.oldest{"Oldest first"}else{"Newest first"},|a|a.oldest=!a.oldest)).child(line())
+            .child(pref("Activity and scheduled order",if app.oldest{"Oldest first"}else{"Newest first"},|a|a.oldest=!a.oldest)).child(line())
             .child(pref("Sidebar",if app.sidebar{"Visible"}else{"Hidden"},|a|a.sidebar=!a.sidebar)))
             .child(muted("Preferences are saved on this device.").font(TextStyle::new(11.,400.))),
-        Connection=>panel.child(muted(app.options.endpoint.as_deref().unwrap_or(if app.remote() { "Invited board" } else { "Local board" })).wrap()).child(label(format!("Status: {}",app.status)).wrap()),
-        Tags|NewTask=>{let current=if page == NewTask { app.task_channel.clone() } else { projects::channel(&app.project,app.channel.text.trim().trim_start_matches('#')) };
-            if page == NewTask {
-                if app.creating_task {
-                    panel = panel.child(muted("Saving task…"));
-                } else {
-                    panel = panel.child(label("Title")).child(form_input(&app.task_title, "task-title", "What needs to be done?").on_edit(|a: &mut App| &mut a.task_title))
-                        .child(muted("Description · optional"))
-                        .child(text_input(&app.task_description, font()).key("task-description").w_full().h(82.).px(12.).py(10.).radius(7.).fill(gray(0)).border(1.,gray(72)).color(gray(235))
-                            .placeholder("Add context, requirements, or acceptance criteria",gray(148)).on_edit(|a: &mut App| &mut a.task_description))
-                        .child(line());
-                    if app.editing_task.is_none() && app.task_parent.is_none() {
-                        panel = panel.child(dialog_action(button(if app.task_global { "Use a regular task" } else { "Create a global task instead" }, |a| {
-                            a.task_global = !a.task_global;
-                            a.details_picker = None;
-                        }).key("task-global-toggle")));
-                    }
-                    if app.task_global {
-                        panel = panel.child(label("Assigned to Everyone")).child(muted("Board-wide, with no Area. Each person or agent can mark it done for themselves.").wrap());
-                    }
-                }
-            }
-            let selector=|key:&'static str,title:String|select_trigger(title,app.details_picker==Some(key),move|a|{a.pick_assignee=false;a.details_picker=if a.details_picker==Some(key){None}else{Some(key)};}).key(key);
-            if page == NewTask && app.creating_task { panel } else {
-            let channel = if current.is_empty() {"Choose a channel".into()} else {format!("#{}",current.split_once('/').map_or(current.as_str(),|(_,s)|s))};
-            let locked_channel = page == NewTask && (app.editing_task.is_some() || app.task_parent.is_some());
-            let global_form = page == NewTask && app.task_global;
-            let mut p=if global_form { panel } else { panel.child(muted("Channel")).child(if locked_channel { label(channel).truncate() } else { selector("pick-channel",channel) }) };
-            if !global_form && !locked_channel && app.details_picker==Some("pick-channel") {
+        NewTask => task_form::properties(app, panel),
+        Tags => {
+            let current = projects::channel(&app.project,app.channel.text.trim().trim_start_matches('#'));
+            let channel = current.split_once('/').map_or(current.as_str(),|(_,s)|s);
+            let mut p = panel.child(muted("Channel")).child(select_trigger(format!("#{channel}"),app.details_picker==Some("pick-channel"),|a| a.details_picker = (a.details_picker!=Some("pick-channel")).then_some("pick-channel")).key("pick-channel"));
+            if app.details_picker==Some("pick-channel") {
                 let mut choices=col().w_full().max_h(116.).scroll(ScrollSpec{stick_bottom:false});
-                for channel in app.snapshot.channels.iter().filter(|c|projects::contains(&app.project,c)) {
-                    let name=channel.clone();let short=channel.split_once('/').map_or(channel.as_str(),|(_,s)|s);
-                        choices=choices.child(button(format!("#{short}"),move|a|{if page == NewTask {if a.task_channel!=name{a.assignee=edit("");a.needs=edit("");a.task_parent=None;}a.task_channel=name.clone();}else{a.channel=edit(&name);}a.details_picker=None;}));
+                for ch in app.snapshot.channels.iter().filter(|c|projects::contains(&app.project,c)) {
+                    let name=ch.clone(); let short=ch.split_once('/').map_or(ch.as_str(),|(_,s)|s);
+                    choices=choices.child(button(format!("#{short}"),move|a|{a.channel=edit(&name);a.details_picker=None;}));
                 }
-                if !app.snapshot.channels.iter().any(|c|projects::contains(&app.project,c)){choices=choices.child(muted("No channels yet. Use + in the sidebar."));}p=p.child(choices);
+                if !app.snapshot.channels.iter().any(|c|projects::contains(&app.project,c)){choices=choices.child(muted("No channels yet. Use + in the sidebar."));}
+                p=p.child(choices);
             }
-            if page==NewTask && !app.task_global {
-                p = p.child(muted("Area · optional")).child(selector("pick-area", if app.task_area.text.is_empty() {"No area".into()} else {app.task_area.text.clone()}));
-                if app.details_picker == Some("pick-area") || app.details_picker == Some("new-area") {
-                    let mut choices = col().w_full().max_h(122.).scroll(ScrollSpec { stick_bottom: false })
-                        .child(button("No area", |a| {a.task_area = edit(""); a.details_picker = None;}));
-                    for area in app.areas() {
-                        let area = area.to_owned();
-                        choices = choices.child(button(area.clone(), move |a| {a.task_area = edit(&area); a.details_picker = None;}));
-                    }
-                    p = p.child(choices).child(button("+ New area", |_| {}).key("new-area-button").on_press_tx(|a: &mut App,tx| {
-                        a.details_picker = Some("new-area"); tx.focus("new-area-input", false);
-                    }));
-                    if app.details_picker == Some("new-area") {
-                        p = p.child(form_input(&app.new_area,"new-area-input","Area name").on_edit(|a: &mut App| &mut a.new_area))
-                            .child(dialog_action(button("Create area",App::add_area).key("create-area")));
-                    }
-                }
-                let parent_name = app.task_parent.and_then(|id| app.snapshot.messages.iter().find(|m| m.id == id))
-                    .map_or_else(|| "No parent".into(), |m| format!("#{} {}",m.id,m.text.lines().next().unwrap_or("")));
-                p = p.child(muted("Parent task · optional")).child(selector("pick-parent",parent_name));
-                if app.details_picker == Some("pick-parent") {
-                    let mut choices = col().w_full().max_h(124.).scroll(ScrollSpec { stick_bottom:false })
-                        .child(button("No parent",|a| {a.task_parent=None;a.details_picker=None;}));
-                    for m in app.snapshot.messages.iter().filter(|m| m.task.is_some() && m.channel==current && Some(m.id)!=app.editing_task
-                        && app.organization.tasks.get(&m.id).is_none_or(|t| !t.global && t.parent.is_none())) {
-                        let id = m.id;
-                        choices = choices.child(button(format!("#{id} {}",m.text.lines().next().unwrap_or("")),move|a|{a.task_parent=Some(id);a.details_picker=None;}));
-                    }
-                    p = p.child(choices);
-                }
-                p=p.child(muted("Assignee")).child(button(format!("{}  ▾",if app.assignee.text.is_empty(){"Unassigned"}else{app.actor_label(&app.assignee.text)}),App::show_assignees).key("choose-assignee").border(1.,gray(60)).radius(7.));
-                if app.pick_assignee {
-                    let mut list=col().w_full().max_h(138.).scroll(ScrollSpec{stick_bottom:false}).child(button("Unassigned",|a|{a.assignee=edit("");a.pick_assignee=false;}));
-                    match app.member_list.as_ref().filter(|(ch,_)|*ch==current).map(|(_,r)|r){
-                        Some(Ok(members))=>for member in members{let id=member.actor.clone(); let name=app.actor_label(&id).to_owned();list=list.child(button(name,move|a|{a.assignee=edit(&id);a.pick_assignee=false;}));},
-                        Some(Err(e))=>list=list.child(muted(e).wrap()),None=>list=list.child(muted("Loading members…")),
-                    }p=p.child(list);
-                }
-                let selected=parse_needs(&app.needs.text).unwrap_or_default();
-                p=p.child(muted("Depends on")).child(selector("pick-needs",if selected.is_empty(){"None".into()}else{selected.iter().map(|id|format!("#{id}")).collect::<Vec<_>>().join(", ")}));
-                if app.details_picker==Some("pick-needs") {
-                    let mut list=col().w_full().h(120.).scroll(ScrollSpec{stick_bottom:false});
-                    let mut tasks:Vec<_>=app.snapshot.messages.iter().filter(|m|projects::contains(&app.project,&m.channel) && m.task.is_some() && Some(m.id) != app.editing_task && (!locked_channel || m.channel == current)).collect();
-                    tasks.sort_by_key(|m|(m.channel!=current,&m.channel,m.id));
-                    if tasks.is_empty(){list=list.child(muted("No tasks in this workspace yet."));}
-                    let mut group="";
-                    for m in tasks {let id=m.id;
-                        if group!=m.channel {group=&m.channel;let name=group.to_owned();let short=group.split_once('/').map_or(group,|(_,s)|s);
-                            list=list.child(if group==current{muted(format!("#{short}")).padding(4.)}else{button(format!("Use #{short} for this draft"),move|a|{a.task_channel=name.clone();a.task_parent=None;a.assignee=edit("");a.needs=edit("");})});
-                        }
-                        if group!=current{list=list.child(muted(format!("#{id}  {}",m.text.lines().next().unwrap_or(""))).truncate());continue;}
-                        list=list.child(button(format!("{} #{id}  {}",if selected.contains(&id){"✓"}else{"·"},m.text.lines().next().unwrap_or("")),move|a|{let mut ids=parse_needs(&a.needs.text).unwrap_or_default();if ids.contains(&id){ids.retain(|n|*n!=id);}else{ids.push(id);}a.needs=edit(&ids.iter().map(u64::to_string).collect::<Vec<_>>().join(", "));}));
-                    }p=p.child(list);
-                }
-            }
-            p = p.child(muted("Labels · optional")).child(if page == NewTask {
-                form_input(&app.task_labels,"task-labels","category=design").on_edit(|a: &mut App| &mut a.task_labels)
-            } else { row().w_full().child(field(app,"labels","category=design")) });
-            if page == NewTask && app.editing_task.is_none() {
-                if let Some(path) = &app.task_file {
-                    let name = path.file_name().unwrap_or_default().to_string_lossy();
-                    p = p.child(button(format!("{name} ×"), |a| a.task_file = None));
-                } else {
-                    p = p.child(button("Attach file", |_| {}).on_press_tx(|_: &mut App, tx| {
-                        tx.open_file(rune::FileDialogOptions { title: "Attach a file to the task".into(), ..Default::default() }, |a: &mut App, result, _| {
-                            match result { Ok(Some(path)) => a.task_file = Some(path), Ok(None) => {}, Err(error) => a.error = Some(error.to_string()) }
-                        });
-                    }));
-                }
-            }
-            p
-            }},
+            p.child(muted("Labels · optional")).child(row().w_full().child(field(app,"labels","category=design")))
+        },
         Filters=>{
             let mut p=panel.child(muted("Search")).child(form_input(&app.query,"filter","Words or labels").on_edit(|a:&mut App|&mut a.query));
             let selector = |key: &'static str, title: &str, value: String| {
-                row().w_full().items_center().child(muted(title)).child(spacer())
+                row().w_full().items_center().child(muted(title).w(96.))
                     .child(select_trigger(value,app.details_picker==Some(key), move |a| {
                         a.details_picker = if a.details_picker == Some(key) { None } else { Some(key) };
-                    }).key(key))
+                        a.filter_choice_search=edit("");
+                    }).grow(1.).w(0.).key(key))
             };
             if app.page==Page::Tasks {
                 let filters=&app.task_filters;
                 p = p.child(selector("filter-status", "Status", status_name(app.filter)));
                 if app.details_picker == Some("filter-status") {
                     p = p.child(col().w_full().max_h(156.).scroll(ScrollSpec { stick_bottom:false }).children(std::iter::once(ALL_TASKS).chain(0..ALL_TASKS).map(|i| {
-                        button(if i == app.filter { format!("{}  ✓",status_name(i)) } else { status_name(i) }, move |a| {a.filter=i;a.details_picker=None;}).key(format!("task-status-{}",FILTERS[i])).hover(gray(32))
+                        choice_row(status_name(i),i==app.filter, move |a| {a.filter=i;a.details_picker=None;}).key(format!("task-status-{}",FILTERS[i]))
                     })));
-                }
-                p = p.child(selector("filter-group", "Group by", if app.group_by_area { "Area" } else { "None" }.into()));
-                if app.details_picker == Some("filter-group") {
-                    p = p.child(col().w_full().child(button("None",|a|{a.group_by_area=false;a.details_picker=None;}))
-                        .child(button("Area",|a|{a.group_by_area=true;a.details_picker=None;}).key("group-by-area")));
-                }
-                p = p.child(selector("filter-area", "Area", app.area_filter.as_ref().map(|(_,name)| name.clone()).unwrap_or_else(|| "All areas".into())));
-                if app.details_picker == Some("filter-area") {
-                    let mut choices = col().w_full().max_h(124.).scroll(ScrollSpec { stick_bottom:false })
-                        .child(button("All areas", |a| {a.area_filter=None;a.details_picker=None;}));
-                    for (kind,area) in [(0,"Global"),(2,"No area")].into_iter().chain(app.areas().into_iter().map(|name|(1,name))) {
-                        let area = area.to_owned();
-                        choices = choices.child(button(area.clone(), move |a| { a.area_filter = Some((kind,area.clone())); a.details_picker=None; }));
-                    }
-                    p = p.child(choices);
                 }
                 let scoped=||app.snapshot.messages.iter().filter(|m|m.task.is_some() && projects::contains(&app.project,&m.channel) && filters.channel.as_ref().is_none_or(|c|*c==m.channel));
                 for (key,title,value) in [("filter-channel","Channel",filters.channel.clone().unwrap_or_else(||"All channels".into())),("filter-assignee","Assignee",match filters.assignee.as_deref(){None=>"Anyone",Some("")=>"Unassigned",Some("@me")=>"Assigned to me",Some(id)=>app.actor_label(id)}.into()),("filter-thread","Task thread",filters.thread.map_or_else(||"All task threads".into(),|id|format!("#{id}")))] {
@@ -504,20 +462,22 @@ fn dialog(app:&App, page:Dialog, viewport: [f32; 2], filter_anchor: Option<[f32;
                         "filter-assignee"=>[("Anyone".into(),None),("Assigned to me".into(),Some("@me".into())),("Unassigned".into(),Some(String::new()))].into_iter().chain(scoped().filter_map(|m|m.task.as_ref()?.assignee.as_deref()).collect::<std::collections::BTreeSet<_>>().into_iter().map(|id|(app.actor_label(id).to_string(),Some(id.into())))).collect(),
                         _=>std::iter::once(("All task threads".into(),None)).chain(scoped().map(|m|(format!("#{}  {}",m.id,m.text.lines().next().unwrap_or("")),Some(m.id.to_string())))).collect(),
                     };
-                    for (name,id) in options {choices=choices.child(button(name,move|a|{match key {"filter-channel"=>{a.task_filters.channel=id.clone();a.task_filters.thread=None;},"filter-assignee"=>a.task_filters.assignee=id.clone(),_=>a.task_filters.thread=id.as_ref().and_then(|s|s.parse().ok())}a.details_picker=None;}));}p=p.child(choices);
+                    let search=if options.len()>7 {p=p.child(form_input(&app.filter_choice_search,"filter-choice-search","Find an option…").on_edit(|a:&mut App|&mut a.filter_choice_search));app.filter_choice_search.text.trim().to_lowercase()}else{String::new()};
+                    let mut found=false;
+                    for (name,id) in options {if !name.to_lowercase().contains(&search){continue;}found=true;let selected=match key{"filter-channel"=>filters.channel==id,"filter-assignee"=>filters.assignee==id,_=>filters.thread.map(|n|n.to_string())==id};choices=choices.child(choice_row(name,selected,move|a|{match key {"filter-channel"=>{a.task_filters.channel=id.clone();a.task_filters.thread=None;},"filter-assignee"=>a.task_filters.assignee=id.clone(),_=>a.task_filters.thread=id.as_ref().and_then(|s|s.parse().ok())}a.details_picker=None;}));}if !found{choices=choices.child(muted("No matches"));}p=p.child(choices);
                 }
             }
-            p = p.child(selector("filter-sort","Sort order",if app.oldest { "Oldest first" } else { "Newest first" }.into()));
+            if matches!(app.page,Page::Activity|Page::Scheduled) {p = p.child(selector("filter-sort","Sort order",if app.oldest { "Oldest first" } else { "Newest first" }.into()));}
             if app.details_picker == Some("filter-sort") {
                 p = p.child(col().w_full().children([(false,"Newest first"),(true,"Oldest first")].into_iter().map(|(oldest,name)| {
-                    button(if app.oldest == oldest { format!("{name}  ✓") } else { name.into() }, move |a| {
+                    choice_row(name.into(),app.oldest == oldest, move |a| {
                         a.oldest = oldest;
                         a.details_picker = None;
                         a.save_preferences();
                     }).hover(gray(32)).radius(7.)
                 })));
             }
-            p.child(button("Clear filters",|a|{a.query=edit("");a.task_filters=Default::default();a.details_picker=None;if a.page==Page::Tasks{a.filter=ALL_TASKS;a.area_filter=None;}}))},
+            p.child(button("Clear filters",|a|{a.query=edit("");a.task_filters=Default::default();a.details_picker=None;if a.page==Page::Tasks{a.filter=ALL_TASKS;}}))},
         Schedule=>crate::calendar::picker(app,panel),
     };
     if let Some([x,y,w,h]) = filter_anchor {
@@ -538,11 +498,12 @@ fn dialog(app:&App, page:Dialog, viewport: [f32; 2], filter_anchor: Option<[f32;
     };
     modal_frame("board-dialog", viewport, if page == Schedule { 388. } else { 436. }, Some(top), panel, footer, |a| a.dialog = None)
 }
-fn thread(app: &App, root: &Message) -> El {
+fn thread(app: &App, root: &Message,width:f32,height:f32) -> El {
     let id = root.id;
-    let mut content = col().w_full().min_h(app.thread_h).child(spacer()).child(message(app, root, true));
-    let mut panel=col().key("thread-panel").w(0.0).grow(0.65).h_full().clip_soft(0.0)
-        .child(row().w_full().h(45.).px(18.).gap(10.).items_center().child(label(if root.task.is_some(){"task"}else{"thread"})).child(muted(format!("in #{}",root.channel.strip_prefix(&app.project).and_then(|s|s.strip_prefix('/')).unwrap_or(&root.channel))).truncate().shrink()).child(spacer()).child(button("×",|a|a.thread=None))).child(line());
+    let mut content = col().selection_group(true).w_full().min_h(app.thread_h).child(spacer()).child(message(app, root, true));
+    let parent=app.organization.tasks.get(&id).and_then(|p|p.parent);
+    let mut panel=col().key("thread-panel").w(width).h_full().clip_soft(0.0)
+        .child(row().w_full().h(45.).px(10.).gap(6.).items_center().children(parent.map(|p|button("‹ Back to parent",move|a|a.open_thread(p)).key("subtask-back"))).child(label(if parent.is_some(){"subtask"}else if root.task.is_some(){"task"}else{"thread"})).child(muted(format!("in #{}",root.channel.strip_prefix(&app.project).and_then(|s|s.strip_prefix('/')).unwrap_or(&root.channel))).truncate().shrink()).child(spacer()).child(button("×",|a|a.thread=None))).child(line());
     if let Some(task) = &root.task {
         let placement = app.organization.tasks.get(&id);
         let global = placement.is_some_and(|p| p.global);
@@ -550,24 +511,29 @@ fn thread(app: &App, root: &Message) -> El {
         let mut status=row().w_full().gap(6.).items_center().child(task_status(task.state));
         if let Some(t)=task.expires_at {status=status.child(muted(lease(app,t)));}
         let mut details=col().key("task-summary").w_full().padding(16.).gap(7.).child(status);
-        details = details.child(field("Owner", app.actor_label(&root.author).into()))
+        details = details.child(row().w_full().items_center().gap(8.).child(muted("Owner").w(90.)).child(marked_sender(root, label(app.sender_label(root)).truncate())))
             .child(field("Assigned to", if global { "Everyone" } else { task.assignee.as_deref().map_or("Unassigned", |actor| app.actor_label(actor)) }.into()));
-        let (kind, area) = app.task_group(root);
-        if kind == 1 { details = details.child(field("Area",area.into())); }
+        let mut subtask_options=None;
         if let Some(parent) = placement.and_then(|p| p.parent) {
-            details = details.child(button(format!("Parent task #{parent}"), move |a| a.open_thread(parent)));
+            let title = app.snapshot.messages.iter().find(|m| m.id == parent).and_then(|m| m.text.lines().next()).unwrap_or("");
+            details = details.child(field("Parent task",format!("#{parent} {title}").trim_end().to_owned()).key("parent-task-link").radius(4.).hover(gray(35)).on_press(move |a:&mut App| a.open_thread(parent)));
         } else if !global {
             let children: Vec<_> = app.snapshot.messages.iter().filter(|m| app.organization.tasks.get(&m.id).and_then(|p| p.parent) == Some(id)).collect();
-            details = details.child(line()).child(label("Subtasks").font(TextStyle::new(13., 600.)));
-            if !children.is_empty() {
+            let mut section=col().w_full().gap(4.);
+            let has_children=!children.is_empty();
+            if has_children {
                 let done = children.iter().filter(|m| m.task.as_ref().is_some_and(|t| t.state==TaskState::Completed)).count();
-                details = details.child(muted(format!("{done} of {} complete",children.len())));
+                section = section.child(label("Subtasks")).child(muted(format!("{done} of {} complete",children.len())));
+                let mut items = col().w_full();
+                let height = (children.len().min(4) * 26) as f32;
                 for child in children {
                     let id = child.id;
-                    details = details.child(button(format!("#{id} {}",child.text.lines().next().unwrap_or("")),move|a|a.open_thread(id)));
+                    items = items.child(row().key(format!("open-subtask-{id}")).w_full().h(26.).px(5.).items_center().radius(4.).hover(gray(35)).child(label(format!("#{id} {}",child.text.lines().next().unwrap_or(""))).w(0.).grow(1.).truncate()).on_press(move|a:&mut App|a.open_thread(id)));
                 }
-            } else { details = details.child(muted("No subtasks yet")); }
-            details = details.child(button("+ Add subtask", move |a| a.add_subtask(id)).key("add-subtask"));
+                section = section.child(col().key(format!("subtasks-{id}")).w_full().h(height).scroll(ScrollSpec{stick_bottom:false}).child(items));
+            }
+            if task.state!=TaskState::Completed {section=section.child(button("+ Add subtask", move |a| a.add_subtask(id)).key("add-subtask"));}
+            if has_children || task.state!=TaskState::Completed {subtask_options=Some(section);}
         }
         if let Some(actor) = &task.owner { details = details.child(field("Claimed by", app.actor_label(actor).into())); }
         if let Some(actor) = &task.finished_by { details = details.child(field("Finished by", app.actor_label(actor).into())); }
@@ -588,7 +554,14 @@ fn thread(app: &App, root: &Message) -> El {
             }));
         }
         if claim{actions=actions.child(primary("Claim task").key("claim-task").on_press(move|a:&mut App|a.dispatch(Action::Claim{id,lease_secs:300},None)));}
-        if mine {actions=actions.child(primary("Complete task").on_press(move|a:&mut App|{let text=a.reply.text.clone();a.dispatch(Action::Complete{id,text:text.clone()},Some((Some(id),text)));}));}
+        if mine {
+            let unfinished=app.snapshot.messages.iter().any(|m|app.organization.tasks.get(&m.id).and_then(|p|p.parent)==Some(id) && m.task.as_ref().is_some_and(|t|t.state!=TaskState::Completed));
+            if unfinished && app.confirm_parent_completion==Some(id) {
+                details=details.child(muted("Unfinished subtasks will keep their current status.").wrap());
+                actions=actions.child(button("Cancel",|a|a.confirm_parent_completion=None)).child(primary("Complete parent anyway").on_press(move|a:&mut App|{a.confirm_parent_completion=None;let text=a.reply.text.clone();a.dispatch(Action::CompleteAnyway{id,text:text.clone()},Some((Some(id),text)));}));
+            } else if unfinished {actions=actions.child(primary("Complete task").on_press(move|a:&mut App|a.confirm_parent_completion=Some(id)));}
+            else {actions=actions.child(primary("Complete task").on_press(move|a:&mut App|{let text=a.reply.text.clone();a.dispatch(Action::Complete{id,text:text.clone()},Some((Some(id),text)));}));}
+        }
         if active && (creator||mine){actions=actions.child(button("More actions ▾",move|a|a.task_menu=if a.task_menu==Some(id){None}else{Some(id)}).key("task-more-actions").radius(7.).border(1.,gray(52)));}
         if global||claim||mine||(active&&creator){details=details.child(actions);}
         if active && app.task_menu==Some(id) && (mine||creator){
@@ -603,14 +576,24 @@ fn thread(app: &App, root: &Message) -> El {
             if creator {menu=menu.child(button("Cancel task",move|a|{a.task_menu=None;a.dispatch(Action::Cancel{id},None);}));}
             details=details.child(menu);
         }
-        panel=panel.child(details).child(line());
+        if let Some(options)=subtask_options {details=details.child(line()).child(options);}
+        let max=(height-215.).max(48.);let summary=app.pane_sizes[2].clamp(48.,max);
+        panel=panel.child(col().key("task-details-scroll").w_full().max_h(summary).scroll(ScrollSpec{stick_bottom:false}).child(details)).child(divider(2,summary,48.,max));
     }
     let mut replies: Vec<_> = app.snapshot.messages.iter().filter(|m| m.parent == Some(id)).collect();
     replies.sort_by_key(|m| (m.created_at,m.id));
     if !replies.is_empty() {
         content = content.child(line()).child(muted(format!("{} {}", replies.len(),if replies.len()==1{"reply"}else{"replies"})).key("thread-reply-count").padding(12.0));
     }
-    for reply in replies { content = content.child(message(app, reply, true)); }
+    let start=replies.len().saturating_sub(app.reply_limit);
+    if start>0 {
+        let anchor=format!("reply-{}",replies[start].id);
+        let limit=app.reply_limit;
+        content=content.child(el().key(format!("reply-edge-{id}-{limit}")).w_full().h(4.).on_visible(move|a:&mut App,on,tx|{
+            if on && a.thread==Some(id) && a.reply_limit==limit {tx.keep_on_screen(anchor.clone()); a.reply_limit=limit.saturating_add(40);}
+        }));
+    }
+    for reply in replies.into_iter().skip(start) { content = content.child(message(app, reply, true)); }
     if let Some(message) = app.attachment_message.filter(|selected| *selected == id || app.snapshot.messages.iter().any(|m| m.id == *selected && m.parent == Some(id))) {
         content = content.child(attachment_panel(app, message));
     }
@@ -620,9 +603,12 @@ fn thread(app: &App, root: &Message) -> El {
         .child(composer(app, true))
 }
 
+fn choice_row(name:String,selected:bool,action:impl Fn(&mut App)+'static)->El {
+    row().w_full().h(28.).px(8.).gap(6.).items_center().radius(4.).hover(gray(36)).child(label(name).selectable(false).grow(1.).w(0.).truncate()).child(muted(if selected{"✓"}else{""}).w(15.).selectable(false)).on_press(action)
+}
 fn select_trigger(value:String,open:bool,action:impl Fn(&mut App)+'static)->El {
-    row().h(30.).px(10.).gap(10.).items_center().radius(6.).border(1.,gray(if open{96}else{58})).fill(gray(22)).hover(gray(35))
-        .child(label(value).truncate()).child(spacer()).child(muted(if open{"▴"}else{"▾"})).on_press(action)
+    row().h(30.).px(8.).gap(8.).items_center().radius(4.).fill(gray(if open{30}else{16})).hover(gray(35))
+        .child(label(value).selectable(false).truncate().shrink()).child(spacer()).child(muted(if open{"▴"}else{"▾"}).selectable(false)).on_press(action)
 }
 
 fn agent_picker(app:&App)->El {
@@ -631,7 +617,7 @@ fn agent_picker(app:&App)->El {
     if app.setup_choices {
         let mut choices = col().w_full().padding(4.).radius(6.).fill(gray(17)).border(1.,gray(55));
         for agent in setup_guide::Agent::ALL {
-            choices = choices.child(row().w_full().h(28.).px(8.).items_center().radius(4.).hover(gray(36)).child(label(agent.name())).child(spacer()).children((app.setup_agent==agent).then(||muted("✓"))).on_press(move |a:&mut App| {
+            choices = choices.child(choice_row(agent.name().into(),app.setup_agent==agent,move |a:&mut App| {
                 a.setup_agent = agent; a.setup_choices = false; a.home_copied = None;
             }).key(format!("setup-agent-{}",agent.name())));
         }
@@ -693,7 +679,7 @@ fn home(app:&App, [width,height]:[f32;2])->El {
         let mut panel=module(if tasks{"home-tasks"}else{"home-activity"}).child(muted(if tasks{"02 / WORK"}else{"03 / FEED"}))
             .child(row().w_full().items_center().child(splash::card_title(app,if tasks{"Tasks"}else{"Activity"})).child(spacer()).child(muted("View all ›"))).child(line());
         if items.is_empty(){panel=panel.child(muted(if tasks{"No open tasks."}else{"No activity in this project yet."}).wrap());}
-        for (_,m) in items {let prefix=if tasks{format!("{:?}",m.task.as_ref().unwrap().state)}else{app.actor_label(&m.author).to_string()};panel=panel.child(row().w_full().gap(6.).child(muted(prefix)).child(label(m.text.lines().next().unwrap_or("")).grow(1.).w(0.).truncate()));}
+        for (_,m) in items {let prefix=if tasks{muted(format!("{:?}",m.task.as_ref().unwrap().state)).truncate().shrink()}else{marked_sender(m,muted(app.sender_label(m)).truncate().shrink())};panel=panel.child(row().w_full().gap(6.).child(prefix).child(label(m.text.lines().next().unwrap_or("")).grow(1.).w(0.).truncate()));}
         panel.on_press(move|a:&mut App|{a.query=edit("");a.filter=ALL_TASKS;a.navigate(if tasks{Page::Tasks}else{Page::Activity});})
     };
     let wordmark_width = 540.0_f32.min((height - 370.) * 2.8);
@@ -777,6 +763,8 @@ fn update_layer(app: &App, viewport: [f32; 2]) -> Option<El> {
     use release_update::Stage;
     let (title, detail) = match &app.release.stage {
         Stage::Hidden => return None,
+        Stage::Checking => ("Checking for updates", "Contacting GitHub Releases…".into()),
+        Stage::Notice(detail) => ("Check for updates",detail.clone()),
         Stage::Offer(version) => ("Update available", format!("Neoboard {version} is available. You’re running {}. Update now or dismiss until the next launch.", env!("CARGO_PKG_VERSION"))),
         Stage::Running => ("Updating Neoboard", "The packaged updater is running. It does not report download progress.".into()),
         Stage::Finished(Ok(detail)) if cfg!(windows) => ("Update staged", format!("Your running installation has not been replaced. Finish your drafts before switching to the new bundle.\n\n{detail}")),
@@ -816,12 +804,12 @@ pub fn root(app: &App, cx: &mut Cx<App>) -> El {
     }
     app.profiles.begin_view();
     let mut main = col().key("main").w(0.0).grow(1.0).h_full().clip_soft(0.0).child(header(app)).child(line());
-    if app.page==Page::Home {main=main.child(home(app,viewport));} else {
+    if app.page==Page::Home {main=main.child(home(app,viewport));} else if app.page==Page::Tasks && app.sprint.show {main=main.child(sprints::browser(app));} else {
     let messages = app.visible();
-    let paged = matches!(app.page, Page::Tasks | Page::Activity);
-    let scope = format!("{:?}:{:?}:{:?}:{}:{}:{:?}:{:?}:{}",app.page,app.project,app.query.text,app.oldest,app.filter,app.task_filters,app.area_filter,app.group_by_area);
+    let paged = matches!(app.page, Page::Tasks | Page::Activity | Page::Channel(_));
+    let scope = format!("{:?}:{:?}:{:?}:{}:{}:{:?}",app.page,app.project,app.query.text,app.oldest,app.filter,app.task_filters);
     let limit = if !paged { usize::MAX } else if app.feed_page.0 == scope { app.feed_page.1 } else { 40 };
-    let older_above = app.page == Page::Activity && app.oldest;
+    let older_above = matches!(app.page,Page::Channel(_)) || app.page == Page::Activity && app.oldest;
     let start = if older_above { messages.len().saturating_sub(limit) } else { 0 };
     let more = messages.len() > limit;
     let sentinel = || {
@@ -831,8 +819,8 @@ pub fn root(app: &App, cx: &mut Cx<App>) -> El {
             if on { if let Some(key) = &anchor { tx.keep_on_screen(key.clone()); } a.feed_page = (scope.clone(),limit.saturating_add(40)); }
         })
     };
-    let mut list = col().w_full();
-    if matches!(app.page,Page::Activity | Page::Channel(_)) && app.oldest { list = list.min_h(app.feed_h).child(spacer()); }
+    let mut list = col().selection_group(true).w_full();
+    if older_above { list = list.min_h(app.feed_h).child(spacer()); }
     if more && older_above { list = list.child(sentinel()); }
     if app.page == Page::Scheduled {
         list = list.child(muted("Your pending scheduled posts · UTC (not local time)").wrap().padding(20.0));
@@ -852,45 +840,53 @@ pub fn root(app: &App, cx: &mut Cx<App>) -> El {
         }
     } else if messages.is_empty() {
         list = list.child(muted(if app.status == "connecting" { "connecting to board…" } else { "No messages match this view." }).padding(20.0));
-    } else if app.page == Page::Tasks && app.group_by_area {
-        let mut groups = BTreeMap::<(u8,&str),Vec<_>>::new();
-        for &m in &messages { groups.entry(app.task_group(m)).or_default().push(m); }
-        let mut remaining = limit;
-        for ((_,name),tasks) in groups {
-            if remaining == 0 { break; }
-            list = list.child(row().key(format!("area-group-{name}")).w_full().h(33.).px(16.).gap(8.).items_center().fill(gray(14))
-                .child(label(name).truncate()).child(muted(tasks.len().to_string())));
-            let shown = remaining.min(tasks.len());
-            for m in tasks.into_iter().take(shown) { list = list.child(task_row(app,m)); }
-            remaining -= shown;
-        }
     } else {
         for m in messages.iter().skip(start).take(limit) { list = list.child(if app.page == Page::Tasks { task_row(app,m) } else { message(app,m,false) }); }
     }
     if more && !older_above { list = list.child(sentinel()); }
     main = main.child(col().key(if paged {format!("paged-{scope}")} else { format!("feed-{:?}-{}", match &app.page { Page::Home => "home", Page::Activity => "activity", Page::Tasks => "tasks", Page::Scheduled => "scheduled", Page::Channel(c) => c }, app.filter) })
-        .w_full().grow(1.0).h(0.0).scroll(ScrollSpec { stick_bottom: matches!(app.page,Page::Activity | Page::Channel(_)) && app.oldest })
+        .w_full().grow(1.0).h(0.0).scroll(ScrollSpec { stick_bottom: older_above })
         .on_layout(|a: &mut App, r| a.feed_h = r[3]).child(list));
     if let Some(error) = &app.error { main = main.child(label(error).color(rune::oklch(0.75,0.1,20.0)).wrap().padding(12.0)); }
     if let Some(notice) = &app.notice { main = main.child(muted(notice).wrap().px(20.0)); }
     if !matches!(app.page, Page::Activity | Page::Tasks) {main = main.child(composer(app, false));}
     }
     let mut root = row().key("neochat").w_full().h_full().fill(gray(0)).on_layout(|a: &mut App, r| a.width = r[2]);
-    if app.sidebar && (app.width >= 900.0 || app.thread.is_none()) { root = root.child(sidebar(app)).child(el().w(1.0).h_full().fill(gray(35))); }
+    let show_left=app.sidebar && (app.width >= 900.0 || app.thread.is_none());
+    let left_max=(viewport[0]-if app.thread.is_some(){540.}else{230.}).clamp(140.,420.);
+    let left=if show_left {app.pane_sizes[0].clamp(140.,left_max)} else {0.};
+    if show_left { root = root.child(sidebar(app,left)).child(divider(0,left,140.,left_max)); }
     root = root.child(main);
     if let Some(thread_root) = app.thread.and_then(|id| app.snapshot.messages.iter().find(|m| m.id == id)) {
-        root = root.child(el().w(1.0).h_full().fill(gray(35))).child(thread(app,thread_root));
+        let max=(viewport[0]-left-210.).max(110.);let min=245_f32.min(max);let right=app.pane_sizes[1].clamp(min,max);
+        root = root.child(divider(1,right,min,max)).child(thread(app,thread_root,right,viewport[1]-height));
     }
     if let Some(id)=app.row_menu && let Some(m)=app.snapshot.messages.iter().find(|m|m.id==id && m.parent.is_none()){
         let width = (viewport[0] - 8.).clamp(1.,175.);
-        let mut menu=col().key("thread-context").w(width).max_h((viewport[1]-8.).max(1.)).scroll(ScrollSpec { stick_bottom: false }).padding(5.).gap(2.).fill(gray(0)).border(1.,gray(57)).radius(7.)
-            .child(button("Open thread",move|a|{a.row_menu=None;a.open_thread(id);})).child(el().h(28.).px(8.).center_y().hover(gray(35)).child(label("Copy thread ID")).on_press_tx(move|a:&mut App,tx|{tx.copy(id.to_string());a.row_menu=None;}));
-        if app.me.as_ref().map(|m|m.actor.as_str())==m.author.split('/').next(){menu=menu.child(line()).child(button("Delete thread…",move|a|{a.row_menu=None;a.error=None;a.dialog=Some(Dialog::DeleteThread(id));}).key("delete-option"));}
+        let mut menu=col().key("thread-context").w(width).max_h((viewport[1]-8.).max(1.)).scroll(ScrollSpec { stick_bottom: false }).padding(5.).gap(2.).fill(gray(18)).border(1.,gray(57)).radius(7.)
+            .child(menu_action("Open thread","›",false).on_press(move|a:&mut App|{a.row_menu=None;a.open_thread(id);})).child(menu_action("Copy thread ID","#",false).on_press_tx(move|a:&mut App,tx|{tx.copy(id.to_string());a.row_menu=None;}));
+        let can_delete=app.me.as_ref().map(|m|m.actor.as_str())==m.author.split('/').next();
+        if can_delete{menu=menu.child(line()).child(menu_action("Delete thread…","×",true).on_press(move|a:&mut App|{a.row_menu=None;a.error=None;a.dialog=Some(Dialog::DeleteThread(id));}).key("delete-option"));}
         let [x,mut y,w,h]=app.row_anchor;
         if native_title { y -= height; } // Convert window coordinates to the board viewport.
-        let menu_h = 106.0_f32.min((viewport[1]-8.).max(1.));
+        let menu_h = (if can_delete{103.0_f32}else{70.}).min((viewport[1]-8.).max(1.));
         let top = if y + h + menu_h <= viewport[1] - 4. { y + h } else { y - menu_h };
         root=root.child(menu.absolute((x+w-width).clamp(4.,(viewport[0]-width-4.).max(4.)),top.clamp(4.,(viewport[1]-menu_h-4.).max(4.))).modal(true,|a:&mut App|a.row_menu=None));
+    }
+    if let Some(channel) = &app.channel_actions.menu && let Some([x,y,_,h]) = cx.layout(&format!("channel-options-{channel}")) {
+        let copy = channel.clone();
+        let mut menu = col().key("channel-context").padding(5.).gap(2.).fill(gray(18)).border(1.,gray(57)).radius(7.)
+            .child(menu_action("Copy channel", "#", false).key("copy-channel").on_press_tx(move |a:&mut App,tx| { tx.copy(copy.clone()); a.channel_actions.menu = None; })).child(line());
+        if let Some(reason) = app.deletion_restriction(channel) {
+            menu = menu.child(muted(reason).key("channel-protected").wrap().padding(6.));
+        } else {
+            menu = menu.child(menu_action("Delete channel…", "×", true).key("delete-channel-option").on_press(|a:&mut App| {
+                a.channel_actions.target = a.channel_actions.menu.take(); a.error = None; a.dialog = Some(Dialog::DeleteChannel);
+            }));
+        }
+        let width = (viewport[0]-8.).clamp(1.,220.);
+        root = root.child(menu.w(width).absolute(x.clamp(4.,(viewport[0]-width-4.).max(4.)), (y+h-height).clamp(4.,(viewport[1]-96.).max(4.)))
+            .modal(true,|a:&mut App| a.channel_actions.menu = None));
     }
     if let Some(page)=app.dialog {
         if page != Dialog::Filters { root=root.child(dialog(app,page,viewport,None)); }
@@ -925,14 +921,15 @@ fn board_menu(app: &App, x: f32, y: f32, viewport: [f32; 2], chrome: f32) -> El 
         let mut ids = local_projects.clone();
         ids.extend(app.saved_boards.keys().map(String::as_str));
         for id in ids {
-            let share = (!app.remote() && local_projects.contains(id)).then(|| {
+            let share = (local_projects.contains(id) && (!app.remote() || id == app.project)).then(|| {
                 let id = id.to_owned();
-                el().key(format!("share-board-{id}")).size(26.,26.).center().radius(5.).hover(gray(56)).group_opacity(0.,1.)
+                el().key(format!("share-board-{id}")).size(26.,26.).center().radius(5.).hover(gray(56))
                     .child(rune::icon(&SHARE, 15.).color(splash::wordmark_ink())).on_press(move |a: &mut App| a.open_board_share(&id))
             });
+            let remote = if local_projects.contains(id) {app.remote()} else {app.saved_boards.get(id).is_some_and(Option::is_some)};
             let id = id.to_owned();
             entries = entries.child(row().key(format!("project-{id}")).w_full().h(32.).px(6.).gap(4.).items_center().radius(5.).hover_group_focus().hover(gray(36))
-                .child(row().w(0.).grow(1.).h_full().items_center().gap(4.).child(label(&id).truncate().shrink()).child(spacer())
+                .child(row().w(0.).grow(1.).h_full().items_center().gap(4.).child(board_icon(remote,15.)).child(label(&id).truncate().shrink()).child(spacer())
                     .child(muted(if id == app.project {"✓"}else{""})).on_press(move |a: &mut App| a.switch_board(&id)))
                 .children(share));
         }

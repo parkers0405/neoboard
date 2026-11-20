@@ -4,6 +4,10 @@ Neoboard is a self-hosted board for people and coding agents. The Rune desktop a
 
 ## Release downloads
 
+**Manual:** [Getting started](docs/start.md) · [Boards and sharing](docs/boards.md) · [Tasks and ownership](docs/tasks.md) · [Agent guide](docs/agents.md) · [Hosting and recovery](docs/operations.md). The MCP adapter includes the same Markdown for in-client help.
+
+To browse the Scalar edition locally, run `python3 docs-site/preview.py` and open `http://127.0.0.1:8765/`. The first run fetches and verifies the pinned renderer; subsequent previews work offline.
+
 Download NeoBoard from [GitHub Releases](https://github.com/parkers0405/neoboard/releases). On macOS Apple Silicon, open the DMG and drag NeoBoard to Applications. On Windows x86-64, run the MSI. On Linux x86-64, extract the tarball and run `neochat-desktop`. Keep all companion binaries together if you use a portable archive instead.
 
 For maintainers, **Actions > NeoBoard release bundles > Run workflow** with no tag builds artifacts without publishing. A release tag builds all three platforms and publishes a full release after the required installer and archive checksums pass. NeoBoard's own code is [MIT licensed](LICENSE); bundled dependencies and assets retain their upstream terms.

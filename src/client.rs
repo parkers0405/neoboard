@@ -23,6 +23,7 @@ impl std::error::Error for ClientError {}
 pub struct Client {
     endpoint: Url,
     http: blocking::Client,
+    sender: Option<String>,
 }
 
 impl Client {
@@ -65,7 +66,13 @@ impl Client {
         let http = if loopback { builder.no_proxy() } else { builder }
             .build()
             .map_err(network_error)?;
-        Ok(Self { endpoint, http })
+        Ok(Self { endpoint, http, sender: None })
+    }
+
+    /// Stamp newly created messages without changing the actor or profile.
+    pub fn with_sender(mut self, sender: &str) -> Self {
+        self.sender = Some(sender.to_owned());
+        self
     }
 
     pub fn discover(data_dir: Option<&Path>, profile: Option<&str>) -> Result<Self, ClientError> {
@@ -92,6 +99,17 @@ impl Client {
 
     pub fn organization(&self) -> Result<Organization, ClientError> {
         self.request(self.http.get(self.url("v1/organization")))
+    }
+
+    /// Public task hierarchy and acknowledgements, without legacy catalog metadata.
+    pub fn task_placements(&self) -> Result<serde_json::Value, ClientError> {
+        let tasks = self.organization()?.tasks.into_iter().map(|(id, p)| (id.to_string(),
+            serde_json::json!({"parent":p.parent,"global":p.global,"done_by":p.done_by}))).collect();
+        Ok(serde_json::Value::Object(tasks))
+    }
+
+    pub fn owned_areas(&self, owner: &str) -> Result<std::collections::BTreeMap<String, Vec<String>>, ClientError> {
+        self.request(self.http.get(self.url("v1/owned-areas")).query(&[("owner", owner)]))
     }
 
     /// Queue tools can still list existing tasks against pre-organization daemons.
@@ -147,11 +165,50 @@ impl Client {
     }
 
     pub fn action_with_key(&self, action: &Action, key: Option<&str>) -> Result<Outcome, ClientError> {
+        self.request(self.action_request(action, key))
+    }
+
+    /// A wake only invalidates a miss; the daemon still selects and leases atomically.
+    pub fn claim_next(&self, action: &Action, key: Option<&str>, wait_ms: u64) -> Result<Outcome, ClientError> {
+        if !matches!(action, Action::ClaimNext { .. }) || wait_ms > 25_000 {
+            return Err(ClientError("claim_next requires a ClaimNext action and wait_ms in 0..25000".into()));
+        }
+        if wait_ms == 0 { return self.action_with_key(action, key); }
+        let deadline = Instant::now() + Duration::from_millis(wait_ms);
+        let mut attempt_key = key.map(str::to_owned);
+        let mut remaining = deadline.saturating_duration_since(Instant::now());
+        loop {
+            // Never treat a timed-out write as a miss: the lease may have committed.
+            let miss: Outcome = self.request(self.action_request(action, attempt_key.as_deref()).timeout(remaining))?;
+            if miss.id.is_some() { return Ok(miss); }
+            remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.as_millis() == 0 { return Ok(miss); }
+            let poll = self.http.get(self.url("v1/events")).query(&[("after", miss.cursor), ("wait_ms", remaining.as_millis() as u64)]).timeout(remaining);
+            let response = match poll.send() {
+                Err(e) if e.is_timeout() && Instant::now() >= deadline => return Ok(miss),
+                result => Self::check_status(result.map_err(network_error)?)?,
+            };
+            let events: Vec<Event> = response.json().map_err(network_error)?;
+            remaining = deadline.saturating_duration_since(Instant::now());
+            if events.is_empty() || remaining.as_millis() == 0 { return Ok(miss); }
+            // A miss is itself cached. Derive the next key from the *cached miss*,
+            // not the wake event (paging/timing may differ when the caller retries).
+            if let Some(root) = key {
+                use sha2::{Digest, Sha256};
+                attempt_key = Some(format!("claim-next:{:x}:{}", Sha256::digest(root.as_bytes()), miss.cursor));
+            }
+        }
+    }
+
+    fn action_request(&self, action: &Action, key: Option<&str>) -> blocking::RequestBuilder {
         let mut request = self.http.post(self.url("v1/actions")).json(action);
+        if let Some(sender) = &self.sender {
+            request = request.header("x-neochat-sender", sender);
+        }
         if let Some(key) = key {
             request = request.header("idempotency-key", key);
         }
-        self.request(request)
+        request
     }
 
     pub fn invite(&self, invite: &InviteRequest) -> Result<Invite, ClientError> {
@@ -160,6 +217,19 @@ impl Client {
 
     pub fn revoke_invite(&self, id: u64) -> Result<(), ClientError> {
         self.send(self.http.delete(self.url(&format!("v1/admin/invites/{id}"))))?;
+        Ok(())
+    }
+
+    pub fn restricted_invite(&self, invite: &InviteRequest, grants: &[crate::protocol::Grant]) -> Result<Invite, ClientError> {
+        self.request(self.http.post(self.url("v1/admin/restricted-invites")).json(&serde_json::json!({"invite":invite,"grants":grants})))
+    }
+    pub fn explain_invite(&self, id: u64) -> Result<serde_json::Value, ClientError> {
+        self.request(self.http.get(self.url(&format!("v1/admin/invites/{id}"))))
+    }
+    pub fn revoke_grant(&self, id: u64, grant: crate::protocol::Grant) -> Result<(), ClientError> {
+        use clap::ValueEnum;
+        let name = grant.to_possible_value().expect("named grant");
+        self.send(self.http.delete(self.url(&format!("v1/admin/invites/{id}/grants/{}",name.get_name()))))?;
         Ok(())
     }
 

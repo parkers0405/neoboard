@@ -12,7 +12,9 @@ pub struct Connection {
 impl Connection {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_str().ok_or_else(|| Error::Misuse("database path must be UTF-8".into()))?;
-        let db = block_on(turso::Builder::new_local(path).experimental_multiprocess_wal(path != ":memory:").build())?;
+        // The Windows I/O backend does not implement multiprocess WAL. The
+        // daemon holds service.lock exclusively before opening the board.
+        let db = block_on(turso::Builder::new_local(path).experimental_multiprocess_wal(cfg!(unix) && path != ":memory:").build())?;
         Ok(Self { inner: db.connect()?, rollback_error: None })
     }
     fn ready(&self) -> Result<()> {

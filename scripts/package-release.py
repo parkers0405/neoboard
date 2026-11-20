@@ -45,7 +45,10 @@ def package(asset):
             shutil.copy2('rune/LICENSE', bin_dir / 'LICENSE-Rune')
             shutil.copy2('vendor/winit-compat/winit-0.30.13/LICENSE', bin_dir / 'LICENSE-winit')
             if system == 'darwin':
-                (app/'Contents/Info.plist').write_bytes(plistlib.dumps(dict(CFBundleExecutable='neochat-desktop', CFBundleIdentifier='com.parkers0405.neoboard', CFBundleName='NeoBoard', CFBundlePackageType='APPL', CFBundleShortVersionString=version, CFBundleVersion=version, NSHighResolutionCapable=True)))
+                resources = app/'Contents/Resources'
+                resources.mkdir()
+                shutil.copy2('design/NeoBoard.icns', resources/'NeoBoard.icns')
+                (app/'Contents/Info.plist').write_bytes(plistlib.dumps(dict(CFBundleExecutable='neochat-desktop', CFBundleIdentifier='com.parkers0405.neoboard', CFBundleName='NeoBoard', CFBundleIconFile='NeoBoard.icns', CFBundlePackageType='APPL', CFBundleShortVersionString=version, CFBundleVersion=version, NSHighResolutionCapable=True)))
                 subprocess.run(['codesign','--force','--deep','--sign','-',app],check=True)
                 subprocess.run(['codesign','--verify','--deep','--strict',app],check=True)
                 (stage/'Applications').symlink_to('/Applications')
@@ -56,6 +59,12 @@ def package(asset):
             archive = out.with_suffix('.tar.gz')
             with tarfile.open(archive,'w:gz') as tar:
                 tar.add(app,arcname=app.name)
+                if system == 'linux':
+                    # Keep the updater-managed binary directory free of extra files.
+                    share = 'neoboard-desktop-integration'
+                    tar.add('desktop/ai.neoism.neochat.desktop', arcname=f'{share}/applications/ai.neoism.neochat.desktop')
+                    tar.add('design/NeoBoard.png', arcname=f'{share}/icons/hicolor/256x256/apps/ai.neoism.neochat.png')
+                    tar.add('desktop/LINUX-LAUNCHER.md', arcname=f'{share}/README.md')
             outputs.append(archive)
     for item in outputs:
         with item.open('rb') as f:

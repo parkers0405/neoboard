@@ -17,7 +17,8 @@ try {
     # Isolate the pinned WiX CLI from other jobs and preinstalled WiX versions.
     dotnet tool install wix --version 5.0.2 --tool-path "$work/tools"
     if ($LASTEXITCODE -ne 0) { throw 'WiX tool installation failed' }
-    & "$work/tools/wix.exe" build "$PSScriptRoot/neoboard.wxs" -arch x64 -d "Version=$installerVersion" -d "BinaryDir=$payload" -intermediateFolder "$work/obj" -o $msi
+    $icon = (Resolve-Path "$PSScriptRoot/../design/NeoBoard.ico").Path
+    & "$work/tools/wix.exe" build "$PSScriptRoot/neoboard.wxs" -arch x64 -d "Version=$installerVersion" -d "BinaryDir=$payload" -d "IconFile=$icon" -intermediateFolder "$work/obj" -o $msi
     if ($LASTEXITCODE -ne 0) { throw 'WiX MSI build failed' }
     & "$PSScriptRoot/verify-windows-msi.ps1" -Msi $msi -Zip $zip
 

@@ -1,7 +1,7 @@
 //! The app's icon from image bytes (the Dock's on macOS, its windows' and the taskbar's on
 //! Windows), so an app needs no platform glue of its own.
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 use std::sync::Mutex;
 #[cfg(target_os = "macos")]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,6 +22,7 @@ static LAUNCHED: AtomicBool = AtomicBool::new(false);
 /// - **Windows:** `bytes` is a PNG or JPEG, best square and 256 px or more. Each window opened
 ///   after the call shows it in its title bar, on the taskbar and in Alt+Tab, so call it before
 ///   `run`.
+/// - **Linux:** sets the X11 window icon. Wayland desktops look up the launcher by app ID.
 /// - Does nothing elsewhere.
 pub fn set_app_icon(bytes: impl Into<Vec<u8>>) -> Result<(), String> {
     #[cfg(target_os = "macos")]
@@ -37,9 +38,24 @@ pub fn set_app_icon(bytes: impl Into<Vec<u8>>) -> Result<(), String> {
         let size = |px: u32| image::imageops::resize(&image, px, px, image::imageops::FilterType::Lanczos3).into_raw();
         *WINDOWS.lock().unwrap_or_else(|e| e.into_inner()) = Some(WindowsIcon { small: size(SMALL), big: size(BIG) });
     }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(target_os = "linux")]
+    {
+        let image = image::load_from_memory(&bytes.into()).map_err(|e| format!("set_app_icon: {e}"))?.into_rgba8();
+        let (w, h) = image.dimensions();
+        let icon = winit::window::Icon::from_rgba(image.into_raw(), w, h).map_err(|e| e.to_string())?;
+        *LINUX.lock().unwrap_or_else(|e| e.into_inner()) = Some(icon);
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     let _ = bytes;
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+static LINUX: Mutex<Option<winit::window::Icon>> = Mutex::new(None);
+
+#[cfg(target_os = "linux")]
+pub(crate) fn with_icon(attrs: winit::window::WindowAttributes) -> winit::window::WindowAttributes {
+    attrs.with_window_icon(LINUX.lock().unwrap_or_else(|e| e.into_inner()).clone())
 }
 
 /// Windows: the icon's pixels at the two sizes a window shows, so each new window makes its own

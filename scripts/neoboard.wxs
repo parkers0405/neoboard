@@ -3,6 +3,8 @@
            UpgradeCode="BA6BECB8-74B8-4A0C-915F-C472F47006C9" Scope="perMachine">
     <MajorUpgrade DowngradeErrorMessage="A newer version of NeoBoard is already installed." />
     <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+    <Icon Id="NeoBoard.exe" SourceFile="$(var.IconFile)" />
+    <Property Id="ARPPRODUCTICON" Value="NeoBoard.exe" />
     <StandardDirectory Id="ProgramMenuFolder" />
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="NeoBoard" />
@@ -20,7 +22,7 @@
       <Component><File Name="neochat-share.exe" /></Component>
       <Component>
         <File Name="neochat-desktop.exe">
-          <Shortcut Id="LaunchNeoBoard" Directory="ProgramMenuFolder" Name="NeoBoard" Advertise="yes" WorkingDirectory="INSTALLFOLDER" />
+          <Shortcut Id="LaunchNeoBoard" Directory="ProgramMenuFolder" Name="NeoBoard" Advertise="yes" WorkingDirectory="INSTALLFOLDER" Icon="NeoBoard.exe" IconIndex="0" />
         </File>
       </Component>
       <Component><File Name="LICENSE" /></Component>

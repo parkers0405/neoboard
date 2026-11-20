@@ -729,6 +729,8 @@ fn main() {
     let opts = Options::parse(&args).unwrap_or_else(|e| { eprintln!("{e}"); std::process::exit(2) });
     let _ = OPTIONS.set(opts);
     rune::set_app_id("ai.neoism.neochat");
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    rune::set_app_icon(include_bytes!("../../design/NeoBoard.png").as_slice()).expect("embedded NeoBoard PNG");
     rune::App::new(AppSpec {
         fonts: &[include_bytes!("../assets/fonts/GeistMono-Regular.otf")],
         families: ("Geist Mono", "Geist Mono"),

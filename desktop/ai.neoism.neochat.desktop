@@ -1,6 +1,7 @@
 [Desktop Entry]
 Type=Application
-Name=Neoboard
+Name=NeoBoard
+Icon=ai.neoism.neochat
 Comment=Native message board and task queue
 Exec=neochat-desktop
 Terminal=false

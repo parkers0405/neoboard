@@ -48,13 +48,18 @@ impl Guide {
 
     fn build(agent: Agent, adapter: &str, opts: &crate::connection::Options, remote: bool) -> Self {
         let mut args = Vec::new();
-        if !remote && opts.data_dir.is_some() {
+        let joined = remote && opts.invite.is_some();
+        if let Some(path) = opts.invite.as_ref().filter(|_| joined) {
+            args.push("--invite".to_owned());
+            args.push(path.display().to_string());
+        } else if !remote && opts.data_dir.is_some() {
             let dir = neochat::client::local_data_dir(opts.data_dir.as_deref()).ok()
                 .and_then(|p| std::path::absolute(p).ok());
             args.push("--data-dir".to_owned());
             args.push(dir.as_deref().and_then(Path::to_str).unwrap_or("<absolute board data directory>").to_owned());
         }
-        let intro = if remote { "This board is hosted. Give the connection its own board credential." } else { "Open NeoBoard and leave it running. The connection can see the boards available on this local server." }.to_owned();
+        let remote = remote && !joined;
+        let intro = if joined { "Adding this entry authorizes this agent on this device to use your saved invite for the selected board, with the same board permissions. No token needs to be copied." } else if remote { "This board is hosted. Give the connection its own board credential." } else { "Open NeoBoard and leave it running. The connection can see the boards available on this local server." }.to_owned();
         let (location, snippet) = match agent {
             Agent::Codex => {
                 // JSON string escapes also work in TOML basic strings; DEL must be escaped in TOML.
@@ -81,11 +86,11 @@ impl Guide {
                 (location, format!("{:#}", json!({"mcpServers":{"neoboard":server}})))
             }
         };
-        let auth = match (remote, agent) {
+        let auth = if joined { "Replace any previous NeoBoard entry. Keep the invite file private and on this device." } else { match (remote, agent) {
             (false, _) => "No workspace selection is needed.",
             (true, Agent::ClaudeDesktop) => "Replace the env placeholders privately in that local file with the board endpoint and this agent's scoped invite token. Do not share the edited file.",
             (true, _) => "Set NEOCHAT_URL to the board endpoint and NEOCHAT_TOKEN to this agent's scoped invite token in the client's launch environment.",
-        };
+        }};
         Self {
             intro,
             instruction: format!("Merge this entry into {location}. {auth} Restart {}.", agent.name()),
@@ -114,6 +119,17 @@ mod tests {
             assert!(text.contains(agent.name()) && text.contains(&guide.snippet) && text.contains(&guide.question));
             assert!(guide.snippet.contains(marker));
             assert!(!text.contains("PRIVATE_SENTINEL") && !text.contains("--data-dir"));
+        }
+    }
+
+    #[test]
+    fn joined_board_setup_uses_selected_invite_instead_of_environment() {
+        let path = env::temp_dir().join("Board A.neochat");
+        let opts = Options { invite: Some(path), token: "PRIVATE_SENTINEL".into(), ..Options::default() };
+        for agent in Agent::ALL {
+            let guide = Guide::build(agent, "adapter", &opts, true);
+            assert!(guide.snippet.contains("--invite") && guide.snippet.contains("Board A.neochat"));
+            assert!(!guide.copy_text().contains("PRIVATE_SENTINEL") && !guide.snippet.contains("NEOCHAT_"));
         }
     }
 

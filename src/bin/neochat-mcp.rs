@@ -16,6 +16,9 @@ const TEXT_LIMIT: usize = 16384;
 #[derive(Parser)]
 #[command(about = "MCP stdio access to one Neoboard board; never executes board content")]
 struct Args {
+    /// Use this explicitly authorized saved board invite; never fall back to local discovery.
+    #[arg(long)]
+    invite: Option<PathBuf>,
     #[arg(long, env = "NEOCHAT_URL", hide_env_values = true)]
     url: Option<String>,
     #[arg(long, env = "NEOCHAT_TOKEN", hide_env_values = true)]
@@ -27,14 +30,20 @@ struct Args {
 
 fn main() {
     let args = Args::parse();
-    let client = match (&args.url, &args.token, &args.data_dir) {
+    let client = if let Some(path) = args.invite.as_deref() {
+        let invite = neochat::invite_file::InviteFile::read(path).unwrap_or_else(|reason| {
+            eprintln!("Cannot use the selected board invite: {reason} Reopen NeoBoard Setup for that board.");
+            std::process::exit(2);
+        });
+        Client::new(&invite.endpoint, &invite.token, None)
+    } else { match (&args.url, &args.token, &args.data_dir) {
         (Some(url), Some(token), _) => Client::new(url, token, None),
         (None, None, dir) => Client::discover(dir.as_deref(), None),
         _ => {
             eprintln!("provide both NEOCHAT_URL and NEOCHAT_TOKEN (or --url/--token), or --data-dir for local discovery");
             std::process::exit(2);
         }
-    }.unwrap_or_else(|_| {
+    }}.unwrap_or_else(|_| {
         eprintln!("cannot configure Neoboard client; check endpoint and board credential");
         std::process::exit(2);
     });

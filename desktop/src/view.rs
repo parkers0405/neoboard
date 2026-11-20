@@ -765,11 +765,11 @@ fn update_layer(app: &App, viewport: [f32; 2]) -> Option<El> {
         Stage::Hidden => return None,
         Stage::Checking => ("Checking for updates", "Contacting GitHub Releases…".into()),
         Stage::Notice(detail) => ("Check for updates",detail.clone()),
-        Stage::Offer(version) => ("Update available", format!("Neoboard {version} is available. You’re running {}. Update now or dismiss until the next launch.", env!("CARGO_PKG_VERSION"))),
+        Stage::Offer(version) => ("Update available", format!("Neoboard {version} is available. {} {}", if cfg!(unix) { "Finish your drafts first. Updating will reopen the installed desktop." } else { "The update will stage a separate bundle." }, release_update::RECONNECT)),
         Stage::Running => ("Updating Neoboard", "The packaged updater is running. It does not report download progress.".into()),
-        Stage::Finished(Ok(detail)) if cfg!(windows) => ("Update staged", format!("Your running installation has not been replaced. Finish your drafts before switching to the new bundle.\n\n{detail}")),
+        Stage::Finished(Ok(detail)) if cfg!(windows) => ("Update staged", format!("Your running installation has not been replaced. After switching, point MCP clients to the new bundle. {}\n\n{detail}", release_update::RECONNECT)),
         Stage::Finished(Ok(detail)) => ("Updater finished", format!("Finish your drafts before restarting Neoboard and its services.\n\n{detail}")),
-        Stage::Finished(Err(error)) => ("Update not confirmed", format!("{error} Finish your drafts. Close Neoboard and run the packaged neoboard update command in a terminal for details.")),
+        Stage::Finished(Err(error)) => ("Update not confirmed", format!("{error}\n\nKeep your drafts. Check the installation before retrying. {}", release_update::RECONNECT)),
     };
     let mut body = col().w_full().padding(20.).gap(12.).child(label(title).font(TextStyle::new(16.,600.))).child(muted(detail).wrap());
     if matches!(app.release.stage, Stage::Running) {
@@ -778,8 +778,7 @@ fn update_layer(app: &App, viewport: [f32; 2]) -> Option<El> {
     } else {
         let mut actions = row().gap(8.).child(dialog_action(button("Dismiss", |a| a.release.dismiss())));
         if matches!(app.release.stage, Stage::Offer(_)) {
-            if cfg!(windows) { body = body.child(muted("Windows locks running programs. The updater stages a separate bundle; you choose when to switch to it.").wrap()); }
-            actions = actions.child(dialog_action(button("Update", |a| a.release.accept())));
+            actions = actions.child(dialog_action(button(if cfg!(unix) { "Update and reopen" } else { "Stage update" }, |a| a.release.accept())));
         }
         body = body.child(actions);
     }

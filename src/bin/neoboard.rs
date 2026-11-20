@@ -13,15 +13,17 @@ struct Cli {
 enum Command {
     /// Download and verify the latest whole bundle (stop board processes first).
     Update,
+    /// Start an isolated portable desktop and its companion (not an existing service).
+    Desktop(update::portable::Options),
 }
 
 fn main() {
-    match Cli::parse().command {
-        Command::Update => {
-            if let Err(e) = update::run() {
-                eprintln!("Update failed: {e}");
-                std::process::exit(1);
-            }
-        }
+    let result = match Cli::parse().command {
+        Command::Update => update::run(),
+        Command::Desktop(options) => update::portable::run(options),
+    };
+    if let Err(e) = result {
+        eprintln!("Neoboard: {e}");
+        std::process::exit(1);
     }
 }

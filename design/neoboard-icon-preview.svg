@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="512" height="512" role="img" aria-label="NeoBoard pixel b icon preview">
+  <rect x="4" y="4" width="120" height="120" rx="26" fill="#000000"/>
+  <defs><path id="b" fill-rule="evenodd" d="M0 0h20v20h40v10h10v30H60v10H0z M20 30v30h30V30z"/></defs>
+  <use href="#b" x="32" y="26" fill="#656565"/>
+  <use href="#b" x="29" y="29" fill="#e8e8e8"/>
+</svg>

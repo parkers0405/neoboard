@@ -304,8 +304,10 @@ pub fn connect_local(data_dir: Option<&Path>, profile: Option<&str>) -> Result<C
         client.ping()?;
         Ok(client)
     };
-    if let Ok(client) = probe() {
-        return Ok(client);
+    match probe() {
+        Ok(client) => return Ok(client),
+        Err(error) if std::env::var_os("NEOBOARD_PORTABLE_HANDOFF").is_some() => return Err(error),
+        Err(_) => (),
     }
 
     let mut command = daemon_command();

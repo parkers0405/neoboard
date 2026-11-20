@@ -5,6 +5,12 @@ use std::{fs::{self, OpenOptions}, io::{self, Write}, net::SocketAddr, path::{Pa
 #[derive(Parser)]
 #[command(about="Durable board-only Neoboard service (never executes board content)")]
 struct Args {
+    /// Report the no-migration portable data contract without opening any board.
+    #[arg(long, hide=true)]
+    portable_v1_check: bool,
+    /// Companion mode: private readiness line and graceful shutdown on stdin EOF.
+    #[arg(long, hide=true)]
+    portable_v1: bool,
     #[arg(long, env="NEOCHAT_BIND", default_value="127.0.0.1:0")]
     bind: SocketAddr,
     #[arg(long, env="NEOCHAT_DATA_DIR", default_value_os_t=neochat::default_data_dir())]
@@ -38,6 +44,8 @@ fn write_discovery(dir: &Path, name: &str, value: &impl serde::Serialize) -> io:
 #[tokio::main]
 async fn main() -> Result<(),Box<dyn std::error::Error>> {
     let args=Args::parse();
+    if args.portable_v1_check { println!("neoboard-portable-v1"); return Ok(()); }
+    if args.portable_v1 && !args.bind.ip().is_loopback() { return Err("portable daemon requires loopback".into()); }
     if !args.bind.ip().is_loopback() {
         eprintln!("warning: non-loopback bind uses plaintext HTTP; use a trusted private network or TLS tunnel, never a public port");
     }
@@ -63,7 +71,7 @@ async fn main() -> Result<(),Box<dyn std::error::Error>> {
         let _ = fs::remove_file(args.data_dir.join(CONTROL_FILE));
         return Err(error.into());
     }
-    println!("{}",discovery_path.display());
+    if args.portable_v1 { println!("READY"); } else { println!("{}",discovery_path.display()); }
     let control_router = sharing.router();
     let management = tokio::spawn(async move { axum::serve(control_listener, control_router).await });
     let resume = tokio::spawn({
@@ -88,7 +96,11 @@ async fn main() -> Result<(),Box<dyn std::error::Error>> {
         }
     });
     let result=axum::serve(listener,neochat::router(board)).with_graceful_shutdown(async move {
-        shutdown().await;
+        if args.portable_v1 {
+            let (tx,rx)=tokio::sync::oneshot::channel();
+            std::thread::spawn(move || { let mut byte=[0]; let _=std::io::Read::read(&mut io::stdin().lock(), &mut byte); let _=tx.send(()); });
+            tokio::select! { _=shutdown()=>{}, _=rx=>{} }
+        } else { shutdown().await; }
         resume.abort();
         management.abort();
         sharing.stop().await;

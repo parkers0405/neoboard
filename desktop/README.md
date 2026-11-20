@@ -31,7 +31,7 @@ The worker owns the blocking client, network parsing, file reads, and file write
 
 ## Verification and screenshots
 
-A packaged release checks GitHub once at launch for a newer stable Neoboard version. Dismiss skips the offer until the next session. Update runs only the `neoboard update` executable alongside the desktop; the moving bar means the CLI is busy, not a percentage. No process is restarted automatically. On Windows the updater stages a separate directory and the dialog shows the CLI’s instructions. Source/debug builds, fixtures, and scenes do not contact GitHub. Preview the modal with `--scene update-offer` or `--scene update-running`.
+A packaged release checks GitHub at launch for a newer stable version. Dismiss leaves your session alone. Finish drafts before choosing **Update and reopen**. On Linux and macOS, a standalone portable desktop runs its sibling `neoboard update` and reopens the executable at the original install path after verifying it was replaced. When launched by `neoboard desktop`, it instead hands approval back to that supervisor, which owns the companion and the relaunch. Neither path manages external MCP clients: reconnect Neoboard in each client to load the updated adapter. On Windows a portable update only stages a separate bundle; follow the displayed switch instructions. For a macOS `.app` or a Windows MSI installation, use the new DMG or MSI rather than the portable updater. Preview the modal with `--scene update-offer` or `--scene update-running`.
 
 Use the pinned Rust toolchain; no release build is required.
 

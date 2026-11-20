@@ -4,6 +4,26 @@ use semver::Version;
 
 const LATEST: &str = "https://api.github.com/repos/parkers0405/neoboard/releases/latest";
 const LIMIT: u64 = 256 * 1024;
+const HANDOFF: &str = "NEOBOARD_DESKTOP_UPDATE_HANDOFF";
+pub const RECONNECT: &str = "External MCP connections are not verified. Reconnect Neoboard in each MCP client to load the updated adapter.";
+
+fn managed_installer(exe: &Path) -> Option<&'static str> {
+    let dir = exe.parent()?;
+    // The DMG's signed app also contains all six portable executables.
+    if dir.ends_with("Contents/MacOS") && dir.ancestors().nth(2)?.extension().is_some_and(|s| s.eq_ignore_ascii_case("app")) {
+        return Some("Install the new NeoBoard.app from the release DMG.");
+    }
+    #[cfg(windows)]
+    for root in ["ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"].iter().filter_map(std::env::var_os) {
+        // current_exe was canonicalized and normally has a verbatim path prefix.
+        let root = PathBuf::from(root);
+        let normalized = root.canonicalize().unwrap_or_else(|_|root.clone());
+        if dir.ancestors().any(|a| [root.as_os_str(), normalized.as_os_str()].iter().any(|r| a.as_os_str().eq_ignore_ascii_case(r))) {
+            return Some("Run the new NeoBoard MSI to upgrade this managed installation.");
+        }
+    }
+    None
+}
 
 fn stable_version(body: impl Read) -> Option<Version> {
     #[derive(serde::Deserialize)]
@@ -30,6 +50,7 @@ fn binary(name: &str) -> String { format!("{name}{}", std::env::consts::EXE_SUFF
 
 fn package_cli(exe: &Path) -> Option<PathBuf> {
     let dir = exe.parent()?;
+    if managed_installer(exe).is_some() { return None; }
     if !exe.is_absolute() || exe.file_name()?.to_str()? != binary("neochat-desktop") { return None; }
     for parent in dir.ancestors() {
         for marker in [".git", "Cargo.toml", ".rustc_info.json"] {
@@ -62,6 +83,15 @@ fn package_cli(exe: &Path) -> Option<PathBuf> {
 
 fn install(exe: &Path) -> Result<String, String> {
     let cli = package_cli(exe).ok_or("The packaged updater is no longer available.")?;
+    // neoboard desktop owns its private companion and the install transaction.
+    // Returning its reserved approval status touches neither daemon nor MCP clients.
+    if std::env::var_os("NEOBOARD_PORTABLE_HANDOFF").as_deref() == Some("1".as_ref()) {
+        std::process::exit(75);
+    }
+    #[cfg(unix)]
+    let old = fs::metadata(exe).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let mut command = Command::new(cli);
     command.arg("update").current_dir(exe.parent().unwrap()).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
     #[cfg(windows)] {
@@ -84,7 +114,20 @@ fn install(exe: &Path) -> Result<String, String> {
     };
     drop(pipe);
     let status = child.wait().map_err(|e| format!("Could not confirm updater exit: {e}"))?;
-    if status.success() { Ok(diagnostic) } else { Err(format!("Updater returned {status}. {diagnostic}")) }
+    if !status.success() { return Err(format!("Updater returned {status}. {diagnostic}")); }
+    #[cfg(unix)] {
+        use std::os::unix::{fs::MetadataExt, process::CommandExt};
+        let new = fs::metadata(exe).map_err(|e| format!("Cannot verify installed desktop: {e}. {diagnostic}"))?;
+        if (old.dev(), old.ino()) == (new.dev(), new.ino()) || package_cli(exe).is_none() {
+            return Err(format!("No replacement desktop verified at the installed path. {diagnostic}"));
+        }
+        // Replace only ourselves. Preserve the board selection and relative CLI paths;
+        // never rediscover current_exe after the swap (it can now point into the backup).
+        let error = Command::new(exe).args(std::env::args_os().skip(1)).current_dir(cwd)
+            .env(HANDOFF, &diagnostic).exec();
+        Err(format!("Installed, but could not reopen {}: {error}. {diagnostic}", exe.display()))
+    }
+    #[cfg(not(unix))] { Ok(diagnostic) }
 }
 
 #[derive(Default)]
@@ -105,6 +148,10 @@ impl Session {
         self.wake = Some(wake.clone());
         if fixture || cfg!(any(test, debug_assertions)) || self.started { return; }
         self.started = true;
+        if let Ok(detail) = std::env::var(HANDOFF) {
+            self.stage = Stage::Notice(format!("Desktop {} reopened. {RECONNECT}\n\n{detail}", env!("CARGO_PKG_VERSION")));
+            return;
+        }
         self.check(false,wake);
     }
     pub fn manual(&mut self) {
@@ -115,17 +162,21 @@ impl Session {
         let (send, recv) = mpsc::channel();
         let (approve, wait) = mpsc::channel();
         let worker = std::thread::Builder::new().name("desktop-update".into()).spawn(move || -> Option<()> {
-            let exe = std::env::current_exe().ok().and_then(|p|p.canonicalize().ok()).filter(|p|package_cli(p).is_some());
-            if !manual && exe.is_none(){return None;}
+            let path = std::env::current_exe().ok().and_then(|p|p.canonicalize().ok());
+            let managed = path.as_deref().and_then(managed_installer);
+            let exe = path.filter(|p|package_cli(p).is_some());
+            if !manual && exe.is_none() && managed.is_none(){return None;}
             let current=Version::parse(env!("CARGO_PKG_VERSION")).ok()?;
-            let stage=match latest() {
+            let latest = latest();
+            if !manual && !latest.as_ref().is_some_and(|v| v.cmp_precedence(&current).is_gt()) { return None; }
+            let stage=match latest {
                 Some(v) if v.cmp_precedence(&current).is_gt() && exe.is_some()=>Stage::Offer(v),
+                Some(v) if v.cmp_precedence(&current).is_gt() && managed.is_some()=>Stage::Notice(format!("Version {v} is available. {} {RECONNECT}", managed.unwrap())),
                 Some(v) if v.cmp_precedence(&current).is_gt()=>Stage::Notice(format!("Version {v} is available. This development build cannot update itself.")),
                 Some(_) => Stage::Notice(format!("You're up to date (version {current}).")),
                 None => Stage::Notice("Couldn't check GitHub Releases. Check your connection and try again.".into()),
             };
             let offered=matches!(stage,Stage::Offer(_));
-            if !manual && !offered{return None;}
             send.send(stage).ok()?;
             wake();
             if !offered{return None;}
@@ -175,6 +226,56 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signed_app_uses_managed_installer() {
+        let exe = Path::new("/Applications/Renamed.app/Contents/MacOS/neochat-desktop");
+        assert!(managed_installer(exe).unwrap().contains("DMG"));
+        assert!(package_cli(exe).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn portable_handoff() {
+        use std::os::unix::fs::PermissionsExt;
+        // Only the disposable test subprocess may exec; its parent observes which
+        // binary replaced it, the working directory and the post-update notice.
+        const CHILD: &str = "NEOBOARD_TEST_HANDOFF_BUNDLE";
+        if let Some(root) = std::env::var_os(CHILD) {
+            let result = install(&Path::new(&root).join("neochat-desktop"));
+            if std::env::var_os("NEOBOARD_TEST_NO_REPLACEMENT").is_some() {
+                assert!(result.unwrap_err().contains("No replacement desktop"));
+                return;
+            }
+            panic!("handoff returned: {result:?}");
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let dir = root.join("installed bundle");
+        fs::create_dir(&dir).unwrap();
+        for name in ["neochat-desktop", "neoboard", "neochat", "neochatd", "neochat-mcp", "neochat-share"] {
+            let file = dir.join(name);
+            fs::write(&file, "#!/bin/sh\nexit 91\n").unwrap();
+            fs::set_permissions(file, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        fs::write(dir.join("LICENSE"), "fixture").unwrap();
+        fs::write(dir.join("neoboard"), "#!/bin/sh\n[ \"$1\" = update ] || exit 1\n").unwrap();
+        let test = "release_update::tests::portable_handoff";
+        let noop = Command::new(std::env::current_exe().unwrap()).args(["--exact", test])
+            .env(CHILD, &dir).env_remove("NEOBOARD_PORTABLE_HANDOFF").env("NEOBOARD_TEST_NO_REPLACEMENT", "1").status().unwrap();
+        assert!(noop.success());
+        fs::write(dir.join("neoboard"), "#!/bin/sh\nset -e\n[ \"$1\" = update ]\nmv ../replacement neochat-desktop\necho fake-swap >&2\n").unwrap();
+        fs::write(root.join("replacement"), "#!/bin/sh\nprintf '%s\\n' \"$0\" \"$PWD\" \"$NEOBOARD_DESKTOP_UPDATE_HANDOFF\" \"$@\" > observed\n").unwrap();
+        fs::set_permissions(root.join("replacement"), fs::Permissions::from_mode(0o755)).unwrap();
+        let supervised = Command::new(std::env::current_exe().unwrap()).args(["--exact", test])
+            .env(CHILD, &dir).env("NEOBOARD_PORTABLE_HANDOFF", "1").current_dir(&root).status().unwrap();
+        assert_eq!(supervised.code(), Some(75));
+        assert!(root.join("replacement").exists(), "supervised desktop must not invoke updater");
+        let status = Command::new(std::env::current_exe().unwrap()).args(["--exact", test])
+            .env(CHILD, &dir).env_remove("NEOBOARD_PORTABLE_HANDOFF").current_dir(&root).status().unwrap();
+        assert!(status.success());
+        assert_eq!(fs::read_to_string(root.join("observed")).unwrap(), format!("{}/neochat-desktop\n{}\nfake-swap\n--exact\n{test}\n",dir.display(),root.display()));
+    }
 
     #[test]
     fn stable_newer_release_only() {

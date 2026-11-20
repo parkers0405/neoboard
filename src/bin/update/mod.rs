@@ -1,4 +1,5 @@
 use sha2::{Digest, Sha256};
+pub(super) mod portable;
 use std::{
     collections::HashSet,
     error::Error,
@@ -74,7 +75,7 @@ fn complete(names: &HashSet<String>, ext: &str) -> Result<()> {
     Ok(())
 }
 
-fn check_install(dir: &Path, ext: &str) -> Result<()> {
+fn check_not_dev(dir: &Path) -> Result<()> {
     for parent in dir.ancestors() {
         for marker in [".git", "Cargo.toml", ".rustc_info.json"] {
             match fs::symlink_metadata(parent.join(marker)) {
@@ -84,6 +85,11 @@ fn check_install(dir: &Path, ext: &str) -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+fn check_install(dir: &Path, ext: &str) -> Result<()> {
+    check_not_dev(dir)?;
     let mut names = HashSet::new();
     for entry in dir.read_dir()? {
         let entry = entry?;
@@ -257,13 +263,33 @@ fn exchange(a: &Path, b: &Path) -> io::Result<()> {
 }
 
 pub(super) fn run() -> Result<()> {
+    let dir = install_directory()?;
+    #[cfg(unix)]
+    let _lease = lock_bundle(&dir)?;
+    let stage = prepare(&dir)?;
+    activate(&dir, stage)
+}
+
+#[cfg(unix)]
+fn lock_bundle(dir: &Path) -> Result<File> {
+    let file = File::open(dir)?;
+    file.try_lock().map_err(|e|format!("bundle busy or filesystem cannot lock it: {e}"))?;
+    Ok(file)
+}
+
+fn install_directory() -> Result<std::path::PathBuf> {
+    let exe = std::env::current_exe()?.canonicalize()?;
+    if exe.file_name() != Some(format!("neoboard{}", std::env::consts::EXE_SUFFIX).as_ref()) {
+        return Err("updater must be the installed neoboard executable".into());
+    }
+    Ok(exe.parent().ok_or("no installation directory")?.into())
+}
+
+fn prepare(dir: &Path) -> Result<tempfile::TempDir> {
     use std::env::{
-        self,
         consts::{ARCH, EXE_SUFFIX, OS},
     };
     let asset = asset(OS, ARCH)?;
-    let exe = env::current_exe()?.canonicalize()?;
-    let dir = exe.parent().ok_or("no installation directory")?;
     let parent = dir.parent().ok_or("cannot update filesystem root")?;
     check_install(dir, EXE_SUFFIX)?;
     let client = reqwest::blocking::Client::builder()
@@ -287,7 +313,11 @@ pub(super) fn run() -> Result<()> {
         .prefix("neoboard-release-")
         .tempdir_in(parent)?;
     extract(&mut archive, stage.path(), EXE_SUFFIX)?;
-    check_install(dir, EXE_SUFFIX)?;
+    Ok(stage)
+}
+
+fn activate(dir: &Path, stage: tempfile::TempDir) -> Result<()> {
+    check_install(dir, std::env::consts::EXE_SUFFIX)?;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -303,7 +333,7 @@ pub(super) fn run() -> Result<()> {
             dir.display(),
             backup.display()
         );
-        if let Err(e) = File::open(parent).and_then(|p| p.sync_all()) {
+        if let Err(e) = File::open(dir.parent().unwrap()).and_then(|p| p.sync_all()) {
             eprintln!("Warning: the directory swap succeeded, but syncing the parent failed: {e}");
         }
     }

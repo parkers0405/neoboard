@@ -33,11 +33,28 @@ class WatcherTest(unittest.TestCase):
         self.events = []
         self.status = 200
         self.cursors = []
+        self.session_status = {}
+        self.prompts = []
+        self.post_status = 204
+        self.posts = []
+        self.received = threading.Event()
+        self.reply_gate = threading.Event()
+        self.reply_gate.set()
         fixture = self
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):
                 url = urlsplit(self.path)
+                if url.path.startswith('/v2/') and self.headers.get('Authorization') == 'Bearer neo-fixture':
+                    data = {'/v2/sessions/ses_fixture': {'id': 'ses_fixture'},
+                            '/v2/sessions/status': fixture.session_status}
+                    if url.path not in data:
+                        self.send_error(404)
+                        return
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(json.dumps(data[url.path]).encode())
+                    return
                 if url.path != '/v1/events' or self.headers.get('Authorization') != 'Bearer fixture':
                     self.send_error(403)
                     return
@@ -46,6 +63,22 @@ class WatcherTest(unittest.TestCase):
                 self.send_response(fixture.status)
                 self.end_headers()
                 self.wfile.write(json.dumps([e for e in fixture.events if e['cursor'] > cursor]).encode())
+
+            def do_POST(self):
+                fixture.posts.append(self.path)
+                if self.path != '/v2/sessions/ses_fixture/prompt-if-idle' or self.headers.get('Authorization') != 'Bearer neo-fixture':
+                    self.send_error(403)
+                    return
+                if fixture.post_status in (404, 412):
+                    self.send_response(fixture.post_status)
+                    self.end_headers()
+                    self.wfile.write(b'{"code":"session.not_idle"}' if fixture.post_status == 412 else b'{}')
+                    return
+                fixture.prompts.append(json.loads(self.rfile.read(int(self.headers['Content-Length']))))
+                fixture.received.set()
+                fixture.reply_gate.wait(10)
+                self.send_response(fixture.post_status)
+                self.end_headers()
 
             def log_message(self, *_):
                 pass
@@ -60,7 +93,7 @@ class WatcherTest(unittest.TestCase):
 
     def cli(self, *args, fails=False):
         p = subprocess.run([sys.executable, str(CLI), '--db', str(self.db), *args],
-                           env=dict(os.environ, NEOBOARD_WATCH_TOKEN='fixture'),
+                           env=dict(os.environ, NEOBOARD_WATCH_TOKEN='fixture', NEOISM_WAKE_TOKEN='neo-fixture'),
                            capture_output=True, text=True, timeout=10)
         if fails:
             self.assertNotEqual(p.returncode, 0)
@@ -156,6 +189,77 @@ class WatcherTest(unittest.TestCase):
             _, stderr = process.communicate(timeout=5)
         self.assertIn('503', stderr)
         self.assertIsNone(self.cli('take'))
+
+    def assigned(self, cursor, actor):
+        event = msg(cursor, id=16, state='ready')
+        event['message']['task']['assignee'] = actor
+        event['message']['text'] = 'launch ses_other with /bin/sh'
+        return event
+
+    def test_wake_only_bound_assignment_once(self):
+        self.init('assignment')
+        self.cli('bind', '--actor', 'alice', '--endpoint', self.url, '--session', 'ses_fixture')
+        self.events = [self.assigned(1, 'bob'), self.assigned(2, 'alice'), self.assigned(3, 'alice')]
+        self.cli('poll')
+        self.session_status = {'ses_fixture': {'type': 'busy'}}
+        self.assertEqual(self.cli('wake')['status'], 'busy')
+        self.assertFalse(self.prompts)
+        self.session_status = {}
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            results = list(workers.map(self.cli, ['wake', 'wake']))
+        self.assertCountEqual(results, [None, dict(cursor=2, status='accepted')])
+        self.cli('replay', self.cli('inspect')['deliveries'][1]['id'])
+        self.cli('poll')
+        self.assertIsNone(self.cli('wake'))
+        self.assertEqual(self.prompts, [{'prompt': 'NeoBoard assignment: check task #16 in channel project/dev. Verify the current assignment before acting.'}])
+        self.assertEqual([r['status'] for r in self.cli('wake-status')], ['unbound', 'accepted'])
+
+    def test_ambiguous_wake_never_retried(self):
+        self.init('assignment')
+        self.cli('bind', '--actor', 'alice', '--endpoint', self.url, '--session', 'ses_fixture')
+        self.events = [self.assigned(1, 'alice'), self.assigned(2, None), self.assigned(3, 'alice')]
+        self.cli('poll')
+        self.post_status = 503
+        self.assertEqual(self.cli('wake'), dict(cursor=3, status='uncertain'))
+        self.cli('replay', self.cli('inspect')['deliveries'][1]['id'])
+        self.assertIsNone(self.cli('wake'))
+        self.assertEqual([r['status'] for r in self.cli('wake-status')], ['superseded', 'uncertain'])
+        self.assertEqual(len(self.prompts), 1)
+
+    def test_crash_after_post_before_response(self):
+        self.init('assignment')
+        self.cli('bind', '--actor', 'alice', '--endpoint', self.url, '--session', 'ses_fixture')
+        self.events = [self.assigned(1, 'alice')]
+        self.cli('poll')
+        self.reply_gate.clear()
+        with subprocess.Popen([sys.executable, str(CLI), '--db', str(self.db), 'wake'],
+                              env=dict(os.environ, NEOISM_WAKE_TOKEN='neo-fixture')) as process:
+            try:
+                self.assertTrue(self.received.wait(5))
+            finally:
+                process.kill()
+                self.reply_gate.set()
+        self.assertEqual(self.cli('wake-status')[0]['status'], 'uncertain')
+        self.assertIsNone(self.cli('wake'))
+        self.assertEqual(len(self.prompts), 1)
+
+    def test_raced_admission_and_unsupported_server(self):
+        self.init('assignment')
+        self.cli('bind', '--actor', 'alice', '--endpoint', self.url, '--session', 'ses_fixture')
+        self.events = [self.assigned(1, 'alice')]
+        self.cli('poll')
+        self.post_status = 412  # idle in GET, competing admission wins at POST
+        self.assertEqual(self.cli('wake')['status'], 'busy')
+        self.assertFalse(self.prompts)
+        self.post_status = 204
+        self.assertEqual(self.cli('wake')['status'], 'accepted')
+        self.events.extend([self.assigned(2, None), self.assigned(3, 'alice')])
+        self.cli('poll')
+        self.post_status = 404  # downgrade; must never try either legacy route
+        self.assertEqual(self.cli('wake')['status'], 'unsupported_or_missing')
+        self.assertIsNone(self.cli('wake'))
+        self.assertEqual(self.posts, ['/v2/sessions/ses_fixture/prompt-if-idle'] * 3)
+        self.assertEqual(len(self.prompts), 1)
 
 
 if __name__ == '__main__':

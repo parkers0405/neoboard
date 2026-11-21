@@ -2819,7 +2819,7 @@ dependencies = [
 
 [[package]]
 name = "neochat"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -2842,7 +2842,7 @@ dependencies = [
 
 [[package]]
 name = "neochat-desktop"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "base64 0.22.1",
  "dirs",
@@ -2850,6 +2850,7 @@ dependencies = [
  "neochat",
  "reqwest 0.12.28",
  "rune",
+ "rustix 1.1.6",
  "semver",
  "serde",
  "serde_json",

@@ -83,6 +83,7 @@ fn display_names_persist_reset_and_do_not_change_identity_or_authorization() {
 async fn shared_client_round_trip_and_profile_is_not_a_display_name_target() {
     let board = Board::open(":memory:", TOKEN, ADMIN).unwrap();
     let guest = invite(&board, "guest", &["project/*"]);
+    let link = board.create_shared_invite(ADMIN, InviteRequest { actor: "guest-link".into(), channels: vec!["project/*".into()], expires_at: None }).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, neochat::board::router(board)).await.unwrap(); });
@@ -99,6 +100,76 @@ async fn shared_client_round_trip_and_profile_is_not_a_display_name_target() {
         client.set_display_name("").unwrap();
         assert_eq!(host.members("project/future").unwrap()[0].display_name, None);
         assert!(client.set_display_name("bad\nname").is_err());
+        // A named invite is used as it is; a shared one is exchanged over HTTP.
+        assert!(client.join().unwrap().is_none());
+        let personal = Client::new(&endpoint, &link.token, None).unwrap().join().unwrap().unwrap();
+        let joined = Client::new(&endpoint, &personal.token, None).unwrap();
+        assert_eq!(joined.my_member().unwrap().actor, personal.actor);
+        assert!(joined.join().unwrap().is_none());
     }).await.unwrap();
     server.abort();
+}
+#[test]
+fn each_person_joining_a_shared_invite_gets_their_own_name_and_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let board = Board::open(dir.path().join("board.db"), TOKEN, ADMIN).unwrap();
+    let request = |actor: &str| InviteRequest { actor: actor.into(), channels: vec!["team/*".into()], expires_at: Some(now() + 600) };
+    let link = board.create_shared_invite(ADMIN, request("guest-link")).unwrap();
+    let name = |token: &str| {
+        let me = board.members(token, "team/general").unwrap();
+        me.into_iter().map(|m| (m.actor, m.display_name)).collect::<Vec<_>>()
+    };
+    // The link is a key, not a person, until someone is behind it.
+    assert_eq!(actors(&board, TOKEN, "team/general"), ["local"]);
+
+    let first = board.join(&link.token).unwrap();
+    let second = board.join(&link.token).unwrap();
+    assert_ne!(first.actor, second.actor);
+    assert_ne!(first.token, second.token);
+    for personal in [&first, &second] {
+        assert_eq!(personal.channels, ["team/*"]);
+        assert!(personal.expires_at.unwrap() > now() + 29 * 86_400);
+        assert_eq!(board.members(&personal.token, "other/general").unwrap_err().0, 403);
+        // A personal credential cannot mint further identities.
+        assert_eq!(board.join(&personal.token).unwrap_err().0, 409);
+    }
+
+    board.set_display_name(&first.token, "Gianmarco").unwrap();
+    board.set_display_name(&second.token, "Parker-Desktop").unwrap();
+    board.set_display_name(&first.token, "Gian").unwrap();
+    let mut expected = vec![(first.actor.clone(), Some("Gian".to_string())), (second.actor.clone(), Some("Parker-Desktop".to_string())), ("local".to_string(), None)];
+    expected.sort();
+    assert_eq!(name(&second.token), expected);
+
+    // The link stops admitting people when it expires; those who joined stay who they are.
+    let db = neochat::storage::Connection::open(dir.path().join("board.db")).unwrap();
+    let expiry = |id: u64| db.query_row("SELECT expires FROM credentials WHERE id=?1", [id as i64], |r| r.get::<_, u64>(0)).unwrap();
+    let expires_at = link.expires_at.unwrap();
+    db.execute("UPDATE credentials SET expires=?1 WHERE id=?2", neochat::params![now(), link.id]).unwrap();
+    assert_eq!(board.join(&link.token).unwrap_err().0, 401);
+    assert_eq!(name(&second.token), expected);
+    // A membership about to lapse is renewed by being used.
+    db.execute("UPDATE credentials SET expires=?1 WHERE id=?2", neochat::params![now() + 60, first.id]).unwrap();
+    assert_eq!(name(&first.token), expected);
+    assert!(expiry(first.id) > now() + 29 * 86_400);
+    db.execute("UPDATE credentials SET expires=?1 WHERE id=?2", neochat::params![expires_at, link.id]).unwrap();
+    // An ordinary invite keeps the expiry it was issued with.
+    assert_eq!(expiry(link.id), expires_at);
+
+    // A client older than the exchange still appears once it names the shared identity.
+    board.set_display_name(&link.token, "Old client").unwrap();
+    assert!(actors(&board, TOKEN, "team/general").contains(&"guest-link".to_string()));
+    assert_eq!(expiry(link.id), expires_at);
+
+    // An invite issued to one named actor stays that actor.
+    let named = board.create_invite(ADMIN, request("bob")).unwrap();
+    assert_eq!(board.join(&named.token).unwrap_err().0, 409);
+    assert_eq!(board.join(TOKEN).unwrap_err().0, 409);
+    assert_eq!(board.join("unknown").unwrap_err().0, 401);
+
+    board.revoke_invite(ADMIN, link.id).unwrap();
+    for token in [&link.token, &first.token, &second.token] {
+        assert_eq!(board.members(token, "team/general").unwrap_err().0, 401);
+    }
+    assert_eq!(actors(&board, TOKEN, "team/general"), ["bob", "local"]);
 }

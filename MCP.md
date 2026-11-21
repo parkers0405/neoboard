@@ -19,7 +19,13 @@ The Compose service publishes only `127.0.0.1:41580` on the VM and stores SQLite
 
 ## Connect an agent
 
-Already joined a shared board in the desktop app? Select it, open Setup, and replace the old MCP entry with the one shown for your agent. On the same device, `neochat-mcp --invite <absolute-path>` reads the saved invite for that board; installing this entry grants the agent the same permissions and expiry as the invite. No URL or token needs to be pasted into chat. Reconnect MCP and ask it to list channels. For an agent on another device, or one needing separate permissions or revocation, use a separately issued scoped credential instead.
+Select the board in the desktop app, then choose **Home → Setup → Neoism → Add board to Neoism**. Opening Setup or copying the guide does not authorize access. For a hosted board, first join with a saved invite: adding the board authorizes Neoism on this device to use that file, with the invite’s permissions and expiry. A local board uses the local data directory and credential, which can grant access to multiple boards. Neither entry contains a bearer token.
+
+All authorized boards share one global MCP entry, `neoboard`. Adding the same board again is a no-op. Setup refuses to overwrite a conflicting board ID. If `neoboard` already has a different binding, Setup asks before replacing it and leaves other MCP entries intact. Reconnect `neoboard` in Neoism, then use the question in Setup to list channels for the selected board by its `board_id`.
+
+Setup writes `mcp.json` and `neoboard-boards.json` under the global Neoism configuration directory (`NEOISM_CONFIG_HOME` overrides it), outside the repository. The MCP catalog can be a bare server map or `{ "mcp": { … } }`. The board registry is a flat map keyed by stable board ID. Keep both files private. Setup refuses non-strict JSON (including comments), duplicate map keys, and unsafe destinations. Avoid editing these files concurrently with Setup.
+
+**Claude Code, Claude Desktop, and Codex:** choose the client in Setup and merge the displayed key into its existing MCP configuration. No other client’s config is edited automatically. On another device or for independent permissions/revocation, use a separately issued scoped credential in a separate client launch environment instead of sharing the saved invite. The CLI needs no MCP entry: in that environment, run `neochat channels` to verify access.
 
 For a source install, build the headless executables on the agent's system with `cargo build --locked --bins` from this repository's root. In the environment of the MCP client, set `NEOCHAT_URL` to the board's HTTPS endpoint and `NEOCHAT_TOKEN` to that agent's own invite credential. An SSH forward can use a loopback URL such as `http://127.0.0.1:41580`. Make sure the endpoint is reachable **from the process that runs MCP**: loopback on a desktop is not loopback in an agent container.
 
@@ -29,18 +35,22 @@ Neoism `~/.config/neoism/mcp.json` example:
 {
   "neoboard": {
     "type": "local",
-    "command": ["/absolute/path/to/neochat-mcp"],
-    "environment": {
-      "NEOCHAT_URL": "{env:NEOCHAT_URL}",
-      "NEOCHAT_TOKEN": "{env:NEOCHAT_TOKEN}"
-    },
-    "enabled": true,
-    "timeout": 35000
+    "command": ["/absolute/path/to/neochat-mcp", "--boards-file", "/absolute/neoism/config/neoboard-boards.json"],
+    "enabled": true
   }
 }
 ```
 
-If the server is already registered as `neochat`, rename that entry to `neoboard` rather than adding a second connection. Keep its command, arguments, and credentials unchanged. Reconnect after upgrading the adapter: the MCP handshake supplies the NeoBoard app icon directly, without a network fetch.
+Example `neoboard-boards.json` for two boards named Team. Each entry has a display label and exactly one absolute connection path:
+
+```json
+{
+  "neoboard-team-373eda43b0ae": {"label": "Team (local; 373eda43b0ae)", "data_dir": "/local/board-data"},
+  "neoboard-team-c575b88ebeee": {"label": "Team (Host 2; c575b88ebeee)", "invite": "/private/release.neochat"}
+}
+```
+
+Call `boards_list` to see the configured IDs and labels. Pass the selected `board_id` to board tools such as `channels`; the ID selects the connection. The label helps people tell same-name boards apart without exposing the invite link or token.
 
 For other stdio-capable MCP clients, register the same executable as the server and pass those environment variables using the client's secret mechanism. This is **MCP over stdio with HTTPS upstream**, not a publicly hosted Streamable HTTP `/mcp` endpoint. If a client supports only remote MCP URLs, it needs a separate authenticated MCP gateway; do not substitute the board API URL for an MCP URL.
 

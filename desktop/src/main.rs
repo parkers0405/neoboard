@@ -18,6 +18,7 @@ mod splash;
 mod splash_art;
 mod zoom;
 mod onboarding;
+mod saved_boards;
 mod setup_guide;
 
 use std::{collections::BTreeMap, sync::{OnceLock, mpsc}, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
@@ -42,11 +43,42 @@ struct Preferences {
     sidebar: bool, oldest: bool, compact: bool,
     #[serde(default)] project: String,
     #[serde(default, skip_serializing_if = "Option::is_none")] invite: Option<std::path::PathBuf>,
-    #[serde(default)] saved_boards: BTreeMap<String, Option<std::path::PathBuf>>,
+    #[serde(default)] board_profiles: saved_boards::SavedBoards,
+    // Before profiles, at most one invite could be saved under each project name.
+    #[serde(default, skip_serializing)] saved_boards: BTreeMap<String, Option<std::path::PathBuf>>,
 }
 
 fn preferences_path() -> Option<std::path::PathBuf> {
     dirs::config_dir().map(|p| p.join("neochat").join("desktop.json"))
+}
+
+impl Preferences {
+    fn path(options: &Options) -> Option<std::path::PathBuf> {
+        let base = preferences_path()?;
+        let dir = options.data_dir.clone().or_else(|| std::env::var_os("NEOCHAT_DATA_DIR").map(Into::into));
+        match dir {
+            // The portable launcher supplies --data-dir. Its local boards must not
+            // be mixed with the default daemon's boards, or forgotten on restart.
+            Some(dir) => {
+                use sha2::{Digest, Sha256};
+                let absolute = std::path::absolute(dir).ok()?;
+                let key = Sha256::digest(absolute.as_os_str().as_encoded_bytes());
+                Some(base.with_file_name(format!("desktop-{key:x}.json")))
+            }
+            None => Some(base),
+        }
+    }
+
+    fn load(path: &std::path::Path) -> Option<Self> {
+        serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+    }
+
+    fn write(&self, path: &std::path::Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(path.parent().unwrap())?;
+        let tmp = path.with_extension(format!("{}.tmp",std::process::id()));
+        std::fs::write(&tmp,serde_json::to_vec_pretty(self)?)?;
+        std::fs::rename(tmp,path)
+    }
 }
 
 struct App {
@@ -82,11 +114,12 @@ struct App {
     page: Page,
     project: String,
     options: Options,
-    saved_boards: BTreeMap<String, Option<std::path::PathBuf>>,
+    saved_boards: saved_boards::SavedBoards,
     onboarding: onboarding::Onboarding,
     project_menu: bool,
     home_copied: Option<&'static str>,
     setup_open: bool,
+    setup_session: setup_guide::Session,
     setup_agent: setup_guide::Agent,
     setup_choices: bool,
     filter_choice_search: rune::TextEdit,
@@ -234,7 +267,8 @@ impl App {
             profiles: profile::Profiles::default(),
             zoom: zoom::Zoom::default(),
             snapshot: Snapshot { cursor: 0, channels: vec![], messages: vec![] }, board_cache:None,board_extra:Default::default(),page: Page::Home, project:String::new(), options: OPTIONS.get().cloned().unwrap_or_default(), onboarding: Default::default(), project_menu:false, home_copied: None, setup_open:false, setup_agent:Default::default(), setup_choices:false, splash: Default::default(),
-            share:Default::default(), connection_wake:None, saved_boards:BTreeMap::new(), me:None, personal_name:edit(""), member_list:None, pick_assignee:false, details_picker:None, task_filters:Default::default(), aliases:BTreeMap::new(),
+            setup_session: Default::default(),
+            share:Default::default(), connection_wake:None, saved_boards:Default::default(), me:None, personal_name:edit(""), member_list:None, pick_assignee:false, details_picker:None, task_filters:Default::default(), aliases:BTreeMap::new(),
             filter: ALL_TASKS, query: edit(""), channel: edit(""), draft: edit(""), reply: edit(""),
             labels: edit(""), needs: edit(""), assignee: edit(""), new_channel: edit(""), creating_channel: None,
             channel_actions: Default::default(),
@@ -250,29 +284,38 @@ impl App {
             attachment_message: None, attachments: BTreeMap::new(), upload_path: edit(""), download_path: edit(""), download_id: None, notice: None,
         };
         if fixture { fixture::load(&mut app, false); }
-        else if !cfg!(test) && let Some(prefs) = preferences_path().and_then(|p| std::fs::read(p).ok()).and_then(|data| serde_json::from_slice::<Preferences>(&data).ok()) {
-            app.sidebar=prefs.sidebar; app.oldest=prefs.oldest; app.compact=prefs.compact;
-            if app.options.endpoint.is_none() && app.options.data_dir.is_none() && std::env::var_os("NEOCHAT_DATA_DIR").is_none() {
-                app.options.invite = prefs.invite;
-                app.saved_boards = prefs.saved_boards;
-            }
-            if app.options.endpoint.is_none() && neochat::valid_project(&prefs.project) { app.project = prefs.project; }
+        else if !cfg!(test) && let Some(prefs) = Preferences::path(&app.options).and_then(|p| Preferences::load(&p)) {
+            app.restore_preferences(prefs);
         }
         if !fixture && !cfg!(test) { app.zoom.load(); }
         if let Some(id) = &app.options.project { app.project = id.clone(); }
         app
     }
+    fn restore_preferences(&mut self, prefs: Preferences) {
+        self.sidebar = prefs.sidebar; self.oldest = prefs.oldest; self.compact = prefs.compact;
+        if self.options.endpoint.is_some() { return; }
+        if neochat::valid_project(&prefs.project) { self.project = prefs.project; }
+        self.saved_boards = prefs.board_profiles;
+        for (id, path) in prefs.saved_boards {
+            self.saved_boards.remember(id, path, None);
+        }
+        // Older preferences could contain an active invite missing from the map.
+        if !self.project.is_empty() {
+            self.saved_boards.remember(self.project.clone(), prefs.invite.clone(), None);
+        }
+        // An explicitly requested local project wins over the last open invite.
+        if self.options.project.is_none() {
+            self.options.invite = prefs.invite;
+            if self.options.invite.is_some() && !self.project.is_empty() { self.options.project = Some(self.project.clone()); }
+        }
+    }
+    fn preferences(&self) -> Preferences {
+        Preferences {sidebar:self.sidebar, oldest:self.oldest, compact:self.compact, project:self.project.clone(), invite:self.options.invite.clone(), board_profiles:self.saved_boards.clone(), saved_boards:Default::default()}
+    }
     fn save_preferences(&mut self) {
-        if self.fixture || cfg!(test) || self.options.endpoint.is_some() || self.options.data_dir.is_some() || std::env::var_os("NEOCHAT_DATA_DIR").is_some() { return; }
-        let Some(path)=preferences_path() else {self.error=Some("No settings directory available".into());return;};
-        let prefs=Preferences {sidebar:self.sidebar, oldest:self.oldest, compact:self.compact, project:self.project.clone(), invite:self.options.invite.clone(), saved_boards:self.saved_boards.clone()};
-        let result=(|| -> std::io::Result<()> {
-            std::fs::create_dir_all(path.parent().unwrap())?;
-            let tmp=path.with_extension(format!("{}.tmp",std::process::id()));
-            std::fs::write(&tmp,serde_json::to_vec_pretty(&prefs)?)?;
-            std::fs::rename(tmp,path)
-        })();
-        if let Err(e)=result {self.error=Some(format!("Could not save preferences: {e}"));}
+        if self.fixture || cfg!(test) || OPTIONS.get().is_some_and(|o| o.endpoint.is_some()) { return; }
+        let Some(path)=Preferences::path(&self.options) else {self.error=Some("No settings directory available".into());return;};
+        if let Err(e)=self.preferences().write(&path) {self.error=Some(format!("Could not save preferences: {e}"));}
     }
     fn navigate(&mut self, page: Page) {
         self.sprint.reset_view();
@@ -582,7 +625,7 @@ fn setup(app: &mut App, wake: rune::Waker) {
 }
 fn poll(app: &mut App, seconds: f64, tx: &mut Tx) -> bool {
     let started = Instant::now();
-    let mut changed = false;
+    let mut changed = app.setup_session.poll();
     if app.share.busy && matches!(app.dialog, Some(Dialog::Share | Dialog::Connection)) {
         app.share.pulse = ((seconds * 2.4).cos() as f32 + 1.) * 0.5;
         tx.wake_after(Duration::from_millis(40));
@@ -788,6 +831,7 @@ fn main() {
             ("new-task", |a| {fixture::load(a,true);a.task_channel=a.channel.text.clone();a.dialog=Some(Dialog::NewTask);}),
             ("edit-task", |a| {fixture::load(a,true);a.open_thread(1);a.open_task_editor(1);}),
             ("add-board", |a| {fixture::load(a,false);a.begin_add_board();}),
+            ("saved-boards", fixture::saved_boards),
             ("new-channel", |a| {fixture::load(a,true);a.dialog=Some(Dialog::NewChannel);}),
             ("channel-options", channel_actions::menu_scene),
             ("delete-channel", |a| {channel_actions::menu_scene(a); a.channel_actions.target=a.channel_actions.menu.take(); a.dialog=Some(Dialog::DeleteChannel);}),

@@ -97,6 +97,18 @@ impl InviteFile {
         Ok(path)
     }
 
+    /// Replace a stored invite in place, so whatever refers to its path keeps working.
+    pub fn replace(&self, path: &Path) -> Result<(), String> {
+        use std::io::Write;
+        let failed = "Couldn't save the invite locally.";
+        // NamedTempFile creates mode 0600; persisting never follows a destination symlink.
+        let mut file = tempfile::NamedTempFile::new_in(path.parent().ok_or(failed)?).map_err(|_| failed)?;
+        serde_json::to_writer(&mut file, self).map_err(|_| failed)?;
+        file.as_file_mut().flush().and_then(|_| file.as_file().sync_all()).map_err(|_| failed)?;
+        file.persist(path).map_err(|_| failed)?;
+        Ok(())
+    }
+
     pub fn read(path: &Path) -> Result<Self, String> {
         if !path.is_absolute() || !std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file()) {
             return Err("Choose a regular invite file by its absolute path.".into());

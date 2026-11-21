@@ -112,16 +112,18 @@ impl App {
         }
     }
 
-    pub fn switch_board(&mut self, id: &str) {
+    pub fn switch_saved_board(&mut self, profile: &saved_boards::BoardProfile) {
         self.project_menu = false;
-        if id == self.project || self.onboarding.busy { return; }
-        if self.projects().contains(id) { self.select_project(id); return; }
-        let Some(path) = self.saved_boards.get(id).cloned() else { return; };
+        if self.onboarding.busy { return; }
+        if self.options.endpoint.is_none() && profile.invite == self.options.invite && self.projects().contains(profile.project.as_str()) {
+            self.select_project(&profile.project);
+            return;
+        }
         if self.has_unsent_work() {
             self.error = Some("Finish or clear your drafts before switching servers.".into());
             return;
         }
-        if self.commands.as_ref().is_some_and(|tx| tx.try_send(Command::SwitchBoard { id: id.into(), path }).is_ok()) {
+        if self.commands.as_ref().is_some_and(|tx| tx.try_send(Command::SwitchBoard { id: profile.project.clone(), path: profile.invite.clone() }).is_ok()) {
             self.onboarding = Onboarding { busy: true, switching: true, ..Default::default() };
         } else {
             self.error = Some("The board connection isn't ready yet. Try again shortly.".into());
@@ -192,21 +194,23 @@ impl App {
         self.onboarding.busy = false;
         let switching = std::mem::take(&mut self.onboarding.switching);
         match result {
-            Ok((id, mut snapshot, member, path)) => {
+            Ok((id, mut snapshot, member, hosted)) => {
                 self.onboarding.invite = edit("");
-                if path.is_some() || switching {
+                if hosted.is_some() || switching {
                     self.organization = Default::default();
-                    for (id, location) in self.projects().into_iter().map(|id| (id.to_owned(), self.options.invite.clone())).collect::<Vec<_>>() {
-                        if self.options.endpoint.is_none() { self.saved_boards.insert(id, location); }
+                    if self.options.endpoint.is_none() {
+                        for id in self.projects().into_iter().map(str::to_owned).collect::<Vec<_>>() {
+                            self.saved_boards.remember(id, self.options.invite.clone(), None);
+                        }
                     }
-                    self.options.invite = path.clone();
+                    self.options.invite = hosted.as_ref().map(|h| h.path.clone());
                     self.options.endpoint = None;
-                    self.options.project = path.as_ref().map(|_| id.clone());
+                    self.options.project = hosted.as_ref().map(|_| id.clone());
                     self.seen.clear(); self.reply_drafts.clear(); self.reply_labels.clear();
                     self.reply_owner = None; self.reply = edit("");
                     self.board_extra = Default::default();
                 }
-                self.saved_boards.insert(id.clone(), path);
+                self.saved_boards.remember(id.clone(), self.options.invite.clone(), hosted.map(|h| h.endpoint));
                 snapshot.messages.sort_by_key(|m| m.id);
                 self.board_cache = Some(snapshot);
                 self.project.clear();
@@ -335,6 +339,100 @@ mod tests {
     }
 
     #[test]
+    fn hosted_picker_preserves_same_named_connections_after_restart() {
+        use neochat::invite_file::InviteFile;
+        let dir = tempfile::tempdir().unwrap();
+        let prefs_path = dir.path().join("desktop.json");
+        let mut app = App::new();
+        fixture::load(&mut app, false);
+        let id = app.project.clone();
+        let (commands, requests) = mpsc::sync_channel(4);
+        app.commands = Some(commands.clone());
+        let mut rt = rune::Runtime::new(app, view::root, (850., 600.), rune::Env::new(true, 1.));
+        let mut paths = Vec::new();
+        for (i, host) in ["east", "west"].into_iter().enumerate() {
+            for _ in 0..4 { rt.frame(1./60.); }
+            click(&mut rt, "projects-toggle");
+            click(&mut rt, "add-board");
+            if !rt.state.onboarding.joining { click(&mut rt, "onboarding-join"); }
+            assert!(rt.find("onboarding-invite").is_some());
+            let endpoint = format!("https://{host}.example.invalid/");
+            let link = format!("{endpoint}#neoboard={id}&expires=4102444800&key=fixture-only-{host}");
+            rt.update(|a,_| a.onboarding.invite = edit(&link));
+            // Switching to Join animates the form; a press during the first frame misses the button.
+            for _ in 0..6 { rt.frame(1./60.); }
+            click(&mut rt, "onboarding-submit");
+            let Command::JoinBoard { invite: connection::JoinSource::Link(invite), .. } = requests.try_recv().unwrap() else { panic!("expected join"); };
+            assert_eq!(invite.endpoint, endpoint);
+            let path = invite.store(dir.path()).unwrap();
+            let snapshot = Snapshot { cursor: i as u64 + 1, channels: vec![format!("{id}/{host}")], messages: vec![] };
+            let member = neochat::protocol::Member { actor: "fixture".into(), display_name: None };
+            rt.update(|a,_| a.finish_board_setup(Ok((id.clone(), snapshot, member, Some(connection::HostedBoard { path: path.clone(), endpoint })))));
+            rt.frame(1./60.);
+            click(&mut rt, "onboarding-open");
+            paths.push(path);
+        }
+        rt.state.preferences().write(&prefs_path).unwrap();
+        let bytes = std::fs::read(&prefs_path).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("fixture-only"));
+        drop(rt);
+
+        let mut app = App::new();
+        app.restore_preferences(Preferences::load(&prefs_path).unwrap());
+        assert_eq!(app.options.invite.as_ref(), paths.last());
+        assert_eq!(app.options.project.as_ref(), Some(&id));
+        assert_eq!(app.saved_boards.entries().len(), 3);
+        fixture::load(&mut app, false);
+        app.commands = Some(commands);
+        let mut rt = rune::Runtime::new(app, view::root, (850., 600.), rune::Env::new(true, 1.));
+        for (index, expected) in [(1, Some(&paths[0])), (0, None), (2, Some(&paths[1]))] {
+            for _ in 0..4 { rt.frame(1./60.); }
+            click(&mut rt, "projects-toggle");
+            click(&mut rt, &format!("saved-board-{index}"));
+            let Command::SwitchBoard { id: target, path } = requests.try_recv().unwrap() else { panic!("expected switch"); };
+            assert_eq!(target, id);
+            assert_eq!(path.as_ref(), expected);
+            let hosted = path.map(|path| connection::HostedBoard { endpoint: InviteFile::read(&path).unwrap().endpoint, path });
+            let snapshot = Snapshot { cursor: index, channels: vec![format!("{id}/server-{index}")], messages: vec![] };
+            rt.update(|a,_| a.finish_board_setup(Ok((target, snapshot, neochat::protocol::Member { actor:"fixture".into(), display_name:None }, hosted))));
+            assert_eq!(rt.state.options.invite.as_ref(), expected);
+            assert_eq!(rt.state.channel.text, format!("{id}/server-{index}"));
+            assert_eq!(rt.state.saved_boards.entries().len(), 3);
+        }
+    }
+
+    #[test]
+    fn legacy_preferences_keep_active_invite_and_same_named_local_board() {
+        let dir = tempfile::tempdir().unwrap();
+        let active = dir.path().join("old.neochat");
+        let other = dir.path().join("unavailable.neochat");
+        let legacy = serde_json::json!({"sidebar":false,"oldest":true,"compact":false,"project":"team","invite":active,
+            "saved_boards":{"team":null,"archive":other}});
+        let mut app = App::new();
+        app.restore_preferences(serde_json::from_value(legacy).unwrap());
+        let migrated = serde_json::to_value(app.preferences()).unwrap();
+        assert!(migrated.get("saved_boards").is_none());
+        let mut restarted = App::new();
+        restarted.restore_preferences(serde_json::from_value(migrated).unwrap());
+        assert!(!restarted.sidebar && !restarted.compact);
+        assert_eq!(restarted.options.invite.as_ref(), Some(&active));
+        let entries = restarted.saved_boards.entries();
+        assert_eq!(entries.len(), 3);
+        for (id, path) in [("team", None), ("team", Some(active)), ("archive", Some(other))] {
+            assert!(entries.iter().any(|p| p.project == id && p.invite == path));
+        }
+    }
+
+    #[test]
+    fn explicit_data_directories_have_independent_board_lists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = |name| Preferences::path(&Options { data_dir: Some(dir.path().join(name)), ..Default::default() }).unwrap();
+        assert_eq!(path("one"), path("one"));
+        assert_ne!(path("one"), path("two"));
+        assert_ne!(Some(path("one")), preferences_path());
+    }
+
+    #[test]
     fn share_targets_the_hovered_board_without_switching_and_collapse_hides_picker() {
         let mut app = App::new();
         fixture::load(&mut app, false);
@@ -375,7 +473,7 @@ mod tests {
         fixture::load(&mut app, false);
         let path = std::path::PathBuf::from("/fixture/never-opened.neochat");
         app.options.invite = Some(path.clone());
-        app.saved_boards.insert(app.project.clone(), Some(path.clone()));
+        app.saved_boards.remember(app.project.clone(), Some(path.clone()), None);
         app.status = "live".into();
         let (commands, requests) = mpsc::sync_channel(4);
         app.commands = Some(commands);
@@ -387,7 +485,7 @@ mod tests {
         click(&mut rt, "disconnect-guest");
         assert_eq!(rt.state.status, "disconnected");
         assert!(rt.find("reconnect-guest").is_some());
-        assert_eq!(rt.state.saved_boards.get(&rt.state.project), Some(&Some(path)));
+        assert_eq!(rt.state.saved_boards.entries()[0].invite.as_ref(), Some(&path));
         assert!(matches!(requests.try_recv(), Err(mpsc::TryRecvError::Disconnected)));
     }
 

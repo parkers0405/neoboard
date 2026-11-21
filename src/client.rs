@@ -124,6 +124,14 @@ impl Client {
     }
     pub fn my_member(&self)->Result<Member,ClientError>{self.request(self.http.get(self.url("v1/me")))}
 
+    /// Exchange a shared invite for a personal credential. `None` means this credential
+    /// is used as it is: the host predates the exchange, or it already identifies one actor.
+    pub fn join(&self) -> Result<Option<Invite>, ClientError> {
+        let response = self.http.post(self.url("v1/join")).send().map_err(network_error)?;
+        if matches!(response.status().as_u16(), 404 | 405 | 409) { return Ok(None); }
+        Ok(Some(Self::check_status(response)?.json().map_err(network_error)?))
+    }
+
     /// Updates the authenticated actor, regardless of any action profile header.
     pub fn set_display_name(&self, name: &str) -> Result<(), ClientError> {
         self.send(self.http.post(self.url("v1/display-name")).json(&DisplayNameRequest { name: name.into() }))?;

@@ -1,6 +1,17 @@
 //! Frozen fixtures; no daemon, random IDs or wall clock in screenshot baselines.
 use super::*;
 use neochat::protocol::Task;
+
+pub fn saved_boards(app: &mut App) {
+    load(app, false);
+    app.saved_boards.remember(app.project.clone(), None, None);
+    for host in ["east", "west"] {
+        app.saved_boards.remember(app.project.clone(), Some(format!("/fixture/{host}.neochat").into()), Some(format!("https://{host}.example.invalid/")));
+    }
+    app.options.invite = Some("/fixture/east.neochat".into());
+    app.options.project = Some(app.project.clone());
+    app.project_menu = true;
+}
 /// A server-rolled-up parent has started, but only the child has a lease.
 pub fn progress(app: &mut App) {
     load(app, true);

@@ -3,6 +3,9 @@
 mod docs;
 #[path = "mcp/extra.rs"]
 mod extra;
+#[path = "neochat-mcp/boards.rs"]
+mod boards;
+use boards::Connections;
 use clap::Parser;
 use neochat::{client::{Client, ClientError}, protocol::Action};
 use serde_json::{json, Value};
@@ -14,40 +17,61 @@ const TITLE_LIMIT: usize = 120;
 const TEXT_LIMIT: usize = 16384;
 
 #[derive(Parser)]
-#[command(about = "MCP stdio access to one Neoboard board; never executes board content")]
+#[command(about = "MCP stdio access to NeoBoard; never executes board content")]
 struct Args {
+    /// Require board_id on every board call. The JSON object maps safe IDs to a public
+    /// label and exactly one absolute invite or data_dir path. No fallback.
+    #[arg(long, value_name = "ABS FILE", conflicts_with_all = ["invite", "url", "token", "data_dir"])]
+    boards_file: Option<PathBuf>,
     /// Use this explicitly authorized saved board invite; never fall back to local discovery.
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["url", "token", "data_dir"])]
     invite: Option<PathBuf>,
-    #[arg(long, env = "NEOCHAT_URL", hide_env_values = true)]
+    /// Remote endpoint (default: NEOCHAT_URL).
+    #[arg(long)]
     url: Option<String>,
-    #[arg(long, env = "NEOCHAT_TOKEN", hide_env_values = true)]
+    /// Remote credential (default: NEOCHAT_TOKEN).
+    #[arg(long)]
     token: Option<String>,
-    /// Discover an already-running local board (no daemon launch or admin credential).
-    #[arg(long, env = "NEOCHAT_DATA_DIR")]
+    /// Discover an already-running local board (default: NEOCHAT_DATA_DIR; no admin credential).
+    #[arg(long, conflicts_with_all = ["url", "token"])]
     data_dir: Option<PathBuf>,
 }
 
+fn fail(message: &str) -> ! { eprintln!("{message}"); std::process::exit(2) }
+
+fn from_env(key: &str) -> Option<String> {
+    std::env::var_os(key).map(|v| v.into_string().unwrap_or_else(|_| fail("invalid remote connection environment")))
+}
+
 fn main() {
-    let args = Args::parse();
-    let client = if let Some(path) = args.invite.as_deref() {
-        let invite = neochat::invite_file::InviteFile::read(path).unwrap_or_else(|reason| {
-            eprintln!("Cannot use the selected board invite: {reason} Reopen NeoBoard Setup for that board.");
-            std::process::exit(2);
-        });
-        Client::new(&invite.endpoint, &invite.token, None)
-    } else { match (&args.url, &args.token, &args.data_dir) {
-        (Some(url), Some(token), _) => Client::new(url, token, None),
-        (None, None, dir) => Client::discover(dir.as_deref(), None),
-        _ => {
-            eprintln!("provide both NEOCHAT_URL and NEOCHAT_TOKEN (or --url/--token), or --data-dir for local discovery");
-            std::process::exit(2);
-        }
-    }}.unwrap_or_else(|_| {
-        eprintln!("cannot configure Neoboard client; check endpoint and board credential");
-        std::process::exit(2);
+    // Parser diagnostics can quote an unexpected argument, including a mistyped credential.
+    let args = Args::try_parse().unwrap_or_else(|err| {
+        if !err.use_stderr() { err.exit(); } // --help
+        fail("invalid or conflicting connection arguments; see --help")
     });
-    if serve(client).is_err() {
+    let connections = if let Some(file) = args.boards_file {
+        if ["NEOCHAT_URL", "NEOCHAT_TOKEN", "NEOCHAT_DATA_DIR"].iter().any(|k| std::env::var_os(k).is_some()) {
+            fail("--boards-file conflicts with single-board connection environment");
+        }
+        Connections::load(&file).unwrap_or_else(|| fail("cannot configure boards from --boards-file"))
+    } else {
+        let client = if let Some(path) = args.invite {
+            let invite = neochat::invite_file::InviteFile::read(&path).unwrap_or_else(|reason| {
+                fail(&format!("Cannot use the selected board invite: {reason} Reopen NeoBoard Setup for that board."))
+            });
+            Client::new(&invite.endpoint, &invite.token, None)
+        } else if let Some(path) = args.data_dir {
+            Client::discover(Some(&path), None)
+        } else {
+            match (args.url.or_else(|| from_env("NEOCHAT_URL")), args.token.or_else(|| from_env("NEOCHAT_TOKEN"))) {
+                (Some(url), Some(token)) => Client::new(&url, &token, None),
+                (None, None) => Client::discover(None, None),
+                _ => fail("provide both NEOCHAT_URL and NEOCHAT_TOKEN (or --url/--token), or --data-dir for local discovery"),
+            }
+        }.unwrap_or_else(|_| fail("cannot configure Neoboard client; check endpoint and board credential"));
+        Connections::Single(client)
+    };
+    if serve(connections).is_err() {
         eprintln!("MCP stdio transport closed");
         std::process::exit(1);
     }
@@ -90,14 +114,16 @@ fn mcp_sender(info: &Value) -> String {
     "mcp".into()
 }
 
-fn serve(mut client: Client) -> io::Result<()> {
+fn serve(mut connections: Connections) -> io::Result<()> {
     let mut input = io::stdin().lock();
     let mut output = io::stdout().lock();
     let mut initialized = false;
     while let Some(bytes) = line(&mut input)? {
         let response = match serde_json::from_slice::<Value>(&bytes) {
             Err(_) => Some(error(Value::Null, -32700, "invalid JSON or frame exceeds 128 KiB")),
-            Ok(request) => dispatch(&mut client, request, &mut initialized),
+            Ok(request) if matches!(connections, Connections::Registry(_)) && request["method"] == "tools/call"
+                && !boards::unambiguous_call(&bytes) => request.get("id").map(|id| error(id.clone(), -32602, "ambiguous or invalid tool call")),
+            Ok(request) => dispatch(&mut connections, request, &mut initialized),
         };
         if let Some(response) = response {
             serde_json::to_writer(&mut output, &response)?;
@@ -108,7 +134,7 @@ fn serve(mut client: Client) -> io::Result<()> {
     Ok(())
 }
 
-fn dispatch(client: &mut Client, r: Value, initialized: &mut bool) -> Option<Value> {
+fn dispatch(connections: &mut Connections, r: Value, initialized: &mut bool) -> Option<Value> {
     let id = r.get("id").cloned().unwrap_or(Value::Null);
     if !r.is_object() || r["jsonrpc"] != "2.0" || !r["method"].is_string()
         || r.get("id").is_some_and(|v| !(v.is_string() || v.is_i64() || v.is_u64()))
@@ -129,7 +155,7 @@ fn dispatch(client: &mut Client, r: Value, initialized: &mut bool) -> Option<Val
                 _ => "2025-11-25",
             };
             *initialized = true;
-            *client = client.clone().with_sender(&mcp_sender(&r["params"]["clientInfo"]));
+            connections.set_sender(&mcp_sender(&r["params"]["clientInfo"]));
             use base64::Engine as _;
             let png = base64::engine::general_purpose::STANDARD.encode(include_bytes!("../../design/NeoBoard.png"));
             json!({"protocolVersion":version,"capabilities":{"tools":{"listChanged":false}},
@@ -139,11 +165,11 @@ fn dispatch(client: &mut Client, r: Value, initialized: &mut bool) -> Option<Val
         }
         "ping" => json!({}),
         _ if !*initialized => return Some(error(id, -32002, "initialize first")),
-        "tools/list" => json!({"tools": tools()}),
+        "tools/list" => json!({"tools": tools(connections)}),
         "tools/call" => {
             let p = &r["params"];
             let Some(name) = p["name"].as_str() else { return Some(error(id, -32602, "tool name required")); };
-            let Some(tool) = tools().into_iter().find(|t| t["name"] == name) else {
+            let Some(tool) = tools(connections).into_iter().find(|t| t["name"] == name) else {
                 return Some(error(id, -32602, "unknown tool"));
             };
             let mut arguments = p.get("arguments").cloned().unwrap_or(json!({}));
@@ -178,7 +204,17 @@ fn dispatch(client: &mut Client, r: Value, initialized: &mut bool) -> Option<Val
                 }
                 arguments["text"] = json!(text);
             }
-            match call(client, name, &arguments) {
+            let result = if name == "boards_list" {
+                Ok(connections.list())
+            } else if name.starts_with("docs_") {
+                docs::call(name, &arguments)
+            } else {
+                let Some(client) = connections.select(&mut arguments) else {
+                    return Some(error(id, -32602, "unknown board_id; see boards_list"));
+                };
+                call(client, name, &arguments)
+            };
+            match result {
                 Ok(value) => json!({"content":[{"type":"text","text":value.to_string()}],"structuredContent":value,"isError":false}),
                 Err(code) => json!({"content":[{"type":"text","text":code}],"structuredContent":{"error":{"code":code}},"isError":true}),
             }
@@ -188,7 +224,7 @@ fn dispatch(client: &mut Client, r: Value, initialized: &mut bool) -> Option<Val
     Some(json!({"jsonrpc":"2.0","id":id,"result":result}))
 }
 
-fn tools() -> Vec<Value> {
+fn tools(connections: &Connections) -> Vec<Value> {
     let channel = json!({"type":"string","minLength":1,"maxLength":128});
     let text = json!({"type":"string","minLength":1,"maxLength":16384});
     let title = json!({"type":"string","minLength":1,"maxLength":TITLE_LIMIT,"description":"Short, nonblank single-line task title."});
@@ -222,9 +258,21 @@ fn tools() -> Vec<Value> {
         ("tasks_update", "Replace editable task fields. Omitted description, labels, dependencies, assignee and parent are cleared.", json!({"id":id,"title":title,"description":description,"labels":labels,"needs":needs,"assignee":channel,"parent":id}), vec!["id","title"]),
         ("tasks_acknowledge", "Set or clear your own acknowledgement on a global task.", json!({"id":id,"done":{"type":"boolean"}}), vec!["id","done"]),
     ];
-    definitions.into_iter().map(|(name, description, properties, required)| json!({
+    let mut tools: Vec<_> = definitions.into_iter().map(|(name, description, properties, required)| json!({
         "name":name,"description":description,"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false}
-    })).chain(docs::tools()).chain(extra::tools(&channel,&text,&id,&cursor,&limit,&labels)).collect()
+    })).chain(docs::tools()).chain(extra::tools(&channel,&text,&id,&cursor,&limit,&labels)).collect();
+    if matches!(connections, Connections::Registry(_)) {
+        for tool in &mut tools {
+            if tool["name"].as_str().unwrap().starts_with("docs_") { continue; }
+            let schema = &mut tool["inputSchema"];
+            schema["properties"]["board_id"] = json!({"type":"string","minLength":1,"maxLength":128,"description":"Exact board ID from boards_list."});
+            schema["required"].as_array_mut().unwrap().push(json!("board_id"));
+        }
+        tools.push(json!({"name":"boards_list","description":"List configured boards by public ID and label.",
+            "annotations":{"readOnlyHint":true,"openWorldHint":false},
+            "inputSchema":{"type":"object","properties":{},"required":[],"additionalProperties":false}}));
+    }
+    tools
 }
 
 // Validate the exact small JSON Schema vocabulary above; unknown fields are rejected.
@@ -254,7 +302,6 @@ fn task_fields(text: &str) -> (Value, Value) {
 }
 
 fn call(c: &Client, name: &str, a: &Value) -> Result<Value, &'static str> {
-    if name.starts_with("docs_") { return docs::call(name, a); }
     if let Some(result) = extra::call(c, name, a) { return result; }
     let n = |key: &str, default| a[key].as_u64().unwrap_or(default);
     let string = |key: &str| a[key].as_str().unwrap_or("").to_owned();

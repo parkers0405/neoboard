@@ -68,7 +68,8 @@ pub enum Command {
     Upload { message: u64, path: PathBuf },
     Download { id: u64, path: PathBuf },
 }
-pub type BoardSetup = (String, Snapshot, neochat::protocol::Member, Option<PathBuf>);
+pub struct HostedBoard { pub path: PathBuf, pub endpoint: String }
+pub type BoardSetup = (String, Snapshot, neochat::protocol::Member, Option<HostedBoard>);
 pub enum JoinSource { File(PathBuf), Link(neochat::invite_file::InviteFile) }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -139,12 +140,32 @@ fn save_download(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
     file.write_all(bytes).and_then(|_| file.sync_all()).map_err(|e| format!("Save failed (partial file may remain): {e}"))
 }
 
+/// The membership this device already holds for the invite's board, if it still works.
+fn membership(stored: &std::path::Path, invite: &neochat::invite_file::InviteFile, profile: Option<&str>) -> Option<(neochat::invite_file::InviteFile, PathBuf)> {
+    let mut files: Vec<_> = std::fs::read_dir(stored).ok()?.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "neochat")).collect();
+    files.sort();
+    files.into_iter().take(256).find_map(|path| {
+        let held = neochat::invite_file::InviteFile::read(&path).ok()?;
+        if held.project.is_none() || held.project != invite.project || held.endpoint != invite.endpoint || held.token == invite.token { return None; }
+        Client::new(&held.endpoint, &held.token, profile).ok()?.my_member().ok()?;
+        Some((held, path))
+    })
+}
+
 fn join_board(source: JoinSource, name: Option<&str>, expected: Option<&str>, profile: Option<&str>) -> Result<BoardSetup, String> {
-    let (invite, path) = match source {
+    let (mut invite, mut path) = match source {
         JoinSource::File(path) => (neochat::invite_file::InviteFile::read(&path)?, Some(path)),
         JoinSource::Link(invite) => (invite, None),
     };
-    let client = Client::new(&invite.endpoint, &invite.token, profile).map_err(|e| e.to_string())?.with_sender("desktop");
+    let stored = crate::preferences_path().map(|p| p.with_file_name("invites"));
+    let kept = |path: &Option<PathBuf>| path.as_ref().is_some_and(|p| p.parent().is_some() && p.parent() == stored.as_deref());
+    // The host's link changes every day. Someone opening a new one for a board this device
+    // has already joined stays the member they were, with their name and their tasks.
+    if !kept(&path) && let Some((held, at)) = stored.as_deref().and_then(|dir| membership(dir, &invite, profile)) {
+        invite = held;
+        path = Some(at);
+    }
+    let mut client = Client::new(&invite.endpoint, &invite.token, profile).map_err(|e| e.to_string())?.with_sender("desktop");
     let snapshot = client.snapshot().map_err(|e| e.to_string())?;
     let available = crate::projects::available(&snapshot, true);
     let id = match invite.project.clone() {
@@ -154,13 +175,24 @@ fn join_board(source: JoinSource, name: Option<&str>, expected: Option<&str>, pr
         None => return Err("Ask the host for an invite scoped to one board.".into()),
     };
     if expected.is_some_and(|expected| expected != id) { return Err("The invite no longer points to this board.".into()); }
+    // One link is opened by several people. Each takes a credential of their own here,
+    // or they would all be one member sharing one name. Reconnecting must use it, so it
+    // replaces an invite this app stored; a file the user chose keeps the shared invite
+    // and the credential goes in a private copy.
+    if let Some(personal) = client.join().map_err(|e| e.to_string())? {
+        invite.token = personal.token;
+        // The host renews a membership while it is used, so only the host can say it has ended.
+        invite.expires_at = i64::MAX as u64;
+        if kept(&path) { invite.replace(path.as_ref().unwrap())?; } else { path = None; }
+        client = Client::new(&invite.endpoint, &invite.token, profile).map_err(|e| e.to_string())?.with_sender("desktop");
+    }
     if let Some(name) = name { client.set_display_name(name).map_err(|e| e.to_string())?; }
     let member = client.my_member().map_err(|e| e.to_string())?;
     let path = match path {
         Some(path) => path,
         None => invite.store(&crate::preferences_path().ok_or("No settings directory available.")?.with_file_name("invites"))?,
     };
-    Ok((id, snapshot, member, Some(path)))
+    Ok((id, snapshot, member, Some(HostedBoard { path, endpoint: invite.endpoint })))
 }
 
 pub fn start(mut opts: Options, wake: rune::Waker) -> (mpsc::SyncSender<Command>, mpsc::Receiver<Update>) {
@@ -200,9 +232,9 @@ pub fn start(mut opts: Options, wake: rune::Waker) -> (mpsc::SyncSender<Command>
                 })()
             };
             let success = result.is_ok();
-            if let Ok((id, _, _, path)) = &result {
-                opts.invite = path.clone();
-                opts.project = path.as_ref().map(|_| id.clone());
+            if let Ok((id, _, _, hosted)) = &result {
+                opts.invite = hosted.as_ref().map(|h| h.path.clone());
+                opts.project = hosted.as_ref().map(|_| id.clone());
                 opts.endpoint = None;
             }
             (send(Update::BoardSetup(result)), success)

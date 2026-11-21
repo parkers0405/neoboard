@@ -63,7 +63,10 @@ fn board_icon(remote:bool, size:f32)->El {
     rune::icon(if remote{&CLOUD}else{&FOLDER},size).color(gray(170))
 }
 fn board_picker(app: &App, scale: f32) -> El {
-    let name = if app.project.is_empty() { "Boards" } else { &app.project };
+    let hosted = app.options.invite.as_ref().and_then(|path| app.saved_boards.entries().iter()
+        .position(|p| p.project == app.project && p.invite.as_ref() == Some(path)));
+    let name = if let Some(i) = hosted { format!("Host {} · {}", i + 1, app.project) }
+        else if app.project.is_empty() { "Boards".into() } else { app.project.clone() };
     let font = TextStyle::new(12. * scale, 600.);
     row().key("projects-toggle").max_w(170. * scale).h(26. * scale).px(8. * scale).gap(8. * scale)
         .items_center().radius(5.).hover_alone().hover(gray(34))
@@ -646,7 +649,17 @@ fn setup_drawer(app:&App, width: f32)->El {
         .child(el().w_full().scroll_x().child(label(contents).font(TextStyle::new(11.,400.))));
     let p=app.project.as_str();
     let guide = setup_guide::Guide::new(app);
-    let picker = agent_picker(app);
+    let mut picker = agent_picker(app);
+    if guide.install.is_some() {
+        let shown_key = guide.key.clone();
+        picker = picker.child(dialog_action(button("Add board to Neoism", move |a| setup_guide::add_board(a, &shown_key))).key("setup-add-neoism"));
+        let status = app.setup_session.status(&guide.key);
+        if !status.is_empty() { picker = picker.child(muted(status).wrap()); }
+        if let Some(ticket) = app.setup_session.replacement(&guide.key).cloned() {
+            let key = guide.key.clone();
+            picker = picker.child(dialog_action(button("Replace existing neoboard binding", move |a| setup_guide::confirm(a, &key, &ticket))).key("setup-replace-neoism"));
+        }
+    }
     let mut cards=col().w_full().padding(16.).gap(12.)
         .child(row().w_full().gap(5.).items_center().child(label("Follow these steps").wrap().w(0.).grow(1.))
             .child(copy("copy-setup","Copy for agent",guide.copy_text())))
@@ -933,32 +946,43 @@ fn status_name(index: usize) -> String {
 fn board_menu(app: &App, x: f32, y: f32, viewport: [f32; 2], chrome: f32) -> El {
         static SHARE: rune::Icon = rune::Icon { name: "Share board", view: 24., body: r#"<path d="M12 15V3m-4 4 4-4 4 4M7 10H5a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-8a1 1 0 0 0-1-1h-2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>"# };
         let scale = app.zoom.factor();
-        let width = (viewport[0] - 8.).clamp(1., 208.);
+        let width = (viewport[0] - 8.).clamp(1., 300.);
         let x = x.clamp(4., (viewport[0] - width - 4.).max(4.));
-        let y = y.clamp(4., (viewport[1] - 52.).max(4.));
-        let list_height = (viewport[1] - y - 52.).clamp(0.,135.);
+        let y = y.clamp(4., (viewport[1] - 84.).max(4.));
+        let list_height = (viewport[1] - y - 84.).clamp(0.,210.);
         let mut entries = col().w_full().gap(2.);
-        let local_projects = app.projects();
-        let mut ids = local_projects.clone();
-        ids.extend(app.saved_boards.keys().map(String::as_str));
-        for id in ids {
-            let share = (local_projects.contains(id) && (!app.remote() || id == app.project)).then(|| {
+        let live = app.projects();
+        let profiles = app.saved_boards.entries();
+        let on_server = |p: &saved_boards::BoardProfile| app.options.endpoint.is_none() && app.options.invite == p.invite;
+        let discovered = live.iter().copied().filter(|id| !profiles.iter().any(|p| on_server(p) && p.project == *id));
+        let rows = profiles.iter().enumerate().map(|(i,p)| (p.project.as_str(), Some((i,p)), on_server(p)))
+            .chain(discovered.map(|id| (id, None, true)));
+        for (id, saved, current_server) in rows {
+            let active = current_server && id == app.project;
+            let share = (current_server && live.contains(id) && (!app.remote() || active)).then(|| {
                 let id = id.to_owned();
                 el().key(format!("share-board-{id}")).size(26.,26.).center().radius(5.).hover(gray(56))
                     .child(rune::icon(&SHARE, 15.).color(splash::wordmark_ink())).on_press(move |a: &mut App| a.open_board_share(&id))
             });
-            let remote = if local_projects.contains(id) {app.remote()} else {app.saved_boards.get(id).is_some_and(Option::is_some)};
+            let remote = saved.map_or_else(|| app.remote(), |(_,p)| p.invite.is_some());
+            let location = match saved {
+                Some((i, p)) if remote => format!("Host {} · {}", i+1, p.endpoint.as_deref().map(|s| s.trim_start_matches("https://").trim_end_matches('/')).unwrap_or("Saved invite")),
+                _ if remote => "Current server".into(),
+                _ => "Local".into(),
+            };
+            let key = saved.map_or_else(|| format!("project-{id}"), |(i,_)| format!("saved-board-{i}"));
+            let profile = saved.map(|(_,p)| p.clone());
             let id = id.to_owned();
-            entries = entries.child(row().key(format!("project-{id}")).w_full().h(32.).px(6.).gap(4.).items_center().radius(5.).hover_group_focus().hover(gray(36))
-                .child(row().w(0.).grow(1.).h_full().items_center().gap(4.).child(board_icon(remote,15.)).child(label(&id).truncate().shrink()).child(spacer())
-                    .child(muted(if id == app.project {"✓"}else{""})).on_press(move |a: &mut App| a.switch_board(&id)))
+            entries = entries.child(row().w_full().h(44.).px(6.).gap(4.).items_center().radius(5.).hover_group_focus().hover(gray(36))
+                .child(row().key(key).w(0.).grow(1.).h_full().items_center().gap(6.).child(board_icon(remote,15.))
+                    .child(col().w(0.).grow(1.).child(label(&id).truncate()).child(muted(location).truncate()))
+                    .child(muted(if active {"✓"}else{""})).on_press(move |a: &mut App| {
+                        if let Some(p) = &profile { a.switch_saved_board(p); } else { a.select_project(&id); }
+                    }))
                 .children(share));
         }
         col().key("projects-menu").absolute(x * scale, chrome + y * scale).origin(0.,0.).scale(scale).w(width).padding(6.).gap(4.).fill(gray(0)).border(1.,gray(62)).radius(8.)
             .child(col().w_full().max_h(list_height).scroll(ScrollSpec {stick_bottom:false}).child(entries))
-            .child(line()).child(button("Add new +", |a| {
-                a.project_menu = false;
-                if !a.project.is_empty() { a.begin_add_board(); }
-            }).key("add-board").w_full().radius(5.).hover(gray(36)))
+            .child(line()).child(button("Add board", App::begin_add_board).key("add-board").w_full().radius(5.).hover(gray(36)))
             .modal(true, |a: &mut App| a.project_menu = false)
 }

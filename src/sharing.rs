@@ -273,20 +273,22 @@ impl Sharing {
         if reuse {
             if let Some(invite) = self.lookup(&request.project, &endpoint)? { return Ok(invite); }
         }
-        let invite = self.issue_invite(endpoint, request).await?;
+        let invite = self.issue_invite(endpoint, request, reuse).await?;
         self.remember(&invite).map_err(|_| internal_error())?;
         Ok(invite)
     }
 
-    async fn issue_invite(&self, endpoint: String, request: ShareRequest) -> Result<InviteFile, (StatusCode, String)> {
+    async fn issue_invite(&self, endpoint: String, request: ShareRequest, shared: bool) -> Result<InviteFile, (StatusCode, String)> {
         let board = self.board.clone();
         let admin = self.admin_token.clone();
         let expires_at = now() + 86_400;
         let scope = format!("{}/*", request.project);
         let actor = request.actor.clone();
-        let invite = tokio::task::spawn_blocking(move || board.create_invite(&admin, InviteRequest {
-            actor, channels: vec![scope], expires_at: Some(expires_at),
-        })).await.map_err(|_| internal_error())?.map_err(board_error)?;
+        // The desktop link is handed to several people; a named CLI invite is one actor.
+        let invite = tokio::task::spawn_blocking(move || {
+            let request = InviteRequest { actor, channels: vec![scope], expires_at: Some(expires_at) };
+            if shared { board.create_shared_invite(&admin, request) } else { board.create_invite(&admin, request) }
+        }).await.map_err(|_| internal_error())?.map_err(board_error)?;
 
         // Only the scoped guest credential ever traverses the tunnel. /v1/me
         // checks that the public origin serves this board without fetching its history.
@@ -535,7 +537,7 @@ mod tests {
         let sharing = service(dir.path());
         // Stand in for the SDK's forwarding leg; no public service is called.
         let (endpoint, task) = serve(crate::router(sharing.board.clone())).await;
-        let invite = sharing.issue_invite(endpoint, request()).await.unwrap();
+        let invite = sharing.issue_invite(endpoint, request(), false).await.unwrap();
         assert_eq!(invite.project.as_deref(), Some("team"));
         assert!(invite.expires_at > now() + 86_000);
         sharing.board.action(HOST, None, None, Action::CreateChannel { channel: "team/new".into() }).unwrap();
@@ -549,10 +551,19 @@ mod tests {
         let sharing = service(dir.path());
         let (endpoint, task) = serve(crate::router(sharing.board.clone())).await;
         let first = sharing.invite_for_endpoint(endpoint.clone(), request(), false).await.unwrap();
-        let desktop = sharing.invite_for_endpoint(endpoint.clone(), request(), true).await.unwrap();
-        assert!(desktop.token == first.token);
-        let second = sharing.invite_for_endpoint(endpoint.clone(), ShareRequest { actor: "writer".into(), ..request() }, false).await.unwrap();
-        assert!(second.token != first.token);
+        // An invite issued to one named actor is never handed to everyone using the desktop link.
+        let guest = |actor: &str| ShareRequest { actor: actor.into(), ..request() };
+        let desktop = sharing.invite_for_endpoint(endpoint.clone(), guest("guest-a"), true).await.unwrap();
+        assert!(desktop.token != first.token);
+        assert!(sharing.board.join(&first.token).is_err());
+        assert!(sharing.board.join(&desktop.token).is_ok());
+        let again = sharing.invite_for_endpoint(endpoint.clone(), guest("guest-b"), true).await.unwrap();
+        assert!(again.token == desktop.token);
+        let writer = sharing.invite_for_endpoint(endpoint.clone(), guest("writer"), false).await.unwrap();
+        assert!(writer.token != first.token);
+        assert!(sharing.lookup("team", &endpoint).unwrap().is_none());
+        let second = sharing.invite_for_endpoint(endpoint.clone(), guest("guest-c"), true).await.unwrap();
+        assert!(second.token != desktop.token);
         assert!(sharing.lookup("team", &endpoint).unwrap().unwrap().token == second.token);
         assert!(sharing.lookup("team-sandbox", &endpoint).unwrap().is_none());
         assert!(sharing.lookup("team", "https://other.example/").unwrap().is_none());
@@ -570,7 +581,7 @@ mod tests {
         sharing.remember(&forged).unwrap();
         assert!(sharing.lookup("team", &endpoint).unwrap().is_none());
 
-        let record = sharing.board.create_invite(ADMIN, InviteRequest { actor: "revocable".into(), channels: vec!["team/*".into()], expires_at: Some(second.expires_at) }).unwrap();
+        let record = sharing.board.create_shared_invite(ADMIN, InviteRequest { actor: "revocable".into(), channels: vec!["team/*".into()], expires_at: Some(second.expires_at) }).unwrap();
         let revocable = InviteFile { token: record.token, ..second };
         sharing.remember(&revocable).unwrap();
         assert!(sharing.lookup("team", &endpoint).unwrap().is_some());
@@ -586,7 +597,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sharing = service(dir.path());
         let expiry = now() + 600;
-        let guest = sharing.board.create_invite(ADMIN, InviteRequest { actor: "reviewer".into(), channels: vec!["team/*".into()], expires_at: Some(expiry) }).unwrap();
+        let guest = sharing.board.create_shared_invite(ADMIN, InviteRequest { actor: "reviewer".into(), channels: vec!["team/*".into()], expires_at: Some(expiry) }).unwrap();
         let endpoint = "https://fixture.example/";
         sharing.remember(&InviteFile { version: 1, project: Some("team".into()), endpoint: endpoint.into(), expires_at: expiry, token: guest.token }).unwrap();
         let path = sharing.cache_path("team");

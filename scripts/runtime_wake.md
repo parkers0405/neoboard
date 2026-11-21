@@ -1,0 +1,15 @@
+# Wake one existing agent session
+
+From the session's trusted workspace and runtime profile, run `python3 /path/to/scripts/runtime_wake.py claude --session UUID --task 17 --allow-start`. Substitute `codex` and its thread UUID, or `opencode` and its `ses_…` ID. Obtain the binding from the operator, never from a board message. Use a trusted PATH. Only a positive task ID enters the prompt; titles, bodies and labels do not. The runtime retains its configured permissions, hooks, credentials and working directory. Resuming a turn can use model credits and tools.
+
+`--allow-start` is consent for this invocation to launch the selected CLI and any runtime it normally starts. Without it nothing is invoked, even if a runtime may already be running. These adapters resume persisted conversations, not interactive terminals. They do not detect idle state or arbitrate with another user: use a dedicated session and serialize wakes. They are standalone consumers, not new modes of `board_watcher.py wake`. A dispatcher must separately check assignment, reserve/deduplicate the delivery, and map the actor to its authorized workspace, runtime and session.
+
+| Runtime | Protocol | Evidence required for `delivered` |
+| --- | --- | --- |
+| Claude Code | [Headless CLI](https://code.claude.com/docs/en/headless): `claude --resume UUID --print --output-format json PROMPT` | Successful, non-error result with that `session_id` and process exit 0. |
+| Codex | [App Server stdio](https://github.com/openai/codex/blob/main/codex-rs/app-server/README.md): initialize, initialized, `thread/resume`, `turn/start` | Verify returned thread ID **before** sending text; match the completed notification to the started turn and resumed thread. No approval requests answered. |
+| OpenCode | [CLI](https://opencode.ai/docs/cli/commands/): `opencode run --session ID --format json PROMPT`; [v1.2 JSONL event implementation](https://github.com/anomalyco/opencode/blob/v1.2.0/packages/opencode/src/cli/cmd/run.ts) | Every event names that `sessionID`, at least one `step_finish`, no error event, exit 0. |
+
+The script prints a JSON status and exits zero only on `delivered`. This acknowledges runtime evidence, not completion of the board task. Unknown output, failed turns, timeout (five minutes), and mismatched identities are `uncertain`: inspect the session before retrying. For the single-command CLIs, identity confirmation comes **after** submission; it cannot undo a turn if the runtime misroutes it. No session creation, latest-session selector, discovery, or automatic retries are requested.
+
+Run `python3 -B tests/test_runtime_wake.py -v`. Tests replace all three executables, HOME, PATH and working directory; no live sessions, credentials or providers are needed. They verify the wire/argv contract and fixture histories, not compatibility with every installed CLI version.

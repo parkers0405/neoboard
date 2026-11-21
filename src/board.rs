@@ -35,6 +35,11 @@ pub fn random_token() -> String {
     let mut bytes = [0u8; 32]; rand::thread_rng().fill_bytes(&mut bytes);
     bytes.iter().map(|v| format!("{v:02x}")).collect()
 }
+/// Bounds how many identities one leaked link can mint.
+const MAX_INVITE_MEMBERS: u64 = 10_000;
+/// A member stays the same actor for as long as they keep coming back. The link they
+/// joined with only admits new people and expires on its own, much sooner.
+const MEMBER_LIFETIME: u64 = 30 * 86_400;
 fn digest(token: &str) -> String { format!("{:x}", Sha256::digest(token.as_bytes())) }
 
 #[derive(Clone)]
@@ -76,6 +81,8 @@ impl Board {
             CREATE TABLE IF NOT EXISTS credentials(id INTEGER PRIMARY KEY AUTOINCREMENT, hash TEXT UNIQUE NOT NULL, actor TEXT UNIQUE NOT NULL, channels TEXT NOT NULL, expires INTEGER, revoked INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS actor_display_names(credential INTEGER PRIMARY KEY REFERENCES credentials(id), name TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS credential_grants(credential INTEGER PRIMARY KEY REFERENCES credentials(id), grants TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS shared_invites(credential INTEGER PRIMARY KEY REFERENCES credentials(id));
+            CREATE TABLE IF NOT EXISTS invite_members(credential INTEGER PRIMARY KEY REFERENCES credentials(id), invite INTEGER NOT NULL REFERENCES credentials(id));
             CREATE TABLE IF NOT EXISTS task_blocks(message INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE, actor TEXT NOT NULL, reason TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS areas(board TEXT NOT NULL, name TEXT NOT NULL, PRIMARY KEY(board,name));
             CREATE TABLE IF NOT EXISTS sprints(id INTEGER PRIMARY KEY AUTOINCREMENT, board TEXT NOT NULL, title TEXT NOT NULL, description TEXT NOT NULL, finished INTEGER NOT NULL DEFAULT 0);
@@ -113,9 +120,13 @@ impl Board {
     }
     fn identity(db: &Connection, token: &str, required: Option<Grant>) -> Result<Identity> {
         let hash = digest(token);
-        let row = db.query_row("SELECT id,actor,channels,hash FROM credentials WHERE hash IN (?1,?2) AND revoked=0 AND (expires IS NULL OR expires>?3)",
-            params![hash,format!("restricted:{hash}"),now()], |r| Ok((r.get(0)?,r.get(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?))).optional()?;
-        let (id,actor,channels,stored_hash) = row.ok_or_else(unauthorized)?;
+        let row = db.query_row("SELECT id,actor,channels,hash,expires FROM credentials WHERE hash IN (?1,?2) AND revoked=0 AND (expires IS NULL OR expires>?3)",
+            params![hash,format!("restricted:{hash}"),now()], |r| Ok((r.get(0)?,r.get(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,Option<u64>>(4)?))).optional()?;
+        let (id,actor,channels,stored_hash,expires): (u64,String,String,String,Option<u64>) = row.ok_or_else(unauthorized)?;
+        // Using a membership renews it, at most once a day, so only an abandoned one lapses.
+        if expires.is_some_and(|at| at < now() + MEMBER_LIFETIME - 86_400) {
+            db.execute("UPDATE credentials SET expires=?1 WHERE id=?2 AND id IN (SELECT credential FROM invite_members)", params![now() + MEMBER_LIFETIME, id])?;
+        }
         if stored_hash != hash {
             let json: String = db.query_row("SELECT grants FROM credential_grants WHERE credential=?1", [id], |r| r.get(0))?;
             let allowed: BTreeSet<Grant> = serde_json::from_str(&json)?;
@@ -126,10 +137,40 @@ impl Board {
     pub fn create_invite(&self, admin: &str, request: InviteRequest) -> Result<Invite> {
         self.issue(admin, request, None)
     }
+    /// An invite several people may open. Each of them exchanges it with `join` for an
+    /// identity of their own, so a display name or a task never belongs to all of them.
+    pub fn create_shared_invite(&self, admin: &str, request: InviteRequest) -> Result<Invite> {
+        let invite = self.issue(admin, request, None)?;
+        self.lock()?.execute("INSERT INTO shared_invites VALUES (?1)", [sql_id(invite.id)?])?;
+        Ok(invite)
+    }
+    /// Exchange a shared invite for a personal credential with the invite's scope. It
+    /// outlives the invite, renewing while it is used. Revoking the invite revokes every
+    /// credential issued from it.
+    pub fn join(&self, token: &str) -> Result<Invite> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let invite = Self::identity(&tx, token, None)?;
+        let shared: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM shared_invites WHERE credential=?1)", [invite.id], |r| r.get(0))?;
+        if !shared { return Err(conflict("this credential already identifies one actor")); }
+        let members: u64 = tx.query_row("SELECT COUNT(*) FROM invite_members m JOIN credentials c ON c.id=m.credential WHERE m.invite=?1 AND c.revoked=0", [invite.id], |r| r.get(0))?;
+        if members >= MAX_INVITE_MEMBERS { return Err(BoardError(StatusCode::TOO_MANY_REQUESTS, "this invite has been joined too many times; ask the host for a new one".into())); }
+        let expires = Some(now() + MEMBER_LIFETIME);
+        let personal = random_token();
+        let actor = format!("guest-{}", &random_token()[..16]);
+        let channels = serde_json::to_string(&invite.channels)?;
+        tx.execute("INSERT INTO credentials(hash,actor,channels,expires) VALUES (?1,?2,?3,?4)", params![digest(&personal),actor,channels,expires])?;
+        let id = tx.last_insert_rowid() as u64;
+        tx.execute("INSERT INTO invite_members VALUES (?1,?2)", params![id,invite.id])?;
+        tx.commit()?;
+        Ok(Invite { id, token: personal, actor, channels: invite.channels, expires_at: expires })
+    }
     /// Match an unrestricted guest bearer to exactly one board, including its authoritative lifetime.
+    /// Only a shared invite is handed out again: one issued before `join` existed would
+    /// keep putting everyone who opens it behind a single identity.
     pub(crate) fn reusable_guest(&self, token: &str, project: &str, expires: u64) -> Result<bool> {
         if expires <= now() || expires > i64::MAX as u64 { return Ok(false); }
-        Ok(self.lock()?.query_row("SELECT EXISTS(SELECT 1 FROM credentials WHERE hash=?1 AND actor NOT IN ('local','system') AND channels=?2 AND expires=?3 AND revoked=0)",
+        Ok(self.lock()?.query_row("SELECT EXISTS(SELECT 1 FROM credentials WHERE hash=?1 AND actor NOT IN ('local','system') AND channels=?2 AND expires=?3 AND revoked=0 AND id IN (SELECT credential FROM shared_invites))",
             params![digest(token), serde_json::to_string(&[format!("{project}/*")])?, expires], |row| row.get(0))?)
     }
     fn issue(&self, admin: &str, request: InviteRequest, grants: Option<BTreeSet<Grant>>) -> Result<Invite> {
@@ -164,6 +205,11 @@ impl Board {
         let tx = db.transaction()?;
         if tx.execute("UPDATE credentials SET revoked=1 WHERE id=?1 AND actor!='local'", [sql_id(id)?])? == 0 { return Err(invalid("unknown invite")); }
         Self::cancel_pending(&tx,id)?;
+        let members = tx.prepare("SELECT credential FROM invite_members WHERE invite=?1")?.query_map([sql_id(id)?], |r| r.get::<_,u64>(0))?.collect::<std::result::Result<Vec<_>,_>>()?;
+        for member in members {
+            tx.execute("UPDATE credentials SET revoked=1 WHERE id=?1", [sql_id(member)?])?;
+            Self::cancel_pending(&tx,member)?;
+        }
         tx.commit()?; Ok(())
     }
     fn revoke_grant(&self, admin: &str, id: u64, grant: Grant) -> Result<()> {
@@ -256,13 +302,14 @@ impl Board {
         Ok(result)
     }
     /// Directory membership is based on live credentials, never message authors.
+    /// A shared invite is a key rather than a person unless an older client named it.
     /// Check the caller before reading identities, including for future channels.
     pub fn members(&self, token: &str, channel: &str) -> Result<Vec<Member>> {
         let db = self.lock()?;
         let caller = Self::identity(&db, token, Some(Grant::Read))?;
         caller.check(channel)?;
         validate_channel(channel)?;
-        let rows = db.prepare("SELECT c.id,c.actor,c.channels,n.name FROM credentials c LEFT JOIN actor_display_names n ON n.credential=c.id WHERE c.revoked=0 AND (c.expires IS NULL OR c.expires>?1) ORDER BY c.actor")?
+        let rows = db.prepare("SELECT c.id,c.actor,c.channels,n.name FROM credentials c LEFT JOIN actor_display_names n ON n.credential=c.id WHERE c.revoked=0 AND (c.expires IS NULL OR c.expires>?1) AND NOT (n.name IS NULL AND c.id IN (SELECT credential FROM shared_invites)) ORDER BY c.actor")?
             .query_map([now()], |r| Ok((r.get::<_,u64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,Option<String>>(3)?)))?
             .collect::<std::result::Result<Vec<_>,_>>()?;
         let mut members = Vec::new();
@@ -1038,7 +1085,7 @@ pub fn router(board: Board) -> Router {
         .route("/v1/reactions",get(http_reactions)).route("/v1/schedules",get(http_schedules))
         .route("/v1/organization",get(http_organization))
         .route("/v1/owned-areas",get(http_owned_areas))
-        .route("/v1/members",get(http_members)).route("/v1/display-name",post(http_display_name)).route("/v1/me",get(http_me))
+        .route("/v1/members",get(http_members)).route("/v1/display-name",post(http_display_name)).route("/v1/me",get(http_me)).route("/v1/join",post(http_join))
         .route("/v1/admin/invites",post(http_invite)).route("/v1/admin/restricted-invites",post(http_restricted_invite))
         .route("/v1/admin/invites/{id}",delete(http_revoke).get(http_explain))
         .route("/v1/admin/invites/{id}/grants/{grant}",delete(http_revoke_grant))
@@ -1081,6 +1128,9 @@ async fn http_me(State(board):State<Board>,headers:HeaderMap)->Result<Json<Membe
         let name=db.query_row("SELECT name FROM actor_display_names WHERE credential=?1",[who.id],|r|r.get(0)).optional()?;
         Ok(Member{actor:who.actor,display_name:name})
     }).await?))
+}
+async fn http_join(State(board):State<Board>,headers:HeaderMap)->Result<Json<Invite>> {
+    let token=bearer(&headers)?; Ok(Json(blocking(move||board.join(&token)).await?))
 }
 async fn http_members(State(board):State<Board>,headers:HeaderMap,Query(q):Query<MembersQuery>)->Result<Json<Vec<Member>>> {
     let token=bearer(&headers)?; Ok(Json(blocking(move||board.members(&token,&q.channel)).await?))

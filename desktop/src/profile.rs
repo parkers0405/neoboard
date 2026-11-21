@@ -37,7 +37,7 @@ pub fn local_name(fixture: bool) -> String {
     choose_name([env.as_deref(), configured, host.as_deref()])
 }
 
-fn config_dir() -> Option<std::path::PathBuf> {
+pub(crate) fn config_dir() -> Option<std::path::PathBuf> {
     if let Some(path) = std::env::var_os("NEOISM_CONFIG_HOME") { return Some(path.into()); }
     let home = dirs::home_dir()?;
     #[cfg(target_os = "windows")]

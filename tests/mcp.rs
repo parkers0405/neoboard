@@ -504,9 +504,147 @@ fn two_actors_coordinate_over_stdio_with_private_isolation() {
 
     // Explicit local discovery works with no admin-token file available.
     std::fs::remove_file(dir.path().join("admin-token")).unwrap();
-    let mut command = Peer::command(); command.arg("--data-dir").arg(dir.path());
+    let mut command = Peer::command(); command.arg("--data-dir").arg(dir.path())
+        .env("NEOCHAT_URL", "https://unused.invalid").env("NEOCHAT_TOKEN", "unused-test-value");
     let mut local = Peer::spawn(command, "integration-test");
     assert!(local.ok("channels", json!({}))["channels"].as_array().unwrap().iter().any(|c| c == "private"));
+}
+
+fn assert_startup_refused(command: &mut Command, secrets: &[&str]) {
+    let output = command.output().unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(!output.stderr.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(secrets.iter().all(|secret| !stderr.contains(secret)));
+}
+
+#[test]
+fn boards_file_routes_each_call_from_one_stdio_peer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let a = root.join("daemon-a");
+    let b = root.join("daemon-b");
+    let (_first, first) = daemon(&a);
+    let (_second, second) = daemon(&b);
+    let (alpha, beta) = ("neoboard-team-aaa", "neoboard-team-bbb");
+    let file = root.join("boards.json");
+    std::fs::write(&file, json!({(alpha):{"label":"Team","data_dir":a}, (beta):{"label":"Team","data_dir":b}}).to_string()).unwrap();
+    let mut command = Peer::command();
+    command.current_dir(&root).arg("--boards-file").arg(&file);
+    let mut peer = Peer::spawn(command, "routed");
+    assert_eq!(peer.ok("boards_list", json!({})), json!({"boards":[{"board_id":alpha,"label":"Team"},{"board_id":beta,"label":"Team"}]}));
+    let catalog = peer.rpc("tools/list", json!({}));
+    let text = catalog.to_string();
+    for private in [root.to_str().unwrap(), &first.url, &second.url, &first.token, &second.token] { assert!(!text.contains(private)); }
+    for tool in catalog["result"]["tools"].as_array().unwrap() {
+        let name = tool["name"].as_str().unwrap();
+        let scoped = name != "boards_list" && !name.starts_with("docs_");
+        let schema = &tool["inputSchema"];
+        assert_eq!(schema["properties"]["board_id"]["type"] == "string", scoped, "{name}");
+        assert_eq!(schema["required"].as_array().unwrap().contains(&json!("board_id")), scoped, "{name}");
+    }
+    peer.ok("docs_list", json!({}));
+    for (id, marker) in [(alpha, "alpha-only"), (beta, "beta-only")] {
+        peer.ok("post", json!({"board_id":id,"channel":"check","text":marker}));
+    }
+    for bad in [json!({}), json!({"board_id":"unknown"}), json!({"board_id":"Team"}), json!({"board_id":null})] {
+        let mut args = bad.clone();
+        args["channel"] = json!("check");
+        args["text"] = json!("misrouted");
+        assert_eq!(peer.rpc("tools/call", json!({"name":"post","arguments":args}))["error"]["code"], -32602);
+        assert_eq!(peer.rpc("tools/call", json!({"name":"read","arguments":bad}))["error"]["code"], -32602);
+    }
+    // Send raw JSON: json! would silently collapse the conflicting selectors.
+    writeln!(peer.input, r#"{{"jsonrpc":"2.0","id":700,"method":"tools/call","params":{{"name":"post","arguments":{{"board_id":"{alpha}","board_id":"{beta}","channel":"check","text":"misrouted"}}}}}}"#).unwrap();
+    peer.input.flush().unwrap();
+    assert_eq!(peer.receive()["error"]["code"], -32602);
+    // Independent, explicit connections prove the writes reached the intended daemons,
+    // not merely that routed reads and writes chose the same (possibly swapped) board.
+    for (id, d, yes, no) in [(alpha, &first, "alpha-only", "beta-only"), (beta, &second, "beta-only", "alpha-only")] {
+        let mut explicit = Peer::new(&d.url, &d.token, "observer");
+        let expected = explicit.ok("read", json!({"channel":"check"}));
+        let actual = peer.ok("read", json!({"board_id":id,"channel":"check"}));
+        assert_eq!(actual, expected);
+        let text = actual.to_string();
+        assert!(text.contains(yes) && !text.contains(no) && !text.contains("misrouted"));
+        assert_eq!(explicit.rpc("tools/call", json!({"name":"read","arguments":{"board_id":id}}))["error"]["code"], -32602);
+        assert_eq!(explicit.rpc("tools/call", json!({"name":"boards_list"}))["error"]["code"], -32602);
+    }
+}
+
+#[test]
+fn registry_preserves_scoped_credentials_and_revocation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let host_dir = tmp.path().join("host");
+    let (_daemon, d) = daemon(&host_dir);
+    let admin = Client::discover_admin(Some(&host_dir)).unwrap();
+    let invite = admin.restricted_invite(&InviteRequest {actor:"reader".into(),channels:vec!["work".into()],expires_at:None}, &[neochat::protocol::Grant::Read]).unwrap();
+    let scoped = tmp.path().join("scoped");
+    std::fs::create_dir(&scoped).unwrap();
+    std::fs::write(scoped.join("endpoint.json"), json!({"url":d.url,"token":invite.token}).to_string()).unwrap();
+    let file = tmp.path().join("boards.json");
+    std::fs::write(&file, json!({"host":{"label":"Host","data_dir":host_dir},"guest":{"label":"Guest","data_dir":scoped}}).to_string()).unwrap();
+    let mut command = Peer::command();
+    command.arg("--boards-file").arg(file);
+    let mut peer = Peer::spawn(command, "registry-reader");
+    peer.ok("post", json!({"board_id":"host","channel":"work","text":"visible"}));
+    peer.ok("post", json!({"board_id":"host","channel":"other","text":"private-sentinel"}));
+    let read = peer.ok("read", json!({"board_id":"guest"})).to_string();
+    assert!(read.contains("visible") && !read.contains("private-sentinel"));
+    assert_eq!(peer.tool("post", json!({"board_id":"guest","channel":"work","text":"denied"}))["isError"], true);
+    admin.revoke_invite(invite.id).unwrap();
+    assert_eq!(peer.tool("read", json!({"board_id":"guest"}))["isError"], true);
+    assert!(!peer.ok("read", json!({"board_id":"host"})).to_string().contains("denied"));
+}
+
+#[test]
+fn boards_file_validates_the_whole_registry_and_refuses_conflicts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().canonicalize().unwrap();
+    let file = cwd.join("boards.json");
+    let launch = |path: &std::path::Path| {
+        let mut c = Peer::command();
+        c.current_dir(&cwd).arg("--boards-file").arg(path);
+        c
+    };
+    let secrets = ["SECRET_SENTINEL", cwd.to_str().unwrap(), "unused.invalid"];
+    assert_startup_refused(&mut launch(&file), &secrets);
+    let invite = neochat::invite_file::InviteFile { version: 1, project: None, endpoint: "https://unused.invalid".into(),
+        token: secrets[0].into(), expires_at: neochat::board::now() + 300 }.store(&cwd).unwrap();
+    let key = json!("neoboard-team-only");
+    let target = json!({"invite":invite,"label":"Only"});
+    std::fs::write(&file, format!("{{{key}:{target}}}")).unwrap();
+    // No request to the invite endpoint is needed for discovery, docs, or invalid calls.
+    let mut peer = Peer::spawn(launch(&file), "invited");
+    assert_eq!(peer.ok("boards_list", json!({})), json!({"boards":[{"board_id":key,"label":"Only"}]}));
+    peer.ok("docs_read", json!({"id":"start"}));
+    for (name, args) in [("channels", json!({})), ("boards_list", json!({"board_id":key})), ("docs_list", json!({"board_id":key}))] {
+        assert_eq!(peer.rpc("tools/call", json!({"name":name,"arguments":args}))["error"]["code"], -32602);
+    }
+    assert_startup_refused(&mut launch(std::path::Path::new("boards.json")), &secrets);
+    for option in ["--invite", "--data-dir", "--url", "--token"] {
+        assert_startup_refused(launch(&file).arg(option).arg(secrets[0]), &secrets);
+    }
+    assert_startup_refused(launch(&file).arg(secrets[0]), &secrets);
+    for env in ["NEOCHAT_URL", "NEOCHAT_TOKEN", "NEOCHAT_DATA_DIR"] {
+        assert_startup_refused(launch(&file).env(env, secrets[0]), &secrets);
+    }
+    for invalid in [
+        "SECRET_SENTINEL".into(), "[]".into(), "{}".into(), format!("{{{key}:{target},{key}:{target}}}"),
+        json!({"both":{"label":"Both","invite":invite,"data_dir":cwd}}).to_string(),
+        json!({"none":{"label":"No connection"}}).to_string(), json!({"nolabel":{"invite":invite}}).to_string(),
+        json!({"extra":{"label":"Extra","invite":invite,"token":secrets[0]}}).to_string(),
+        json!({"":target}).to_string(), json!({(cwd.to_str().unwrap()):target}).to_string(),
+        json!({"bad":{"label":"Bad","invite":"relative"}}).to_string(),
+        json!({"bad":{"label":"Bad","data_dir":"."}}).to_string(),
+        json!({"bad":{"label":cwd,"invite":invite}}).to_string(),
+        json!({"ok":target,"broken":{"label":"Missing","data_dir":cwd.join("missing")}}).to_string(),
+        json!({"ok":target,"broken":{"label":"Missing","invite":cwd.join("missing")}}).to_string(),
+    ] {
+        std::fs::write(&file, invalid).unwrap();
+        assert_startup_refused(&mut launch(&file), &secrets);
+    }
 }
 
 #[test]

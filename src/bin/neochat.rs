@@ -6,12 +6,17 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[path = "neochat/board_password.rs"]
+mod board_password;
+#[path = "neochat/init.rs"]
+mod init;
+
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 #[derive(Parser)]
 #[command(version, about = "Neoboard: shared channels, threads, and task coordination")]
 struct Cli {
-    #[arg(long, global = true, env = "NEOCHAT_URL")]
+    #[arg(long, global = true, env = "NEOCHAT_URL", hide_env_values = true)]
     url: Option<String>,
     #[arg(long, global = true, env = "NEOCHAT_TOKEN", hide_env_values = true, requires = "url")]
     token: Option<String>,
@@ -33,6 +38,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Initialize a new board on the local daemon. Configure Cloudflare or your HTTPS proxy separately.
+    Init(init::Init),
     /// Run the local daemon in the foreground.
     Serve { #[arg(long)] bind: Option<String> },
     /// List channels visible to this credential.
@@ -76,6 +83,9 @@ enum Commands {
     Schedules,
     #[command(subcommand)]
     Invite(Invites),
+    /// Manage password-based joining for a board (admin only).
+    #[command(subcommand)]
+    BoardPassword(board_password::BoardPassword),
 }
 
 #[derive(Subcommand)]
@@ -145,7 +155,20 @@ enum Invites {
 }
 
 fn main() -> std::process::ExitCode {
-    match run(Cli::parse()) {
+    let cli = Cli::try_parse().unwrap_or_else(|err| {
+        // Clap normally quotes unexpected arguments. Avoid repeating a password
+        // mistakenly supplied on the command line in shell logs or stderr.
+        if err.use_stderr() && std::env::args_os().any(|arg| arg == "board-password") {
+            eprintln!("neochat: invalid board-password arguments; see neochat board-password --help");
+            std::process::exit(2);
+        }
+        if err.use_stderr() && std::env::args_os().any(|arg| arg == "init") {
+            eprintln!("neochat: invalid init arguments; see neochat init --help");
+            std::process::exit(2);
+        }
+        err.exit()
+    });
+    match run(cli) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(err) if err.downcast_ref::<io::Error>().is_some_and(|e| e.kind() == io::ErrorKind::BrokenPipe) => std::process::ExitCode::SUCCESS,
         Err(err) => {
@@ -156,6 +179,12 @@ fn main() -> std::process::ExitCode {
 }
 
 fn run(cli: Cli) -> Result<()> {
+    if let Commands::Init(init) = cli.command {
+        if cli.url.is_some() || cli.token.is_some() {
+            return Err("init uses the local daemon's admin credential; unset NEOCHAT_URL/NEOCHAT_TOKEN and omit --url/--token".into());
+        }
+        return init.run(cli.data_dir.as_deref(), cli.json);
+    }
     if let Commands::Serve { bind } = &cli.command {
         let mut cmd = daemon_command();
         if let Some(dir) = &cli.data_dir { cmd.arg("--data-dir").arg(dir); }
@@ -171,7 +200,7 @@ fn run(cli: Cli) -> Result<()> {
 
     let client = match cli.url.as_deref() {
         Some(url) => Client::new(url, cli.token.as_deref().ok_or("set NEOCHAT_TOKEN or pass --token with --url")?, cli.profile.as_deref())?,
-        None if matches!(cli.command, Commands::Invite(_)) => {
+        None if matches!(cli.command, Commands::Invite(_) | Commands::BoardPassword(_)) => {
             connect_local(cli.data_dir.as_deref(), None)?;
             Client::discover_admin(cli.data_dir.as_deref())?
         }
@@ -184,7 +213,8 @@ fn run(cli: Cli) -> Result<()> {
     }else{client};
     let mut claim_wait = None;
     let action = match cli.command {
-        Commands::Serve { .. } => unreachable!(),
+        Commands::Serve { .. } | Commands::Init(_) => unreachable!(),
+        Commands::BoardPassword(command) => return command.run(&client, json),
         Commands::Channels => {
             let channels = client.snapshot()?.channels;
             return if json { print_json(&channels) } else { print_lines(channels) };

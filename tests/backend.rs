@@ -361,3 +361,141 @@ async fn http_contract_auth_and_long_poll() {
     assert_eq!(client.post(format!("{url}/v1/actions")).bearer_auth(&f.token).json(&serde_json::json!({"type":"post","channel":"general","text":"bad","command":"oops"})).send().await.unwrap().status(),422);
     server.abort();
 }
+
+#[tokio::test]
+async fn password_endpoints_scope_lifecycle_and_uniform_failures() {
+    use serde_json::json;
+    let f = Fixture::new();
+    for name in ["a_b/general", "a_b", "axb/general", "a_b2/general"] {
+        f.action(Action::CreateChannel { channel: name.into() });
+    }
+    let shared = f.board.create_shared_invite(&f.admin, InviteRequest {
+        actor: "existing-link".into(), channels: vec!["a_b/*".into()], expires_at: None,
+    }).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let app = neochat::router(f.board.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+    let http = reqwest::Client::builder().no_proxy().build().unwrap();
+    let admin = |token: &str, body| http.post(format!("{url}/v1/admin/board-password")).bearer_auth(token).json(&body);
+    let join = |project: &str, pw: &str| http.post(format!("{url}/v1/join/password")).json(&json!({"project":project,"password":pw}));
+    let setting = |pw: Option<&str>| json!({"project":"a_b","password":pw});
+    assert_eq!(admin(&f.token, setting(Some("one"))).send().await.unwrap().status(), 401);
+    assert_eq!(admin(&f.admin, json!({"project":"a_b/*","password":"one"})).send().await.unwrap().status(), 400);
+    assert_eq!(admin(&f.admin, json!({"project":"a__","password":"one"})).send().await.unwrap().status(), 404);
+    for invalid in [String::new(), "é".repeat(513), "x".repeat(9000)] {
+        assert_eq!(admin(&f.admin, setting(Some(&invalid))).send().await.unwrap().status(), 400);
+    }
+    assert_eq!(admin(&f.admin, setting(Some("one"))).send().await.unwrap().status(), 204);
+    assert_eq!(admin(&f.admin, json!({"project":"a_b"})).send().await.unwrap().status(), 400);
+
+    let mut failures = Vec::new();
+    for project in ["a_b", "axb", "missing"] { // wrong, disabled, nonexistent
+        let response = join(project, "incorrect").send().await.unwrap();
+        assert_eq!(response.status(), 401);
+        failures.push(response.text().await.unwrap());
+    }
+    assert!(failures.windows(2).all(|p| p[0] == p[1]));
+    let response = join("a_b", "one").send().await.unwrap().error_for_status().unwrap();
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    let first: Invite = response.json().await.unwrap();
+    let second: Invite = join("a_b", "one").send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    assert_ne!(first.actor, second.actor);
+    assert_ne!(first.token, second.token);
+    assert_eq!(first.channels, ["a_b/*"]);
+    assert_ne!(first.actor, "local");
+    f.board.action(&first.token, None, None, post("a_b", "root", false, vec![])).unwrap();
+    f.board.action(&first.token, None, None, post("a_b/new", "nested", false, vec![])).unwrap();
+    assert_eq!(f.board.snapshot(&first.token).unwrap().channels, ["a_b", "a_b/general", "a_b/new"]);
+    assert!(f.board.action(&first.token, None, None, post("a_b2/general", "outside", false, vec![])).is_err());
+    assert!(f.board.action(&first.token, None, None, Action::DeleteChannel { channel: "a_b/new".into() }).is_err());
+    assert_eq!(admin(&first.token, setting(None)).send().await.unwrap().status(), 401);
+    assert_eq!(admin(&f.admin, setting(Some("two"))).send().await.unwrap().status(), 204);
+    assert_eq!(join("a_b", "one").send().await.unwrap().status(), 401);
+    assert_eq!(join("a_b", "two").send().await.unwrap().status(), 200);
+    assert_eq!(admin(&f.admin, setting(None)).send().await.unwrap().status(), 204);
+    assert_eq!(join("a_b", "two").send().await.unwrap().status(), 401);
+    assert!(f.board.snapshot(&first.token).is_ok());
+    assert!(f.board.join(&shared.token).is_ok());
+    f.board.revoke_invite(&f.admin, first.id).unwrap();
+    assert!(f.board.snapshot(&first.token).is_err());
+    assert!(f.board.snapshot(&second.token).is_ok());
+    server.abort();
+}
+
+#[tokio::test]
+async fn init_board_is_create_only_admin_only_and_emits_a_scoped_channel_event() {
+    use serde_json::json;
+    let f = Fixture::new();
+    for channel in ["bare", "occupied/other", "axb/general"] {
+        f.action(Action::CreateChannel { channel: channel.into() });
+    }
+    f.action(Action::CreateArea { board: "metadata".into(), name: "design".into() });
+    let outside = f.invite("outside", vec!["axb/*".into()]);
+    let before = f.board.snapshot(&f.token).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let app = neochat::router(f.board.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+    let http = reqwest::Client::builder().no_proxy().build().unwrap();
+    let init = |body| http.post(format!("{url}/v1/admin/init-board")).json(&body);
+    let body = |project, pw| json!({"project":project,"password":pw});
+    let secrets = ["create-only-first-secret", "create-only-second-secret"];
+    assert_eq!(init(body("a_b", secrets[0])).send().await.unwrap().status(), 401);
+    for token in [&f.token, &outside.token] {
+        assert_eq!(init(body("a_b", secrets[0])).bearer_auth(token).send().await.unwrap().status(), 401);
+    }
+    for invalid in [body("a_b/extra", secrets[0]), body("a_b", ""), json!({"project":"a_b"}),
+        json!({"project":"a_b","password":null}), json!({"project":"a_b","password":secrets[0],"url":"https://example.invalid"})] {
+        assert_eq!(init(invalid).bearer_auth(&f.admin).send().await.unwrap().status(), 400);
+    }
+    for existing in ["bare", "occupied", "metadata"] {
+        assert_eq!(init(body(existing, secrets[0])).bearer_auth(&f.admin).send().await.unwrap().status(), 409);
+    }
+    assert_eq!(f.board.snapshot(&f.token).unwrap().channels, before.channels);
+    assert!(f.board.events(&f.token, before.cursor).unwrap().is_empty());
+
+    let race = |pw| init(body("a_b", pw)).bearer_auth(&f.admin).send();
+    let (first, second) = tokio::join!(race(secrets[0]), race(secrets[1]));
+    let winner = match (first.unwrap().status().as_u16(), second.unwrap().status().as_u16()) {
+        (204, 409) => 0, (409, 204) => 1, statuses => panic!("unexpected init statuses: {statuses:?}"),
+    };
+    let join = |pw| http.post(format!("{url}/v1/join/password")).json(&body("a_b", pw)).send();
+    assert_eq!(join(secrets[1-winner]).await.unwrap().status(), 401);
+    let member: Invite = join(secrets[winner]).await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    assert_eq!(member.channels, ["a_b/*"]);
+    assert_eq!(f.board.snapshot(&member.token).unwrap().channels, ["a_b/general"]);
+    let events = f.board.events(&f.token, before.cursor).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].actor, "local");
+    assert_eq!(events[0].kind, EventKind::ChannelCreated { channel: "a_b/general".into() });
+    assert_eq!(f.board.events(&member.token, before.cursor).unwrap(), events);
+    assert!(f.board.events(&outside.token, before.cursor).unwrap().is_empty());
+    for entry in std::fs::read_dir(f.dir.path()).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_file() {
+            let bytes = std::fs::read(path).unwrap();
+            for secret in secrets { assert!(!bytes.windows(secret.len()).any(|w| w == secret.as_bytes())); }
+        }
+    }
+    server.abort();
+}
+
+#[tokio::test]
+async fn password_throttling_ignores_forwarded_addresses_and_project_churn() {
+    let f = Fixture::new();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let app = neochat::router(f.board.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+    let http = reqwest::Client::builder().no_proxy().build().unwrap();
+    for i in 0..=12 {
+        let r = http.post(format!("{url}/v1/join/password"))
+            .header("x-forwarded-for", format!("192.0.2.{i}"))
+            .json(&serde_json::json!({"project":format!("missing{i}"), "password":"incorrect"}))
+            .send().await.unwrap();
+        assert_eq!(r.status(), if i < 12 { 401 } else { 429 });
+    }
+    assert_eq!(http.get(format!("{url}/v1/me")).bearer_auth(&f.token).send().await.unwrap().status(), 200);
+    server.abort();
+}

@@ -1,4 +1,6 @@
 use neochat::{client::Client, protocol::TaskState};
+#[path = "cli_board/init.rs"]
+mod init;
 use std::{path::Path, process::{Child, Command, Stdio}, thread, time::{Duration, Instant}};
 
 struct Daemon(Child);

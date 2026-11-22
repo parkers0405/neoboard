@@ -1,4 +1,6 @@
 //! Blocking client shared by the CLI and the desktop's network worker.
+mod board_password;
+pub use board_password::{join_with_password, MAX_BOARD_PASSWORD_BYTES};
 use crate::protocol::{Action, Discovery, DisplayNameRequest, Event, Invite, InviteRequest, Member, Organization, Outcome, Reaction, ScheduledPost, Snapshot};
 use reqwest::{blocking, header, Url};
 use serde::de::DeserializeOwned;
@@ -30,9 +32,7 @@ impl Client {
     pub fn new(endpoint: &str, token: &str, profile: Option<&str>) -> Result<Self, ClientError> {
         let mut endpoint = Url::parse(endpoint.trim())
             .map_err(|_| ClientError("invalid Neoboard endpoint".into()))?;
-        let loopback = endpoint.host_str().is_some_and(|host| {
-            host == "localhost" || host.trim_matches(['[', ']']).parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
-        });
+        let loopback = is_loopback(&endpoint);
         if !(endpoint.scheme() == "https" || endpoint.scheme() == "http" && loopback)
             || endpoint.host().is_none()
             || !endpoint.username().is_empty()
@@ -276,6 +276,12 @@ impl Client {
             None => format!("Neoboard request failed: {status}"),
         }))
     }
+}
+
+fn is_loopback(endpoint: &Url) -> bool {
+    endpoint.host_str().is_some_and(|host| {
+        host == "localhost" || host.trim_matches(['[', ']']).parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+    })
 }
 
 fn network_error(err: reqwest::Error) -> ClientError {

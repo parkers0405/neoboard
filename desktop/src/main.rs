@@ -18,6 +18,7 @@ mod splash;
 mod splash_art;
 mod zoom;
 mod onboarding;
+mod host_password;
 mod saved_boards;
 mod setup_guide;
 
@@ -409,7 +410,7 @@ impl App {
         self.row_menu=None;self.hover_row=None;
         if self.board_cache.is_none(){self.board_cache=Some(self.snapshot.clone());}
         self.refresh_project();self.refresh_extra();
-        self.member_list=None;self.aliases.clear();self.pick_assignee=false;self.details_picker=None;self.dialog=None;
+        self.member_list=None;self.aliases.clear();self.pick_assignee=false;self.details_picker=None;self.close_dialog();
         self.task_menu=None;self.attachment_message=None;self.download_id=None;self.attachments.clear();self.error=None;self.notice=None;
         self.default_channel();
         self.labels=edit("");self.needs=edit("");self.assignee=edit("");
@@ -638,6 +639,7 @@ fn poll(app: &mut App, seconds: f64, tx: &mut Tx) -> bool {
         changed = true;
         match update {
             Update::BoardSetup(result) => app.finish_board_setup(result),
+            Update::BoardPassword(request, ok) => app.finish_password(request, ok),
             Update::Organization(organization) => app.organization = organization,
             Update::SprintCreated(id) => app.sprint_created(id),
             Update::Host(request, result) => {
@@ -693,7 +695,7 @@ fn poll(app: &mut App, seconds: f64, tx: &mut Tx) -> bool {
                 }
             }
             Update::Status(status) => {
-                if status != "live" { app.share.request += 1; app.share.busy = false; app.share.confirm_stop = false; app.share.result = None; }
+                if status != "live" { app.share.request += 1; app.share.busy = false; app.share.confirm_stop = false; app.share.result = None; app.share.password = Default::default(); }
                 app.status = status;
                 if matches!(app.dialog, Some(Dialog::Share | Dialog::Connection)) && app.share.result.is_none() { app.host_request(connection::HostOp::Inspect); }
             }
@@ -753,6 +755,9 @@ fn poll(app: &mut App, seconds: f64, tx: &mut Tx) -> bool {
             }
         }
     }
+    if !matches!(app.share.password, host_password::Panel::Closed) && !app.password_controls_available() {
+        app.share.password = Default::default(); changed = true;
+    }
     if !app.fixture {
         // Match surfaces that can contain an orb; Tasks alone need no animation timer.
         let sidebar_visible = app.sidebar && (app.width >= 900.0 || app.thread.is_none());
@@ -802,7 +807,7 @@ fn main() {
             if !matches!(app.release.stage, release_update::Stage::Hidden) && e.key == Key::Escape { app.release.dismiss(); return true; }
             if e.key == Key::Escape && app.setup_choices {app.setup_choices=false;return true;}
             if e.key == Key::Escape && app.dialog==Some(Dialog::Filters) && app.details_picker.take().is_some(){return true;}
-            if app.onboarding_visible() && e.key == Key::Escape { return true; }
+            if app.onboarding_visible() && e.key == Key::Escape { app.onboarding.cancel_form(); return true; }
             if e.key == Key::Escape {
                 if app.dialog == Some(Dialog::NewTask) && app.details_picker.is_some() {
                     if !(app.details_picker == Some("new-sprint") && app.pending) { app.details_picker = None; }
@@ -812,7 +817,7 @@ fn main() {
                 if app.channel_actions.menu.take().is_some(){return true;}
                 if app.row_menu.take().is_some(){return true;}
                 if app.setup_open {app.setup_open=false;return true;}
-                if app.dialog.take().is_some() { return true; }
+                if app.dialog.is_some() { app.close_dialog(); return true; }
                 else if app.attachment_message.is_some() { app.attachment_message = None; }
                 else { app.thread = None; }
                 return true;
@@ -838,9 +843,21 @@ fn main() {
             ("home", |a| {fixture::load(a,true);a.navigate(Page::Home);}),
             ("onboarding", |a| { a.project.clear(); a.onboarding.adding = true; }),
             ("join-board", |a| { a.onboarding.adding = true; a.onboarding.joining = true; a.onboarding.step = onboarding::Step::Board; }),
+            ("join-password", |a| {
+                fixture::load(a, false); a.begin_add_board(); a.onboarding.joining = true;
+                a.onboarding.method = onboarding::JoinMethod::Password;
+                a.onboarding.server = edit("https://board.example/#neoboard=dev");
+                a.onboarding.password.replace_text("fixture-only");
+            }),
             ("home-setup", |a| {fixture::load(a,true);a.navigate(Page::Home);a.setup_open=true;}),
-            ("share-board", |a| { fixture::load(a, false); a.navigate(Page::Home); a.open_share(); a.status="live".into(); a.share.result=Some(Ok(connection::HostState { route: neochat::sharing::RouteState::Stopped, link:None })); }),
+            ("share-board", |a| { fixture::load(a, false); a.navigate(Page::Home); a.open_share(); a.status="live".into(); a.share.result=Some(Ok(connection::HostState { route: neochat::sharing::RouteState::Stopped, link:None, endpoint:None })); }),
             ("share-loading", |a| { fixture::load(a, false); a.navigate(Page::Home); a.open_share(); a.share.busy=true; }),
+            ("share-password", |a| {
+                fixture::load(a, false); a.open_share(); a.status = "live".into(); a.edit_host_password();
+                if let host_password::Panel::Edit { new, repeat, .. } = &mut a.share.password {
+                    new.replace_text("fixture-only"); repeat.replace_text("fixture-only");
+                }
+            }),
             ("schedule-compact", |a| { fixture::load(a, false); a.dialog = Some(Dialog::Schedule); a.zoom = zoom::Zoom::maximum(); }),
             ("channel-thread", |a| {fixture::load(a,true);a.navigate(Page::Channel(projects::channel(&a.project,"dev/rune")));a.open_thread(1);}),
             ("preferences", |a| {fixture::load(a,true); a.dialog=Some(Dialog::BoardView);}),

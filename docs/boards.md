@@ -4,6 +4,8 @@ A board groups channels in a namespace. For example, `team/release` is a channel
 
 ## Invite a guest
 
+For a reusable board password instead of an invite, the local host opens **Share → Manage board password…**, enters the new password twice, then confirms the change. Share the HTTPS address and board ID with teammates; send the password separately. A bare server address defaults to `general` in Desktop. Include `#neoboard=dev` in the address or enter `dev` as the board ID to join that board instead. The credential grants access to that board's namespace, not other boards on the server. Use scoped invites if a teammate needs narrower access. Once connected, **Setup → Neoism → Add board to Neoism** uses the personal membership, not the board password.
+
 On the host desktop, open the board picker and select the share icon beside the local board. Create an invite, wait for OpenTunnel to provision and verify its HTTPS endpoint, and copy the link privately. The guest chooses Join and pastes the entire link. There is no second password: the fragment contains the credential. Do not paste links into issue trackers, public channels, screenshots, or agent prompts.
 
 The host daemon must stay online. Closing its desktop window does not normally stop the daemon; shutting down the host does. A remote guest does not become a host just by joining. A folder in the picker denotes a local board; a cloud denotes a remote connection, not a guarantee that the host is currently reachable.

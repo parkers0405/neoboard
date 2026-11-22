@@ -10,16 +10,40 @@ pub struct Share {
     pub busy: bool,
     pub result: Option<Result<connection::HostState, String>>,
     pub copied: bool,
+    pub password: crate::host_password::Panel,
 }
 
 #[derive(Clone, Copy, Default, PartialEq)]
 pub enum Step { #[default] Name, Board, Connect }
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub enum JoinMethod { #[default] Invite, Password }
+
+// The fragment names the board; it is never part of the endpoint sent to the client.
+fn password_target(address: &str, slug: &str) -> Result<(String, String), &'static str> {
+    let address = address.trim();
+    let slug = slug.trim();
+    let (base, fragment) = match address.split_once('#') {
+        None => (address, None),
+        Some((base, fragment)) => (base, Some(fragment.strip_prefix("neoboard=")
+            .filter(|id| neochat::valid_project(id)).ok_or("Use a server address or a #neoboard=BOARD link. For a private invite, choose Private invite.")?)),
+    };
+    let endpoint = neochat::invite_file::https_endpoint(base)?;
+    if !slug.is_empty() && fragment.is_some_and(|id| id != slug) { return Err("The board slug must match the board in the server link."); }
+    let project = fragment.unwrap_or(if slug.is_empty() { "general" } else { slug });
+    if !neochat::valid_project(project) { return Err("Enter a valid board slug (letters, digits, dashes, underscores or dots)."); }
+    Ok((endpoint, project.to_owned()))
+}
 
 pub struct Onboarding {
     pub step: Step,
     pub name: TextEdit,
     pub board: TextEdit,
     pub invite: TextEdit,
+    pub method: JoinMethod,
+    pub server: TextEdit,
+    pub slug: TextEdit,
+    pub password: TextEdit,
     pub joining: bool,
     pub adding: bool,
     pub busy: bool,
@@ -29,8 +53,22 @@ pub struct Onboarding {
 
 impl Default for Onboarding {
     fn default() -> Self {
-        Self { step: Step::Name, name: edit(""), board: edit(""), invite: edit(""), joining: false,
+        Self { step: Step::Name, name: edit(""), board: edit(""), invite: edit("").secure(), joining: false,
+            method: Default::default(), server: edit(""), slug: edit(""), password: edit("").secure(),
             adding: false, busy: false, switching: false, error: None }
+    }
+}
+
+impl Onboarding {
+    pub fn clear_join_fields(&mut self) {
+        self.invite.clear(); self.password.clear(); self.server.clear(); self.slug.clear();
+        self.error = None;
+    }
+
+    pub fn cancel_form(&mut self) {
+        if self.busy || self.step != Step::Board { return; }
+        if self.adding { *self = Self::default(); }
+        else { *self = Self { name: std::mem::replace(&mut self.name, edit("")), ..Self::default() }; }
     }
 }
 
@@ -160,15 +198,27 @@ impl App {
             return;
         }
         let command = if self.onboarding.joining {
-            let input = self.onboarding.invite.text.trim();
-            let invite = match neochat::invite_file::InviteFile::from_link(input) {
-                Ok(invite) => connection::JoinSource::Link(invite),
-                Err(error) => { self.onboarding.error = Some(error); return; }
-            };
             if self.has_unsent_work() {
                 self.onboarding.error = Some("Finish or clear your drafts before joining another server.".into());
                 return;
             }
+            let o = &mut self.onboarding;
+            let invite = match o.method {
+                JoinMethod::Invite => match neochat::invite_file::InviteFile::from_link(o.invite.text.trim()) {
+                    Ok(invite) => connection::JoinSource::Link(invite),
+                    Err(error) => { o.error = Some(error); return; }
+                },
+                JoinMethod::Password => {
+                    let (endpoint, project) = match password_target(&o.server.text, &o.slug.text) {
+                        Ok(target) => target,
+                        Err(error) => { o.error = Some(error.into()); return; }
+                    };
+                    if o.password.text.is_empty() { o.error = Some("Enter the board password.".into()); return; }
+                    let password = connection::JoinPassword::new(std::mem::take(&mut o.password.text));
+                    o.password = edit("").secure();
+                    connection::JoinSource::Password { endpoint, project, password }
+                }
+            };
             Command::JoinBoard { invite, name }
         } else {
             let id = self.onboarding.board.text.split_whitespace().collect::<Vec<_>>().join("-");
@@ -184,6 +234,7 @@ impl App {
         };
         self.onboarding.error = None;
         if self.commands.as_ref().is_some_and(|tx| tx.try_send(command).is_ok()) {
+            self.onboarding.invite.clear();
             self.onboarding.busy = true;
         } else {
             self.onboarding.error = Some("The board connection isn't ready yet. Try again shortly.".into());
@@ -195,7 +246,7 @@ impl App {
         let switching = std::mem::take(&mut self.onboarding.switching);
         match result {
             Ok((id, mut snapshot, member, hosted)) => {
-                self.onboarding.invite = edit("");
+                self.onboarding.clear_join_fields();
                 if hosted.is_some() || switching {
                     self.organization = Default::default();
                     if self.options.endpoint.is_none() {
@@ -235,6 +286,61 @@ mod tests {
     fn click(rt: &mut rune::Runtime<App>, key: &str) {
         let (x, y) = rt.find(key).unwrap_or_else(|| panic!("missing {key}"));
         rt.pointer_move(x, y); rt.pointer_down(x, y); rt.pointer_up(x, y); rt.frame(1. / 60.);
+    }
+
+    #[test]
+    fn password_join_targets_are_unambiguous_and_https_only() {
+        assert_eq!(password_target("https://boards.invalid/prefix/#neoboard=QA_42", ""),
+            Ok(("https://boards.invalid/prefix/".into(), "QA_42".into())));
+        for (address, slug, expected) in [
+            ("https://host", "", "general"), ("https://host/", " design ", "design"),
+            ("https://host/#neoboard=dev", "", "dev"), ("https://host/#neoboard=dev", "dev", "dev"),
+        ] {
+            assert_eq!(password_target(address, slug), Ok(("https://host/".into(), expected.into())));
+        }
+        for (address, slug) in [("http://localhost", ""), ("https://user:pass@host", ""), ("https://host/?key=x", ""),
+            ("https://host/#neoboard=dev&key=x", ""), ("https://host/#neoboard=dev", "other"),
+            ("https://host/#neoboard=", ""), ("https://host", "../other"), ("https://host/#foo", "")] {
+            assert!(password_target(address, slug).is_err());
+        }
+    }
+
+    #[test]
+    fn password_join_is_masked_transient_and_cancellable() {
+        let mut app = App::new(); fixture::load(&mut app, false); app.begin_add_board();
+        let (tx, rx) = mpsc::sync_channel(1); app.commands = Some(tx);
+        let mut rt = rune::Runtime::new(app, view::root, (850., 600.), rune::Env::new(true, 1.));
+        rt.frame(0.);
+        click(&mut rt, "onboarding-join"); click(&mut rt, "method-password");
+        const SECRET: &str = " sentinel-secret ";
+        rt.update(|a, _| {
+            a.onboarding.server.replace_text("https://host/#neoboard=dev");
+            a.onboarding.name.replace_text("Sam Lee");
+        });
+        for _ in 0..60 { rt.frame(1./60.); }
+        click(&mut rt, "onboarding-password"); rt.paste(SECRET); rt.frame(0.);
+        assert!(rt.state.onboarding.password.text == SECRET);
+        assert!(rt.state.onboarding.password.is_secure());
+        assert!(!format!("{:?}", rt.state.onboarding.password).contains(SECRET.trim()));
+        assert!(!format!("{:?}", rt.elements()).contains(SECRET.trim()));
+        assert!(!serde_json::to_string(&rt.state.preferences()).unwrap().contains(SECRET.trim()));
+        assert!(!crate::setup_guide::Guide::new(&rt.state).copy_text().contains(SECRET.trim()));
+        click(&mut rt, "onboarding-submit");
+        assert!(matches!(rx.try_recv(), Ok(Command::JoinBoard { invite: connection::JoinSource::Password { endpoint, project, .. }, name })
+            if endpoint == "https://host/" && project == "dev" && name == "Sam Lee"));
+        assert!(rt.state.onboarding.busy && rt.state.onboarding.password.text.is_empty());
+        rt.update(|a, _| a.finish_board_setup(Err("Join failed".into())));
+        for _ in 0..60 { rt.frame(1./60.); }
+        rt.update(|a, _| a.onboarding.password.replace_text(SECRET));
+        click(&mut rt, "method-invite");
+        assert!(rt.state.onboarding.password.text.is_empty() && rt.state.onboarding.server.text.is_empty());
+        for _ in 0..60 { rt.frame(1./60.); }
+        click(&mut rt, "method-password");
+        rt.update(|a, _| a.onboarding.password.replace_text(SECRET));
+        for _ in 0..60 { rt.frame(1./60.); }
+        click(&mut rt, "onboarding-cancel");
+        assert!(!rt.state.onboarding_visible() && rt.state.onboarding.password.text.is_empty());
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
@@ -358,9 +464,9 @@ mod tests {
             assert!(rt.find("onboarding-invite").is_some());
             let endpoint = format!("https://{host}.example.invalid/");
             let link = format!("{endpoint}#neoboard={id}&expires=4102444800&key=fixture-only-{host}");
-            rt.update(|a,_| a.onboarding.invite = edit(&link));
+            rt.update(|a,_| a.onboarding.invite.replace_text(link));
             // Switching to Join animates the form; a press during the first frame misses the button.
-            for _ in 0..6 { rt.frame(1./60.); }
+            for _ in 0..60 { rt.frame(1./60.); }
             click(&mut rt, "onboarding-submit");
             let Command::JoinBoard { invite: connection::JoinSource::Link(invite), .. } = requests.try_recv().unwrap() else { panic!("expected join"); };
             assert_eq!(invite.endpoint, endpoint);
@@ -455,7 +561,7 @@ mod tests {
         assert!(rt.find("create-share-link").is_none());
         rt.update(|a, _| {
             a.share.busy = false;
-            a.share.result = Some(Ok(connection::HostState { route: neochat::sharing::RouteState::Connected, link: None }));
+            a.share.result = Some(Ok(connection::HostState { route: neochat::sharing::RouteState::Connected, link: None, endpoint: None }));
         });
         rt.frame(1. / 60.);
         click(&mut rt, "create-share-link");
@@ -481,12 +587,58 @@ mod tests {
         let mut rt = rune::Runtime::new(app, view::root, (850., 600.), rune::Env::new(true, 1.));
         rt.frame(1. / 60.);
         assert!(rt.find("guest-status").is_some());
-        for key in ["disconnect-host", "create-share-link", "copy-share-link"] { assert!(rt.find(key).is_none()); }
+        for key in ["disconnect-host", "create-share-link", "copy-share-link", "manage-password", "copy-password-address"] { assert!(rt.find(key).is_none()); }
         click(&mut rt, "disconnect-guest");
         assert_eq!(rt.state.status, "disconnected");
         assert!(rt.find("reconnect-guest").is_some());
         assert_eq!(rt.state.saved_boards.entries()[0].invite.as_ref(), Some(&path));
         assert!(matches!(requests.try_recv(), Err(mpsc::TryRecvError::Disconnected)));
+    }
+
+    #[test]
+    fn host_password_requires_confirmation_and_never_publishes() {
+        use crate::host_password::Panel;
+        let mut app = App::new(); fixture::load(&mut app, false);
+        app.status = "live".into();
+        let mut board = app.snapshot.clone(); board.channels.push("another/general".into()); app.board_cache = Some(board);
+        app.open_board_share("another");
+        app.share.result = Some(Ok(connection::HostState { route: neochat::sharing::RouteState::Stopped, link: None, endpoint: None }));
+        let (tx, rx) = mpsc::sync_channel(1); app.commands = Some(tx);
+        let mut rt = rune::Runtime::new(app, view::root, (850., 600.), rune::Env::new(true, 1.));
+        let press = |rt: &mut rune::Runtime<App>, key| {
+            for _ in 0..30 { rt.frame(1./60.); }
+            click(rt, key);
+        };
+        const SECRET: &str = " fixture-166 ";
+        press(&mut rt, "manage-password");
+        press(&mut rt, "host-new-password"); rt.paste(SECRET); rt.frame(0.);
+        press(&mut rt, "review-password");
+        assert!(matches!(&rt.state.share.password, Panel::Edit { new, repeat, error: Some(_) } if new.text.is_empty() && repeat.text.is_empty()));
+        for key in ["host-new-password", "host-repeat-password"] {
+            press(&mut rt, key); rt.paste(SECRET); rt.frame(0.);
+        }
+        assert!(matches!(&rt.state.share.password, Panel::Edit { new, repeat, .. } if new.is_secure() && repeat.is_secure() && new.text == SECRET && repeat.text == SECRET));
+        assert!(!format!("{:?}", rt.elements()).contains(SECRET.trim()));
+        assert!(!serde_json::to_string(&rt.state.preferences()).unwrap().contains(SECRET.trim()));
+        press(&mut rt, "review-password");
+        assert!(matches!(rt.state.share.password, Panel::ConfirmSet(_)) && rx.try_recv().is_err());
+        press(&mut rt, "confirm-password");
+        let Ok(Command::BoardPassword { request, id, password: Some(_) }) = rx.try_recv() else { panic!("expected only an admin password write"); };
+        assert_eq!(id, "another");
+        rt.update(|a, _| a.finish_password(request, true));
+        assert!(matches!(rt.state.share.password, Panel::Notice(_)));
+        assert!(rt.state.password_address().is_none() && !rt.state.share.copied);
+        press(&mut rt, "manage-password"); press(&mut rt, "disable-password");
+        assert!(rx.try_recv().is_err()); press(&mut rt, "cancel-password");
+        assert!(matches!(rt.state.share.password, Panel::Closed) && rx.try_recv().is_err());
+        press(&mut rt, "manage-password"); press(&mut rt, "disable-password"); press(&mut rt, "confirm-password");
+        assert!(matches!(rx.try_recv(), Ok(Command::BoardPassword { id, password: None, .. }) if id == "another"));
+        rt.update(|a, _| a.finish_password(request, true)); // Earlier set cannot complete this disable.
+        assert!(matches!(rt.state.share.password, Panel::Saving { disable: true }));
+        rt.update(|a, _| a.finish_password(a.share.request, false));
+        press(&mut rt, "manage-password"); press(&mut rt, "host-new-password"); rt.paste(SECRET); rt.frame(0.);
+        press(&mut rt, "dialog-close");
+        assert!(matches!(rt.state.share.password, Panel::Closed) && rt.state.dialog.is_none() && rx.try_recv().is_err());
     }
 
     #[test]
@@ -511,10 +663,11 @@ mod tests {
             rt.update(|a, tx| { poll(a, 0., tx); });
             rt.frame(1. / 60.);
         };
-        apply(&mut rt, Update::Host(first, Ok(HostState { route: Stopped, link: None })));
+        apply(&mut rt, Update::Host(first, Ok(HostState { route: Stopped, link: None, endpoint: None })));
         assert!(rt.state.share.busy);
         let link = format!("https://fixture.invalid/#neoboard={}&expires=4102444800&key=private-fixture-key", rt.state.project);
-        apply(&mut rt, Update::Host(second, Ok(HostState { route: Connected, link: Some(link) })));
+        apply(&mut rt, Update::Host(second, Ok(HostState { route: Connected, link: Some(link), endpoint: Some("https://fixture.invalid/".into()) })));
+        assert_eq!(rt.state.password_address(), Some(format!("https://fixture.invalid/#neoboard={}", rt.state.project)));
         click(&mut rt, "copy-share-link");
         assert!(rt.state.share.copied);
         for _ in 0..8 { rt.frame(1. / 60.); }
@@ -524,14 +677,14 @@ mod tests {
         assert!(requests.try_recv().is_err());
         click(&mut rt, "confirm-stop-host");
         let Ok(Command::Host { operation: HostOp::Stop, request, .. }) = requests.try_recv() else { panic!("expected confirmed stop"); };
-        apply(&mut rt, Update::Host(request, Ok(HostState { route: Stopped, link: None })));
+        apply(&mut rt, Update::Host(request, Ok(HostState { route: Stopped, link: None, endpoint: None })));
         assert!(rt.find("disconnect-host").is_none());
         assert!(rt.find("copy-share-link").is_none());
         assert!(rt.find("create-share-link").is_some());
         click(&mut rt, "create-share-link");
         let Ok(Command::Host { operation: HostOp::Create, request, .. }) = requests.try_recv() else { panic!("expected explicit create"); };
         let link = format!("https://fixture.invalid/#neoboard={}&expires=4102444800&key=fixture", rt.state.project);
-        apply(&mut rt, Update::Host(request, Ok(HostState { route: Connected, link: Some(link) })));
+        apply(&mut rt, Update::Host(request, Ok(HostState { route: Connected, link: Some(link), endpoint: None })));
         assert!(rt.state.share.copied);
         apply(&mut rt, Update::Status("offline".into()));
         assert!(rt.find("copy-share-link").is_none());

@@ -8,6 +8,8 @@ services:
     volumes:
       - board:/var/lib/neochat
     read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,mode=1777
     security_opt:
       - no-new-privileges:true
     cap_drop:

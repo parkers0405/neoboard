@@ -1,5 +1,6 @@
 //! Embedded Turso is the single writer authority. Mutations, derived task transitions and events share a transaction.
 use crate::protocol::*;
+mod password;
 use axum::{extract::{Path, Query, State}, http::{HeaderMap, StatusCode}, response::{IntoResponse, Response}, routing::{delete, get, post}, Json, Router};
 use rand::RngCore;
 use crate::{params, storage::{Connection, OptionalExtension, Transaction}};
@@ -43,7 +44,7 @@ const MEMBER_LIFETIME: u64 = 30 * 86_400;
 fn digest(token: &str) -> String { format!("{:x}", Sha256::digest(token.as_bytes())) }
 
 #[derive(Clone)]
-pub struct Board { db: Arc<Mutex<Connection>>, admin_hash: String }
+pub struct Board { db: Arc<Mutex<Connection>>, admin_hash: String, passwords: Arc<password::Admission> }
 #[derive(Clone)]
 struct Identity { id: u64, actor: String, channels: Vec<String> }
 impl Identity {
@@ -75,6 +76,7 @@ impl Board {
         }
         db.execute_batch("CREATE TABLE IF NOT EXISTS channels(name TEXT PRIMARY KEY);
             INSERT OR IGNORE INTO channels VALUES ('general');
+            CREATE TABLE IF NOT EXISTS board_passwords(project TEXT PRIMARY KEY, salt BLOB NOT NULL CHECK(length(salt)=16), pbkdf2_sha256_600k BLOB NOT NULL CHECK(length(pbkdf2_sha256_600k)=32));
             CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY AUTOINCREMENT, channel TEXT NOT NULL, creator TEXT NOT NULL, body TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS events(cursor INTEGER PRIMARY KEY AUTOINCREMENT, channel TEXT NOT NULL, body TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS event_channels ON events(channel,cursor);
@@ -113,7 +115,7 @@ impl Board {
             SELECT json_group_array(json_object('id',id,'message_id',message_id,'name',name,'size',length(bytes)))
             FROM attachments WHERE message_id=messages.id
         ))) WHERE id IN (SELECT message_id FROM attachments) AND json_type(body,'$.attachments') IS NULL", [])?;
-        Ok(Self { db: Arc::new(Mutex::new(db)), admin_hash: digest(admin_token) })
+        Ok(Self { db: Arc::new(Mutex::new(db)), admin_hash: digest(admin_token), passwords: Arc::new(password::Admission::default()) })
     }
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
         self.db.lock().map_err(|_| BoardError(StatusCode::INTERNAL_SERVER_ERROR, "board lock poisoned".into()))
@@ -155,15 +157,18 @@ impl Board {
         if !shared { return Err(conflict("this credential already identifies one actor")); }
         let members: u64 = tx.query_row("SELECT COUNT(*) FROM invite_members m JOIN credentials c ON c.id=m.credential WHERE m.invite=?1 AND c.revoked=0", [invite.id], |r| r.get(0))?;
         if members >= MAX_INVITE_MEMBERS { return Err(BoardError(StatusCode::TOO_MANY_REQUESTS, "this invite has been joined too many times; ask the host for a new one".into())); }
+        let member = Self::personal_credential(&tx, invite.channels)?;
+        tx.execute("INSERT INTO invite_members VALUES (?1,?2)", params![member.id,invite.id])?;
+        tx.commit()?;
+        Ok(member)
+    }
+    fn personal_credential(tx: &Transaction<'_>, channels: Vec<String>) -> Result<Invite> {
         let expires = Some(now() + MEMBER_LIFETIME);
         let personal = random_token();
         let actor = format!("guest-{}", &random_token()[..16]);
-        let channels = serde_json::to_string(&invite.channels)?;
-        tx.execute("INSERT INTO credentials(hash,actor,channels,expires) VALUES (?1,?2,?3,?4)", params![digest(&personal),actor,channels,expires])?;
+        tx.execute("INSERT INTO credentials(hash,actor,channels,expires) VALUES (?1,?2,?3,?4)", params![digest(&personal),actor,serde_json::to_string(&channels)?,expires])?;
         let id = tx.last_insert_rowid() as u64;
-        tx.execute("INSERT INTO invite_members VALUES (?1,?2)", params![id,invite.id])?;
-        tx.commit()?;
-        Ok(Invite { id, token: personal, actor, channels: invite.channels, expires_at: expires })
+        Ok(Invite { id, token: personal, actor, channels, expires_at: expires })
     }
     /// Match an unrestricted guest bearer to exactly one board, including its authoritative lifetime.
     /// Only a shared invite is handed out again: one issued before `join` existed would
@@ -581,7 +586,11 @@ fn validate_global_fields(labels: &BTreeMap<String,String>, needs: &[u64], assig
 }
 fn ensure_channel(tx: &Transaction<'_>, identity: &Identity, channel: &str) -> Result<()> {
     validate_channel(channel)?; identity.check(channel)?;
-    if tx.execute("INSERT OR IGNORE INTO channels VALUES (?1)", [channel])? != 0 { emit(tx,&identity.actor,channel,EventKind::ChannelCreated { channel: channel.into() })?; } Ok(())
+    insert_channel(tx, &identity.actor, channel)
+}
+// Callers validate the channel and authorize the actor before inserting.
+fn insert_channel(tx: &Transaction<'_>, actor: &str, channel: &str) -> Result<()> {
+    if tx.execute("INSERT OR IGNORE INTO channels VALUES (?1)", [channel])? != 0 { emit(tx,actor,channel,EventKind::ChannelCreated { channel: channel.into() })?; } Ok(())
 }
 fn require_creator(tx: &Transaction<'_>, m: &Message, identity: &Identity) -> Result<()> {
     let creator: String = tx.query_row("SELECT creator FROM messages WHERE id=?1", [m.id], |r| r.get(0))?;
@@ -719,6 +728,10 @@ fn apply(tx: &Transaction<'_>, who: &Identity, author: &str, sender: Option<&str
             }
             if tx.execute("DELETE FROM channels WHERE name=?1", [&channel])? == 0 {
                 return Err(BoardError(StatusCode::NOT_FOUND, "channel not found".into()));
+            }
+            let project = board_namespace(&channel);
+            if !password::project_exists(tx, project)? {
+                tx.execute("DELETE FROM board_passwords WHERE project=?1", [project])?;
             }
             // Placements must go before messages: parent uses ON DELETE RESTRICT even
             // when the subtask and its parent are both being deleted. Needs, parents
@@ -1090,7 +1103,7 @@ pub fn router(board: Board) -> Router {
         .route("/v1/admin/invites/{id}",delete(http_revoke).get(http_explain))
         .route("/v1/admin/invites/{id}/grants/{grant}",delete(http_revoke_grant))
         .route("/v1/attachments/{id}",get(http_download_attachment))
-        .layer(axum::extract::DefaultBodyLimit::max(128*1024)).merge(uploads).with_state(board)
+        .layer(axum::extract::DefaultBodyLimit::max(128*1024)).merge(uploads).merge(password::routes()).with_state(board)
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

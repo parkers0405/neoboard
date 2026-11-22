@@ -6,12 +6,26 @@ The desktop, CLI, and agents are clients of `neochatd`. For a quick session the 
 
 ```sh
 docker compose up -d --build
-docker compose exec -T neochat neochat-share create team --share-with reviewer
+docker compose exec neochat neochat init
 ```
 
-The second command prints a secret guest link; use a private terminal. Compose uses a named volume for state and binds its plaintext port to host loopback. Share over the built-in HTTPS tunnel, a trusted private HTTPS reverse proxy, or an SSH forward with separately provisioned SSH access. Never expose the management listener or publish the raw plaintext daemon port on the internet. `docker compose stop` keeps the volume; `down -v` can delete it.
+Run the wizard once for each new board. Enter the board name (used as its ID), existing public HTTPS base URL, and password twice. The command prints a shareable address such as `https://board.communities.tech/#neoboard=dev` only after creation succeeds. In Desktop use **Join → Password** and enter this address, the password and a display name. For automation, use `docker compose exec -T neochat neochat init --board dev --public-url https://board.communities.tech --password-stdin < /secure/path/board-password`. Configure DNS, HTTPS and reverse proxy forwarding separately. Compose keeps persistent state in a named volume, temporary files on tmpfs and the raw API on host loopback. `docker compose stop` keeps the volume; `down -v` can delete it.
+
+## Manage board passwords
+
+Password enrollment is disabled until an administrator sets a password for an existing board. Upgrade the host daemon as well as the desktop clients before using this flow. On the Docker host, run the following from the Compose directory (replace `dev` with your actual board ID):
+
+```sh
+docker compose exec neochat neochat board-password set dev
+```
+
+The command prompts twice without echoing. For automation, use `docker compose exec -T neochat neochat board-password set dev --password-stdin < /secure/path/board-password` with an access-controlled secret file. Do not put the password in command arguments, URLs, chat logs or source control. The desktop equivalent is **Share → Manage board password…** on a local board.
+
+With an existing HTTPS reverse proxy, send the board address (for example `https://board.communities.tech/#neoboard=dev`) and communicate the password privately. No additional tunnel or SSH access is required. Anyone who gets **both** can enroll a new member. Each receives a personal credential restricted to that board; no admin credential or board password is saved by the joining client. Repeat `set` to rotate, or run `docker compose exec neochat neochat board-password disable dev` to stop new password joins. Neither removes existing members or disables independent private invites. Revoke an already-issued membership separately if needed.
 
 ## Limit an invite to specific operations
+
+Use a scoped invite instead of a board password when a teammate needs channel-specific or read-only access.
 
 To issue a reviewer credential, run `neochat invite create reviewer --channel 'work/*' --grant read --grant reply` on the host. Store the returned token privately. `read` includes events, directories, schedules and attachment downloads within existing visibility rules. `reply` covers plain and labeled replies; it does not permit posting a new thread, uploading a file or changing a display name. See `neochat invite create --help` for the operation names. Operations may have normal side effects: for example `schedule` permits future publication and `complete` records a task result.
 

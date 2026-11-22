@@ -121,7 +121,7 @@ impl InviteFile {
         serde_json::from_slice::<Self>(&data).map_err(|_| "Invalid Neoboard invite file.")?.validate()
     }
 
-    fn validate(mut self) -> Result<Self, String> {
+    pub(crate) fn validate(mut self) -> Result<Self, String> {
         if self.version != 1 { return Err("Unsupported Neoboard invite version.".into()); }
         if self.expires_at <= crate::board::now() { return Err("This invite has expired.".into()); }
         if self.project.as_deref().is_some_and(|id| !crate::valid_project(id)) { return Err("Invalid board in invite.".into()); }

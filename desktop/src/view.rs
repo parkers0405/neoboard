@@ -337,7 +337,8 @@ fn modal_frame(key: &str, viewport: [f32; 2], width: f32, header: Option<El>, bo
         .children(header)
         .child(col().key("modal-body").w_full().min_h(0.).shrink().scroll(ScrollSpec { stick_bottom: false }).child(body))
         .children(footer)
-        .modal(true, dismiss);
+        // A stray background click must not discard the join form. Escape may cancel it.
+        .modal(key != "board-onboarding", dismiss);
     el().absolute(0.,0.).w_full().h_full().center().fill(gray(0).alpha(0.64)).child(panel)
 }
 
@@ -354,9 +355,9 @@ fn dialog(app:&App, page:Dialog, viewport: [f32; 2], filter_anchor: Option<[f32;
     let title=match page {NewSprint=>return sprints::create_dialog(app,viewport),Settings=>"Settings",Personal=>"Personal",BoardView=>"Board View",Connection|Share=>"Board connection",Tags=>"Message details",NewTask if app.editing_task.is_some()=>"Edit task",NewTask if app.task_global=>"New global task",NewTask if app.task_parent.is_some()=>"New subtask",NewTask=>"New task",ReplyTags(_)=>"Reply labels",Filters=>"Filters",Schedule=>"Schedule delivery",NewChannel=>"New channel",DeleteThread(_)=>"Delete thread?",DeleteChannel=>"Delete channel?"};
     let nav=|name:&str, detail:&str, dest:Dialog| row().w_full().h(58.).px(14.).items_center().radius(10.).fill(gray(0)).border(1.,gray(55)).hover(gray(48))
         .child(col().gap(3.).child(label(name)).child(muted(detail).font(TextStyle::new(10.,400.)))).child(spacer()).child(muted("›")).on_press(move |a:&mut App| {if dest==Personal{a.personal_name=edit(a.me.as_ref().and_then(|m|m.display_name.as_deref()).unwrap_or(""));a.error=None;}if dest==Connection {a.open_share();}a.dialog=Some(dest);});
-    let back = matches!(page, BoardView|Connection|Personal).then(|| button("‹ Back",|a|a.dialog=Some(Settings)).radius(7.).hover(gray(52)));
+    let back = matches!(page, BoardView|Connection|Personal).then(|| button("‹ Back",|a|{ a.close_dialog(); a.dialog=Some(Settings); }).radius(7.).hover(gray(52)));
     let top=row().w_full().px(12.).h(40.).gap(8.).items_center().border_sides([0.,0.,1.,0.],gray(35)).children(back).child(label(title).font(TextStyle::new(15.,600.)).truncate().shrink()).child(spacer())
-        .child(el().w(62.).h(30.).center().child(dialog_action(button(if page==Share{"Close"}else if matches!(page,NewChannel|NewTask|DeleteThread(_)|DeleteChannel){"Cancel"}else{"Done"},|a|a.dialog=None).key("dialog-close"))));
+        .child(el().w(62.).h(30.).center().child(dialog_action(button(if page==Share{"Close"}else if matches!(page,NewChannel|NewTask|DeleteThread(_)|DeleteChannel){"Cancel"}else{"Done"},App::close_dialog).key("dialog-close"))));
     let mut panel=col().w_full().padding(16.).gap(10.);
     let pref=|name:&str, value:&str, change:fn(&mut App)| row().w_full().h(44.).px(14.).items_center().hover(gray(49))
         .child(label(name)).child(spacer()).child(muted(value)).on_press(move |a:&mut App|{change(a);a.save_preferences();});
@@ -380,6 +381,8 @@ fn dialog(app:&App, page:Dialog, viewport: [f32; 2], filter_anchor: Option<[f32;
                     .child(muted("Disconnecting affects only this desktop. Your board stays saved and the host stays online.").wrap());
                 if app.status == "disconnected" { p = p.child(dialog_action(button("Reconnect", App::reconnect_guest).key("reconnect-guest"))); }
                 else { p = p.child(dialog_action(button("Disconnect this desktop", App::disconnect_guest).key("disconnect-guest"))); }
+            } else if app.password_controls_available() && !matches!(s.password, host_password::Panel::Closed | host_password::Panel::Notice(_)) {
+                return modal_frame("board-dialog", viewport, 436., Some(top), password_form(app, p), None, App::close_dialog);
             } else if s.busy {
                 p = p.child(muted(match s.operation { Some(HostOp::Create) => "Creating invite link…", Some(HostOp::Stop) => "Stopping host tunnel…", _ => "Checking host status…" })).child(el().key("share-progress").w(160.).h(5.).radius(2.).fill(gray(53)).child(el().absolute(112.*s.pulse,0.).w(48.).h(5.).radius(2.).fill(gray(200))));
             } else if app.status != "live" { p = p.child(muted(if app.status == "connecting" {"Connecting to local board…"} else {"Local board offline"})); }
@@ -400,6 +403,16 @@ fn dialog(app:&App, page:Dialog, viewport: [f32; 2], filter_anchor: Option<[f32;
             } else {
                 if let Some(Err(error)) = &s.result { p = p.child(muted(error).wrap()); }
                 p = p.child(dialog_action(button("Retry status check", |a| a.host_request(HostOp::Inspect)).key("retry-host")));
+            }
+            if app.password_controls_available() {
+                p = p.child(line());
+                if let host_password::Panel::Notice(message) = s.password { p = p.child(muted(message).wrap()); }
+                p = p.child(dialog_action(button("Manage board password…", App::edit_host_password).key("manage-password")));
+                if app.password_address().is_some() {
+                    p = p.child(dialog_action(button("Copy password-join address", |_| {}).key("copy-password-address").on_press_tx(|a: &mut App, tx| {
+                        if let Some(address) = a.password_address() { tx.copy(address); }
+                    })));
+                }
             }
             p
         }
@@ -505,7 +518,38 @@ fn dialog(app:&App, page:Dialog, viewport: [f32; 2], filter_anchor: Option<[f32;
                 .key("create-task"))))),
         _ => None,
     };
-    modal_frame("board-dialog", viewport, if page == Schedule { 388. } else { 436. }, Some(top), panel, footer, |a| a.dialog = None)
+    modal_frame("board-dialog", viewport, if page == Schedule { 388. } else { 436. }, Some(top), panel, footer, App::close_dialog)
+}
+
+fn password_form(app: &App, panel: El) -> El {
+    use host_password::Panel::*;
+    let cancel = || dialog_action(button("Cancel", |a| a.share.password = Closed).key("cancel-password"));
+    match &app.share.password {
+        Edit { new, repeat, error } => panel.child(label("Board password"))
+            .child(muted("Allow people with this password to join this board. Setting it does not start a tunnel.").wrap())
+            .child(label("New password"))
+            .child(form_input(new, "host-new-password", "New password").secure().on_edit(|a: &mut App| {
+                let Edit { new, .. } = &mut a.share.password else { unreachable!() }; new
+            }))
+            .child(label("Repeat new password"))
+            .child(form_input(repeat, "host-repeat-password", "Repeat new password").secure().on_edit(|a: &mut App| {
+                let Edit { repeat, .. } = &mut a.share.password else { unreachable!() }; repeat
+            }))
+            .children(error.map(|msg| muted(msg).wrap()))
+            .child(dialog_action(button("Set or replace password…", App::review_password).key("review-password")))
+            .child(dialog_action(button("Disable password joins…", |a| a.share.password = ConfirmDisable).key("disable-password")))
+            .child(cancel()),
+        ConfirmSet(_) | ConfirmDisable => {
+            let disable = matches!(app.share.password, ConfirmDisable);
+            panel.child(label(if disable { "Disable password joins?" } else { "Set or replace the board password?" }))
+                .child(muted(if disable { "No one can join with the board password after this change. Existing members keep access." }
+                    else { "The new password replaces any previous one for future joins. Existing members keep access." }).wrap())
+                .child(dialog_action(button(if disable { "Confirm disable" } else { "Confirm password change" }, App::confirm_password).key("confirm-password")))
+                .child(cancel())
+        }
+        Saving { .. } => panel.child(muted("Updating board password…")),
+        _ => panel,
+    }
 }
 fn thread(app: &App, root: &Message,width:f32,height:f32) -> El {
     let id = root.id;
@@ -709,12 +753,12 @@ fn home(app:&App, [width,height]:[f32;2])->El {
 }
 
 fn onboarding_panel(app: &App) -> El {
-    use onboarding::Step;
+    use onboarding::{JoinMethod, Step};
     let o = &app.onboarding;
     if o.switching { return el().padding(22.).radius(12.).fill(gray(20)).child(label("Opening board…")); }
     let (step, title, detail) = match o.step {
         Step::Name => ("01 / PROFILE", "Welcome to NeoBoard", "Choose the name teammates will see on the board."),
-        Step::Board => ("02 / BOARD", if o.adding { "Add a board" } else { "Join or create a board" }, "Create a local board or join one with a private invite."),
+        Step::Board => ("02 / BOARD", if o.adding { "Add a board" } else { "Join or create a board" }, "Create a local board or join your host’s board."),
         Step::Connect => ("03 / AGENT SETUP", "Connect your agent", "Choose your agent and copy its setup guide. You can also do this later from Home."),
     };
     let mut panel = col().w_full().padding(18.).gap(10.)
@@ -741,28 +785,47 @@ fn onboarding_panel(app: &App) -> El {
                         .child(label(title).color(gray(if selected { 232 } else { 151 })))
                         .on_press_tx(move |a: &mut App, tx| {
                             if !a.onboarding.busy {
+                                if a.onboarding.joining != joining { a.onboarding.clear_join_fields(); }
                                 a.onboarding.joining = joining;
                                 a.onboarding.error = None;
-                                tx.focus(if joining { "onboarding-invite" } else { "onboarding-board-name" }, false);
+                                tx.focus(if !joining { "onboarding-board-name" } else if a.onboarding.method == JoinMethod::Password { "onboarding-server" } else { "onboarding-invite" }, false);
                             }
                         })
                 };
                 panel = panel.child(row().w_full().border_sides([0.,0.,1.,0.],gray(35))
                     .child(mode("Create", "onboarding-create", false)).child(mode("Join", "onboarding-join", true)));
             }
+            if o.busy { return panel.child(muted("Connecting…")); }
             if o.joining {
-                panel = panel.child(muted("Paste the private invite link from your host. No separate password is needed. Anyone with the link can join, so keep it out of public chats.").w_full().wrap());
-                panel = panel.child(form_input(&o.invite, "onboarding-invite", "Paste invite link").on_edit(|a: &mut App| &mut a.onboarding.invite));
+                let method = |title, key, method| {
+                    let selected = method == o.method;
+                    el().key(key).h(30.).px(10.).radius(5.).center().fill(gray(if selected { 42 } else { 16 })).hover(gray(50))
+                        .child(label(title)).on_press_tx(move |a: &mut App, tx| {
+                            if a.onboarding.busy || a.onboarding.method == method { return; }
+                            a.onboarding.clear_join_fields(); a.onboarding.method = method;
+                            tx.focus(if method == JoinMethod::Invite { "onboarding-invite" } else { "onboarding-server" }, false);
+                        })
+                };
+                panel = panel.child(row().gap(6.).items_center().child(muted("Join with"))
+                    .child(method("Private invite", "method-invite", JoinMethod::Invite))
+                    .child(method("Password", "method-password", JoinMethod::Password)));
+                panel = match o.method {
+                    JoinMethod::Invite => panel.child(muted("Paste the private invite link from your host. No separate password is needed.").wrap())
+                        .child(form_input(&o.invite, "onboarding-invite", "Paste private invite link").secure().on_edit(|a: &mut App| &mut a.onboarding.invite)),
+                    JoinMethod::Password => panel.child(muted("Paste the HTTPS address from your host. If it names a board, leave the slug blank.").wrap())
+                        .child(form_input(&o.server, "onboarding-server", "HTTPS server address").on_edit(|a: &mut App| &mut a.onboarding.server))
+                        .child(form_input(&o.slug, "onboarding-slug", "Board slug (default: general)").on_edit(|a: &mut App| &mut a.onboarding.slug))
+                        .child(form_input(&o.password, "onboarding-password", "Board password").secure().on_edit(|a: &mut App| &mut a.onboarding.password)),
+                };
+                panel = panel.child(muted("Your display name"))
+                    .child(form_input(&o.name, "onboarding-display-name", "Display name").on_edit(|a: &mut App| &mut a.onboarding.name));
             } else {
                 panel = panel.child(form_input(&o.board, "onboarding-board-name", "Board name").on_edit(|a: &mut App| &mut a.onboarding.board));
             }
-            panel = panel.child(if o.busy { muted("Connecting…") } else {
+            panel = panel.child(
                 row().gap(8.).child(dialog_action(button(if o.joining { "Join board" } else { "Create board" }, App::submit_board_setup).key("onboarding-submit")))
-                    .child(button(if o.adding { "Cancel" } else { "Back" }, |a| {
-                        if a.onboarding.adding { a.onboarding = Default::default(); }
-                        else { a.onboarding.step = Step::Name; a.onboarding.error = None; }
-                    }))
-            });
+                    .child(button(if o.adding { "Cancel" } else { "Back" }, |a| a.onboarding.cancel_form()).key("onboarding-cancel"))
+            );
         }
         Step::Connect => {
             let prompt = setup_guide::Guide::new(app).copy_text();
@@ -777,7 +840,7 @@ fn onboarding_panel(app: &App) -> El {
 }
 
 fn onboarding_layer(app: &App, viewport: [f32; 2]) -> El {
-    modal_frame("board-onboarding", viewport, 460., None, onboarding_panel(app), None, |_| {})
+    modal_frame("board-onboarding", viewport, 460., None, onboarding_panel(app), None, |a| a.onboarding.cancel_form())
 }
 
 fn update_layer(app: &App, viewport: [f32; 2]) -> Option<El> {

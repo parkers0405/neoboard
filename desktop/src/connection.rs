@@ -1,6 +1,6 @@
 //! The blocking shared client never runs on Rune's thread. Writes are not retried:
 //! a lost response is ambiguous, so keep the draft and let the user inspect the board.
-use std::{path::PathBuf, sync::mpsc, time::Duration};
+use std::{path::{Path, PathBuf}, sync::mpsc, time::Duration};
 use neochat::{client::{Client, connect_local}, protocol::{Action, Snapshot, Event, Reaction, ScheduledPost, Attachment, MAX_ATTACHMENT_BYTES}};
 
 #[derive(Clone, Default)]
@@ -59,6 +59,7 @@ pub enum Command {
     CreateBoard { id: String, name: String },
     JoinBoard { invite: JoinSource, name: String },
     Host { id: String, request: u64, operation: HostOp },
+    BoardPassword { id: String, request: u64, password: Option<JoinPassword> },
     SwitchBoard { id: String, path: Option<PathBuf> },
     Members(String),
     Personal(String),
@@ -70,12 +71,31 @@ pub enum Command {
 }
 pub struct HostedBoard { pub path: PathBuf, pub endpoint: String }
 pub type BoardSetup = (String, Snapshot, neochat::protocol::Member, Option<HostedBoard>);
-pub enum JoinSource { File(PathBuf), Link(neochat::invite_file::InviteFile) }
+// Deliberately neither serializable nor Debug. The worker drops the password after exchange.
+pub struct JoinPassword(zeroize::Zeroizing<String>);
+impl JoinPassword {
+    pub fn new(value: String) -> Self { Self(zeroize::Zeroizing::new(value)) }
+}
+
+pub enum JoinSource {
+    File(PathBuf), Link(neochat::invite_file::InviteFile),
+    Password { endpoint: String, project: String, password: JoinPassword },
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum HostOp { Inspect, Create, Stop }
 
-pub struct HostState { pub route: neochat::sharing::RouteState, pub link: Option<String> }
+pub struct HostState { pub route: neochat::sharing::RouteState, pub link: Option<String>, pub endpoint: Option<String> }
+
+// Host administration never uses the current session's bearer or an explicit endpoint,
+// even if the latter points to localhost. Discovery itself performs no network I/O.
+fn change_password(opts: &Options, id: &str, password: Option<JoinPassword>) -> bool {
+    if opts.fixture || opts.invite.is_some() || opts.endpoint.is_some() || opts.project.as_deref().is_some_and(|p| p != id) { return false; }
+    let Ok(admin) = Client::discover_admin(opts.data_dir.as_deref()) else { return false; };
+    let local = reqwest::Url::parse(admin.endpoint()).ok().is_some_and(|url| url.host_str().is_some_and(|host|
+        host == "localhost" || host.trim_matches(['[', ']']).parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())));
+    local && admin.set_board_password(id, password.as_ref().map(|p| p.0.as_str())).is_ok()
+}
 
 fn host_control(dir: Option<&std::path::Path>, id: &str, op: HostOp) -> Result<HostState, String> {
     use neochat::sharing::{self, RouteState};
@@ -83,7 +103,7 @@ fn host_control(dir: Option<&std::path::Path>, id: &str, op: HostOp) -> Result<H
         HostOp::Stop => sharing::stop_local(dir)?,
         HostOp::Create => {
             let invite = sharing::share_desktop_local(dir, id)?;
-            return Ok(HostState { route: RouteState::Connected, link: Some(invite.to_link()?) });
+            return Ok(HostState { route: RouteState::Connected, link: Some(invite.to_link()?), endpoint: Some(invite.endpoint) });
         }
         HostOp::Inspect => {}
     }
@@ -93,12 +113,13 @@ fn host_control(dir: Option<&std::path::Path>, id: &str, op: HostOp) -> Result<H
             && status.endpoint.as_deref().and_then(|e| neochat::invite_file::https_endpoint(e).ok()) == neochat::invite_file::https_endpoint(&invite.endpoint).ok())
             .and_then(|invite| invite.to_link().ok())
     } else { None };
-    Ok(HostState { route: status.state, link })
+    Ok(HostState { route: status.state, link, endpoint: status.endpoint })
 }
 
 pub enum Update {
     BoardSetup(Result<BoardSetup, String>),
     Host(u64, Result<HostState, String>),
+    BoardPassword(u64, bool),
     Members(String,Result<Vec<neochat::protocol::Member>,String>),
     Names(String,Vec<neochat::protocol::Member>),
     Personal(Result<neochat::protocol::Member,String>),
@@ -152,21 +173,41 @@ fn membership(stored: &std::path::Path, invite: &neochat::invite_file::InviteFil
     })
 }
 
+struct JoinCredential { invite: neochat::invite_file::InviteFile, path: Option<PathBuf>, personal: bool }
+
+fn kept_invite(path: Option<&Path>, stored: Option<&Path>) -> bool {
+    path.and_then(Path::parent).is_some_and(|dir| Some(dir) == stored)
+}
+
 fn join_board(source: JoinSource, name: Option<&str>, expected: Option<&str>, profile: Option<&str>) -> Result<BoardSetup, String> {
-    let (mut invite, mut path) = match source {
-        JoinSource::File(path) => (neochat::invite_file::InviteFile::read(&path)?, Some(path)),
-        JoinSource::Link(invite) => (invite, None),
+    let (mut invite, mut path, personal) = match source {
+        JoinSource::File(path) => (neochat::invite_file::InviteFile::read(&path)?, Some(path), false),
+        JoinSource::Link(invite) => (invite, None, false),
+        JoinSource::Password { endpoint, project, password } => {
+            let invite = neochat::client::join_with_password(&endpoint, &project, &password.0)
+                .map_err(|_| "Could not join. Check the server address, board slug and password.")?;
+            if invite.project.as_deref() != Some(&project) || neochat::invite_file::https_endpoint(&invite.endpoint)? != endpoint {
+                return Err("The server returned a credential for a different board.".into());
+            }
+            (invite, None, true)
+        }
     };
     let stored = crate::preferences_path().map(|p| p.with_file_name("invites"));
-    let kept = |path: &Option<PathBuf>| path.as_ref().is_some_and(|p| p.parent().is_some() && p.parent() == stored.as_deref());
     // The host's link changes every day. Someone opening a new one for a board this device
     // has already joined stays the member they were, with their name and their tasks.
-    if !kept(&path) && let Some((held, at)) = stored.as_deref().and_then(|dir| membership(dir, &invite, profile)) {
+    if !personal && !kept_invite(path.as_deref(), stored.as_deref()) && let Some((held, at)) = stored.as_deref().and_then(|dir| membership(dir, &invite, profile)) {
         invite = held;
         path = Some(at);
     }
-    let mut client = Client::new(&invite.endpoint, &invite.token, profile).map_err(|e| e.to_string())?.with_sender("desktop");
-    let snapshot = client.snapshot().map_err(|e| e.to_string())?;
+    let client = Client::new(&invite.endpoint, &invite.token, profile).map_err(|e| e.to_string())?.with_sender("desktop");
+    finish_join(JoinCredential { invite, path, personal }, client, name, expected, profile, stored.as_deref())
+}
+
+fn finish_join(credential: JoinCredential, mut client: Client, name: Option<&str>, expected: Option<&str>, profile: Option<&str>, stored: Option<&Path>) -> Result<BoardSetup, String> {
+    let JoinCredential { mut invite, mut path, personal } = credential;
+    // A remote error body is arbitrary text. Never display it after a password exchange.
+    let remote_error = |e: neochat::client::ClientError| if personal { "Could not verify the new board membership.".to_owned() } else { e.to_string() };
+    let snapshot = client.snapshot().map_err(remote_error)?;
     let available = crate::projects::available(&snapshot, true);
     let id = match invite.project.clone() {
         Some(id) if available.contains(id.as_str()) => id,
@@ -179,18 +220,18 @@ fn join_board(source: JoinSource, name: Option<&str>, expected: Option<&str>, pr
     // or they would all be one member sharing one name. Reconnecting must use it, so it
     // replaces an invite this app stored; a file the user chose keeps the shared invite
     // and the credential goes in a private copy.
-    if let Some(personal) = client.join().map_err(|e| e.to_string())? {
+    if !personal && let Some(personal) = client.join().map_err(|e| e.to_string())? {
         invite.token = personal.token;
         // The host renews a membership while it is used, so only the host can say it has ended.
         invite.expires_at = i64::MAX as u64;
-        if kept(&path) { invite.replace(path.as_ref().unwrap())?; } else { path = None; }
+        if kept_invite(path.as_deref(), stored) { invite.replace(path.as_ref().unwrap())?; } else { path = None; }
         client = Client::new(&invite.endpoint, &invite.token, profile).map_err(|e| e.to_string())?.with_sender("desktop");
     }
-    if let Some(name) = name { client.set_display_name(name).map_err(|e| e.to_string())?; }
-    let member = client.my_member().map_err(|e| e.to_string())?;
+    if let Some(name) = name { client.set_display_name(name).map_err(remote_error)?; }
+    let member = client.my_member().map_err(remote_error)?;
     let path = match path {
         Some(path) => path,
-        None => invite.store(&crate::preferences_path().ok_or("No settings directory available.")?.with_file_name("invites"))?,
+        None => invite.store(stored.ok_or("No settings directory available.")?)?,
     };
     Ok((id, snapshot, member, Some(HostedBoard { path, endpoint: invite.endpoint })))
 }
@@ -248,6 +289,7 @@ pub fn start(mut opts: Options, wake: rune::Waker) -> (mpsc::SyncSender<Command>
                         Ok(Command::JoinBoard { invite, name }) => if !change_board(&mut opts, Some(invite), Some(&name), None).0 { break; },
                         Ok(Command::SwitchBoard { id, path }) => if !change_board(&mut opts, path.map(JoinSource::File), None, Some(id)).0 { break; },
                         Ok(Command::Host { request, .. }) => if !send(Update::Host(request, Err("The local board is offline.".into()))) { break; },
+                        Ok(Command::BoardPassword { request, .. }) => if !send(Update::BoardPassword(request, false)) { break; },
                         Ok(Command::CreateBoard { .. }) => if !send(Update::BoardSetup(Err(e.to_string()))) { break; },
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
                         _ => {},
@@ -269,6 +311,7 @@ pub fn start(mut opts: Options, wake: rune::Waker) -> (mpsc::SyncSender<Command>
                         Ok(Command::JoinBoard { invite, name }) => if !change_board(&mut opts, Some(invite), Some(&name), None).0 { break; },
                         Ok(Command::SwitchBoard { id, path }) => if !change_board(&mut opts, path.map(JoinSource::File), None, Some(id)).0 { break; },
                         Ok(Command::Host { request, .. }) => if !send(Update::Host(request, Err("The local board is offline.".into()))) { break; },
+                        Ok(Command::BoardPassword { request, .. }) => if !send(Update::BoardPassword(request, false)) { break; },
                         Ok(Command::CreateBoard { .. }) => if !send(Update::BoardSetup(Err(e.to_string()))) { break; },
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
                         _ => {},
@@ -301,6 +344,9 @@ pub fn start(mut opts: Options, wake: rune::Waker) -> (mpsc::SyncSender<Command>
                                     "Host controls are busy. Try again shortly."
                                 } else { continue; };
                                 if !send(Update::Host(request, Err(error.into()))) { return; }
+                            }
+                            Command::BoardPassword { id, request, password } => {
+                                if !send(Update::BoardPassword(request, change_password(&opts, &id, password))) { return; }
                             }
                             Command::CreateBoard { id, name } => {
                                 let result = (|| -> Result<_, String> {
@@ -394,6 +440,89 @@ pub fn start(mut opts: Options, wake: rune::Waker) -> (mpsc::SyncSender<Command>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_password_uses_only_local_admin_and_never_a_share_route() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let record = |url: &str| serde_json::to_vec(&serde_json::json!({"url":url,"token":"ordinary-test-token"})).unwrap();
+        std::fs::write(dir.path().join("admin-token"), "test-admin").unwrap();
+        std::fs::write(dir.path().join("endpoint.json"), record(&url)).unwrap();
+        let opts = Options { data_dir: Some(dir.path().into()), ..Default::default() };
+        for denied in [Options { endpoint: Some(url.clone()), ..opts.clone() },
+            Options { invite: Some("unused".into()), ..opts.clone() }, Options { project: Some("other".into()), ..opts.clone() },
+            Options { fixture: true, ..opts.clone() }] {
+            assert!(!change_password(&denied, "team", None));
+        }
+        let handler = std::thread::spawn(move || {
+            for expected in [Some(" secret "), None] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(&stream);
+                let mut lines = (&mut reader).lines().map(Result::unwrap);
+                assert_eq!(lines.next().unwrap(), "POST /v1/admin/board-password HTTP/1.1");
+                let headers: Vec<_> = lines.take_while(|s| !s.is_empty()).collect();
+                assert!(headers.iter().any(|h| h.eq_ignore_ascii_case("authorization: Bearer test-admin")));
+                let len = headers.iter().filter_map(|h| h.to_lowercase().strip_prefix("content-length: ")?.parse::<usize>().ok()).next().unwrap();
+                let mut body = vec![0; len]; reader.read_exact(&mut body).unwrap();
+                assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap(), serde_json::json!({"project":"team","password":expected}));
+                stream.write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n").unwrap();
+            }
+        });
+        assert!(change_password(&opts, "team", Some(JoinPassword::new(" secret ".into()))));
+        assert!(change_password(&opts, "team", None));
+        handler.join().unwrap();
+    }
+
+    #[test]
+    fn exchanged_credential_is_verified_before_saving_and_never_redeemed_again() {
+        use neochat::invite_file::InviteFile;
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+
+        for valid in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let client = Client::new(&format!("http://{}", listener.local_addr().unwrap()), "personal-fixture", None).unwrap();
+            let server = std::thread::spawn(move || {
+                let snapshot = if valid { r#"{"cursor":0,"channels":["dev/general"],"messages":[]}"# }
+                    else { r#"{"cursor":0,"channels":["other/general"],"messages":[]}"# };
+                let mut calls = vec![("GET /v1/snapshot", snapshot)];
+                if valid { calls.extend([("POST /v1/display-name", "{}"), ("GET /v1/me", r#"{"actor":"sam","display_name":"Sam Lee"}"#)]); }
+                for (expected, reply) in calls {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let mut req = BufReader::new(&stream);
+                    let mut line = String::new(); req.read_line(&mut line).unwrap();
+                    assert!(line.starts_with(expected));
+                    let mut length = 0; let mut authorized = false;
+                    loop {
+                        line.clear(); req.read_line(&mut line).unwrap(); if line.trim().is_empty() { break; }
+                        let (k,v) = line.split_once(':').unwrap();
+                        if k.eq_ignore_ascii_case("content-length") { length = v.trim().parse().unwrap(); }
+                        if k.eq_ignore_ascii_case("authorization") { authorized = v.trim() == "Bearer personal-fixture"; }
+                    }
+                    assert!(authorized);
+                    if expected.starts_with("POST") {
+                        let mut body = vec![0; length]; req.read_exact(&mut body).unwrap();
+                        assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap(), serde_json::json!({"name":"Sam Lee"}));
+                    }
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).unwrap();
+                }
+            });
+            let invite = InviteFile { project: Some("dev".into()), version: 1, endpoint: "https://board.example/".into(), token: "personal-fixture".into(), expires_at: i64::MAX as u64 };
+            let result = finish_join(JoinCredential { invite, path: None, personal: true }, client, Some("Sam Lee"), None, None, Some(dir.path()));
+            if valid {
+                let (id, _, member, hosted) = result.unwrap();
+                assert_eq!(id, "dev"); assert_eq!(member.display_name.as_deref(), Some("Sam Lee"));
+                let path = hosted.unwrap().path;
+                assert_eq!(InviteFile::read(&path).unwrap().token, "personal-fixture");
+                #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; assert_eq!(path.metadata().unwrap().permissions().mode() & 0o777, 0o600); }
+            } else { assert!(result.is_err() && dir.path().read_dir().unwrap().next().is_none()); }
+            server.join().unwrap();
+        }
+    }
+
     #[test]
     fn explicit_download_never_overwrites() {
         let path = std::env::temp_dir().join(format!("neochat-desktop-save-{}", std::process::id()));

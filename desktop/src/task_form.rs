@@ -6,11 +6,11 @@ fn property(name: &str, control: El) -> El {
         .child(control.w(0.).grow(1.))
 }
 
-pub(super) fn selector(name: &str, key: &'static str, value: String) -> El {
-    property(name, select_trigger(value, false, move |a| {
+pub(super) fn selector(app: &App, name: &str, key: &'static str, value: String) -> El {
+    property(name, select_trigger(value, app.details_picker == Some(key), move |a| {
         a.task_search = edit("");
-        a.details_picker = Some(key);
-        if key == "choose-assignee" { a.show_assignees(); }
+        a.details_picker = if a.details_picker == Some(key) { None } else { Some(key) };
+        if key == "choose-assignee" && a.details_picker.is_some() { a.show_assignees(); }
     }).key(key))
 }
 
@@ -29,15 +29,16 @@ pub(super) fn properties(app: &App, panel: El) -> El {
     } else {
         let channel = channel_name(&app.task_channel);
         p = p.child(if app.editing_task.is_some() || app.task_parent.is_some() { property("Channel", label(channel)) }
-            else { selector("Channel","pick-channel",channel) });
+            else { selector(app,"Channel","pick-channel",channel) });
         let who = if app.assignee.text.is_empty() { "Unassigned" } else { app.actor_label(&app.assignee.text) };
-        p = p.child(selector("Assignee","choose-assignee",who.into()));
+        p = p.child(selector(app,"Assignee","choose-assignee",who.into()));
         if app.task_parent.is_none() { p = p.child(sprints::assignment(app)); }
         let parent = app.task_parent.map_or_else(|| "None".into(), |id| app.snapshot.messages.iter().find(|m| m.id==id).map_or_else(||format!("#{id}"),task_name));
-        p = p.child(selector("Parent task","pick-parent",parent));
+        p = p.child(selector(app,"Parent task","pick-parent",parent));
         let ids = parse_needs(&app.needs.text).unwrap_or_default();
-        p = p.child(selector("Depends on","pick-needs",match ids.as_slice() { [] => "None".into(), [id] => format!("#{id}"), _ => format!("{} tasks",ids.len()) }));
+        p = p.child(selector(app,"Depends on","pick-needs",match ids.as_slice() { [] => "None".into(), [id] => format!("#{id}"), _ => format!("{} tasks",ids.len()) }));
     }
+    if let Some(key) = app.details_picker.filter(|k| matches!(*k, "pick-channel"|"pick-sprint"|"choose-assignee"|"pick-parent"|"pick-needs")) { chooser(app, key); }
     p = p.child(property("Labels",form_input(&app.task_labels,"task-labels","category=design").on_edit(|a: &mut App| &mut a.task_labels)));
     if app.editing_task.is_none() {
         p = p.child(property("Attachment", if let Some(path) = &app.task_file {
@@ -70,21 +71,20 @@ fn change_channel(a: &mut App, channel: &str) {
     }
 }
 
-pub(super) fn chooser(app: &App, viewport: [f32;2], key: &str) -> El {
+/// The open field's options, floating under it with a search box.
+fn chooser(app: &App, key: &str) {
     let mut rows = Choices { query:app.task_search.text.trim().to_lowercase(), items:vec![] };
     let current = &app.task_channel;
     let mut note = None;
-    let title = match key {
+    match key {
         "pick-channel" => {
             for ch in app.snapshot.channels.iter().filter(|c| projects::contains(&app.project,c)) {
                 let name = ch.clone(); rows.add(channel_name(ch),ch==current,format!("channel-choice-{ch}"),move|a| {change_channel(a,&name);a.details_picker=None;});
             }
-            "Channel"
         }
         "pick-sprint" => {
             sprints::choices(app,&mut rows);
             if app.editing_task.is_some() { note=Some("Choosing a sprint updates membership immediately."); }
-            "Sprint"
         }
         "choose-assignee" => {
             rows.add("Unassigned".into(),app.assignee.text.is_empty(),"assign-none".into(),|a| {a.assignee=edit("");a.details_picker=None;});
@@ -93,14 +93,12 @@ pub(super) fn chooser(app: &App, viewport: [f32;2], key: &str) -> El {
                     let id=member.actor.clone(); rows.add(app.actor_label(&id).into(),id==app.assignee.text,format!("assign-member-{id}"),move|a| {a.assignee=edit(&id);a.details_picker=None;});
                 }, Some(Err(e)) => note=Some(e.as_str()), None => note=Some("Loading members…"),
             }
-            "Assignee"
         }
         "pick-parent" => {
             rows.add("No parent".into(),app.task_parent.is_none(),"parent-none".into(),|a| {a.task_parent=None;a.details_picker=None;});
             for m in app.snapshot.messages.iter().filter(|m| m.task.is_some() && &m.channel==current && Some(m.id)!=app.editing_task && app.organization.tasks.get(&m.id).is_none_or(|t| !t.global && t.parent.is_none())) {
                 let id=m.id; rows.add(task_name(m),app.task_parent==Some(id),format!("parent-{id}"),move|a| {a.task_parent=Some(id);a.details_picker=None;});
             }
-            "Parent task"
         }
         "pick-needs" => {
             let selected=parse_needs(&app.needs.text).unwrap_or_default();
@@ -112,15 +110,15 @@ pub(super) fn chooser(app: &App, viewport: [f32;2], key: &str) -> El {
                 });
             }
             note=Some("Select any tasks this task depends on in its channel.");
-            "Dependencies"
         }
-        _ => "Task properties",
-    };
-    let close=|a:&mut App| a.details_picker=None;
-    let header=row().w_full().padding(12.).items_center().child(label(title)).child(spacer()).child(button(if key=="pick-needs" {"Done"} else {"Back"},close).key("task-picker-back"));
-    let mut body=col().w_full().padding(12.).gap(6.).child(form_input(&app.task_search,"task-picker-search","Search choices").on_edit(|a:&mut App| &mut a.task_search)).children(note.map(|s|muted(s).wrap()));
-    if rows.items.is_empty() { rows.items.push(muted("No matching choices")); }
-    body=body.child(col().w_full().h(216.).scroll(ScrollSpec{stick_bottom:false}).children(rows.items));
-    if key=="pick-sprint" && app.editing_task.is_none() { body=body.child(button("Create new sprint…",|a| {a.error=None;a.details_picker=Some("new-sprint");}).key("new-sprint")); }
-    modal_frame("task-chooser",viewport,436.,Some(header),body,None,close)
+        _ => {}
+    }
+    let mut list=col().w_full().max_h(300.).scroll(ScrollSpec{stick_bottom:false})
+        .child(form_input(&app.task_search,"task-picker-search","Search").on_edit(|a:&mut App| &mut a.task_search).mb(4.))
+        .children(note.map(|s|muted(s).wrap().px(8.).py(4.)));
+    if rows.items.is_empty() { rows.items.push(muted("No matches").px(8.).py(6.)); }
+    list=list.children(rows.items);
+    if key=="pick-sprint" && app.editing_task.is_none() { list=list.child(line().my(4.)).child(choice_row("Create new sprint…".into(),false,|a| {a.error=None;a.details_picker=Some("new-sprint");}).key("new-sprint")); }
+    if key=="pick-needs" { list=list.child(line().my(4.)).child(choice_row("Done".into(),false,|a| a.details_picker=None).key("task-picker-back")); }
+    float_menu(app,key,list);
 }

@@ -9,7 +9,7 @@ docker compose up -d --build
 docker compose exec neochat neochat init
 ```
 
-Run the wizard once for each new board. Enter the board name (used as its ID), existing public HTTPS base URL, and password twice. The command prints a shareable address such as `https://board.communities.tech/#neoboard=dev` only after creation succeeds. In Desktop use **Join → Password** and enter this address, the password and a display name. For automation, use `docker compose exec -T neochat neochat init --board dev --public-url https://board.communities.tech --password-stdin < /secure/path/board-password`. Configure DNS, HTTPS and reverse proxy forwarding separately. Compose keeps persistent state in a named volume, temporary files on tmpfs and the raw API on host loopback. `docker compose stop` keeps the volume; `down -v` can delete it.
+Run the wizard once for each new board. Enter the board name (used as its ID), existing public HTTPS base URL, and password twice. The command prints a shareable address such as `https://board.communities.tech/#neoboard=dev` only after creation succeeds. In Desktop use **Join → Password** and enter this address and the password. For automation, use `docker compose exec -T neochat neochat init --board dev --public-url https://board.communities.tech --password-stdin < /secure/path/board-password`. Configure DNS, HTTPS and reverse proxy forwarding separately. Compose keeps persistent state in a named volume, temporary files on tmpfs and the raw API on host loopback. `docker compose stop` keeps the volume; `down -v` can delete it.
 
 ## Manage board passwords
 

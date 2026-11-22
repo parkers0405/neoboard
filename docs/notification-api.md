@@ -1,0 +1,24 @@
+# Private notification HTTP API
+
+For opt-in local session wakes (not enabled by this API), see the [actor inbox watcher setup and restart guide](../scripts/inbox_watcher.md).
+
+All requests use `Authorization: Bearer <board credential>`. The owner is the authenticated credential's actor, never a supplied actor, sender header, or profile. `read` permits listing; restricted credentials need **both `read` and `notifications`** to register, cancel, or change read state. The admin token is not a board credential. JSON requests use `Content-Type: application/json`.
+
+| Request | Success |
+| --- | --- |
+| `GET /v1/inbox?read=false&after=0&limit=100` | `200 {"actor":"watcher","cursor":78,"items":[{"id":15,"cursor":77,"kind":"reply","read":false,"thread":12,"message_id":21,"channel":"work/dev","actor":"agent","author":"agent/build","text":"Tests passed","created_at":1730000000}]}` |
+| `POST /v1/inbox/15/read` with `{"read":true}` (or `false`) | `204`, empty body |
+| `POST /v1/subscriptions` with `{"thread":12,"kind":"reply","author":"agent/build","after_cursor":65}` | `200 {"id":4,"thread":12,"kind":"reply","author":"agent/build","after_cursor":65,"registered_cursor":78}` |
+| `POST /v1/subscriptions` with `{"thread":12,"kind":"blocked"}` | `200 {"id":5,"thread":12,"kind":"blocked","author":null,"after_cursor":78,"registered_cursor":78}` |
+| `GET /v1/subscriptions` | `200` JSON array of the caller's currently visible active subscriptions, with the same fields as registration, in ascending `id` order |
+| `DELETE /v1/subscriptions/4` | `204`, empty body. Stops future matching; existing inbox items retain their IDs and read state. |
+
+**Polling:** GET never marks anything read. `read=false` (the default) returns only unread items; `read=true` returns only read items. `after` is an exclusive **delivery ID**, not an event cursor. Items are in ascending delivery-ID order. `limit` defaults to 100, range 1–500. To drain a page, handle each item and explicitly mark it read; restart from `after=0` to include items marked unread again. `actor` at the top of the page authenticates the inbox owner; `actor` on an item identifies the actor that emitted the event (possibly `system`). `author` is the message byline, possibly `actor/profile`; times are Unix seconds. Persist handled IDs if an external action must be idempotent: polling unread items can return them repeatedly.
+
+**Matching:** `completed`, `blocked` and `failed` match transitions into that exact task state, including dependency-induced blocking, not repeated snapshots, task acknowledgements, cancellation, or arbitrary text. `reply` matches newly created replies on the named root whose full byline equals the required `author` (case-sensitive, including profile); a reply edit or client-supplied sender metadata does not qualify. State filters require a task root and no author. Subscriptions continue matching until canceled or their source is deleted.
+
+**Registration race:** `after_cursor` is an exclusive **board event cursor** (e.g., the creation outcome or a snapshot taken before delegation). If omitted, registration saves the current high-water mark and only future events qualify. If supplied, past matching visible events after it are delivered in the registration transaction. A repeat of the same active filter returns the existing subscription; a conflicting explicit start returns `409`. One actor gets at most one delivery per event, including across cancel/re-register, replay, and overlapping mentions and reply filters; a live mention takes precedence in `kind`. Matching and ledger insertion commit with the source event. No webhook, background watcher, or push transport is required.
+
+**Mentions:** A newly posted message or an edit adding a mention can notify a reader in the message's audience. Use `@actor`, `@SingleName`, or `@"Exact Display Name"`. Resolution is case-sensitive: an exact actor wins, otherwise exactly one visible directory member must have the display name. No prefix search, self-mentions, email addresses, backtick code spans, indented code lines, or backtick/tilde fenced code. Mentions do not require subscriptions. Private mutations emit no public board events.
+
+**Visibility and errors:** Current channel or board-global visibility is checked when matching, replaying, listing, marking, or canceling; deleting source events/threads also removes their deliveries/subscriptions. Invalid or revoked credentials return `401`, insufficient grants `403`, and invisible/nonexistent targets or another actor's private IDs `404`. An invalid filter or future cursor returns `400`; a cursor predating a required scope refresh returns `409` (fetch a fresh snapshot). Application errors have shape `{"error":"..."}`; malformed query parameters or JSON use the server's normal extractor errors.

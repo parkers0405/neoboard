@@ -19,6 +19,11 @@ pub(super) fn tools(channel: &Value, text: &Value, id: &Value, offset: &Value, l
         ("sprints_create", "Create a sprint on a board.", json!({"board":channel,"title":text,"description":{"type":"string","maxLength":16384}}), vec!["board","title"]),
         ("tasks_set_sprint", "Set a top-level task's sprint; omit sprint to unassign.", json!({"id":id,"sprint":id}), vec!["id"]),
         ("sprints_finish", "Finish a sprint. Set allow_unfinished to leave unfinished tasks unchanged.", json!({"id":id,"allow_unfinished":{"type":"boolean"}}), vec!["id"]),
+        ("inbox_list", "Poll your private inbox without marking it read. Defaults to unread, after 0, limit 100. Pass next_after (a delivery ID, not an event cursor) until items is empty.", json!({"read":{"type":"boolean"},"after":offset,"limit":{"type":"integer","minimum":1,"maximum":500}}), vec![]),
+        ("inbox_set_read", "Set the read state of one of your visible deliveries by inbox item ID.", json!({"id":id,"read":{"type":"boolean"}}), vec!["id","read"]),
+        ("callbacks_register", "Subscribe privately to a task state transition or a new thread reply. For reply only, author is required (exact actor or actor/profile). Omit after_cursor for future events only, or replay matches after that board event cursor.", json!({"thread":id,"kind":{"type":"string","enum":["completed","blocked","failed","reply"]},"author":{"type":"string","minLength":1,"maxLength":161},"after_cursor":offset}), vec!["thread","kind"]),
+        ("callbacks_list", "List your active, visible callbacks in subscription ID order.", json!({"offset":offset,"limit":limit}), vec![]),
+        ("callbacks_cancel", "Cancel your visible callback by subscription ID. Existing deliveries are retained.", json!({"id":id}), vec!["id"]),
     ].into_iter().map(|(name,description,properties,required)| json!({"name":name,"description":description,"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false}})).collect()
 }
 
@@ -46,6 +51,28 @@ pub(super) fn call(c: &Client, name: &str, a: &Value) -> Option<Result<Value, &'
     let string = |key: &str| a[key].as_str().unwrap_or_default().to_owned();
     let labels = || serde_json::from_value(a.get("labels").cloned().unwrap_or(json!({}))).map_err(|_| "invalid_arguments");
     let action = match name {
+        "inbox_list" => {
+            let after = a["after"].as_u64().unwrap_or(0);
+            let limit = a["limit"].as_u64().unwrap_or(100) as usize;
+            return Some(c.inbox(a["read"] == true, after, limit).map_err(upstream_error).and_then(|inbox| {
+                let items = inbox.items.into_iter().map(|item| json!(item)).collect();
+                let mut result = page(items, limit, json!({"actor":inbox.actor,"cursor":inbox.cursor,"next_after":after}), "items", "next_after", |item, _| item["id"].as_u64().unwrap())?;
+                // The HTTP page is already limited: it cannot establish end-of-inbox.
+                result.as_object_mut().unwrap().remove("has_more");
+                Ok(result)
+            }));
+        }
+        "inbox_set_read" => {
+            let id = id?;
+            let read = a["read"].as_bool()?;
+            return Some(c.set_inbox_read(id, read).map(|()| json!({"id":id,"read":read})).map_err(upstream_error));
+        }
+        "callbacks_register" => return Some(c.register_subscription(a["thread"].as_u64()?, a["kind"].as_str()?, a["author"].as_str(), a["after_cursor"].as_u64()).map(|sub| json!(sub)).map_err(upstream_error)),
+        "callbacks_list" => return Some(c.subscriptions().map_err(upstream_error).and_then(|subs| list(subs.into_iter(), a, "callbacks"))),
+        "callbacks_cancel" => {
+            let id = id?;
+            return Some(c.cancel_subscription(id).map(|()| json!({"id":id,"canceled":true})).map_err(upstream_error));
+        }
         "sprints_list" => return Some(c.organization().map_err(upstream_error).and_then(|org| list(org.sprints.into_values().filter(|s| a["board"].as_str().is_none_or(|b| b == s.board)), a, "sprints"))),
         "sprints_create" => Action::CreateSprint { board: string("board"), title: string("title"), description: string("description") },
         "tasks_set_sprint" => Action::SetTaskSprint { id: id?, sprint: a["sprint"].as_u64() },

@@ -21,11 +21,26 @@ python3 scripts/github_bridge.py state.sqlite binding.json poll
 
 Use `X-GitHub-Event`, `X-GitHub-Delivery`, and `X-Hub-Signature-256`, respectively. Schedule `poll` repeatedly; each invocation processes one events response. The first poll starts at cursor zero and can export **existing** labeled roots and mapped replies, so review channel history first. Label-based opt-in is not a separate authorization boundary: only grant board access to people permitted to publish to this repository. Text travels in both directions, including mentions. Edits, closures, review summaries, attachments, deletions, reactions, and thread recreation are not synchronized.
 
-## Recovery and loop prevention
+## Task questions and answers (#185 watcher contract)
 
 Optional immutable binding field `issue_task_assignee`: set this to a board actor to import issue roots as assigned tasks (also when a comment precedes the opening event). This requires the `post_task` grant. Pull requests remain conversations. The assignee comes from operator configuration, never the webhook body. Assignment does not itself claim the task.
 
-Imports use stable board idempotency keys and commit delivery ID, source object ID, returned board ID and mapping together. Exports deduplicate by board message ID, not event cursor. The bridge ignores its own GitHub object author ID, its authenticated board event actor, and subsequent updates of imported messages. The HTML marker `<!-- neoboard:ID -->` aids inspection; it is not trusted as proof of origin.
+Answers are off by default. To opt in, include e.g. `"answer_actor_ids":[789]` in the binding: these are trusted GitHub **account IDs** (positive JSON integers), not logins, board actors, or session IDs. Like the other binding fields this policy is immutable for a state database. Do not reset the database to change it. On the watcher, authorize the authenticated `board_actor` for the specific `repo:<repo_id>` route (see [watcher contract](board_watcher.md)); neither side's policy replaces the other's.
+
+An exported board reply labeled `watcher_kind=pending_question` shows its board reply ID when the feature is enabled. For a question with ID `51`, an allowlisted user can create this issue comment in the **same** GitHub conversation:
+
+```text
+/neoboard-answer 51
+Use blue.
+```
+
+The command must be the entire first line, with a canonical positive decimal board reply ID and nonblank answer on subsequent lines. Only signed `issue_comment.created` imports can qualify. The bridge checks the comment author, repository, existing issue/thread mapping, confirmed question export, and current board snapshot (marked reply and task root in the bound channel). A new label on an ordinary exported comment cannot make it a question. Old exports without question provenance are not backfilled. Command text, quoted markers and mentions are never evidence of a task or session binding. Unmatched comments still mirror as ordinary replies; edits are ignored. If a comment arrives before its question export is confirmed, send a **new** comment after confirmation rather than replaying the old one.
+
+For a match, the bridge posts the answer text alone under the task root using its own board token (`reply_with_labels`, no author override). Its only labels are `watcher_kind=answer`, `watcher_question=51` (string) and e.g. `watcher_route=repo:123`. The watcher, not the bridge, decides whether that question is still pending under the authorized worker's live lease and session. A worker's nonempty `tasks_complete` result is already a board reply: it mirrors as one GitHub comment. No separate completion comment is synthesized from the root update.
+
+## Recovery and loop prevention
+
+Imports use stable board idempotency keys and record the delivery ID, source object ID and returned board ID together. For candidate answer commands the bridge saves the exact outgoing reply decision before the board write, so a lost response cannot upgrade an ordinary reply or change a labeled action on retry. Exports deduplicate by board message ID, not event cursor. The bridge ignores its own GitHub object author ID, its authenticated board event actor, and subsequent updates of imported messages. The HTML marker `<!-- neoboard:ID -->` aids inspection; it is not trusted as proof of origin.
 
 GitHub does not provide an exactly-once comment POST. The bridge records a pending export **before** sending. If an attempt is interrupted, it will not retry it blindly. Stop poll workers, inspect the pending message, the remote issue/comment, marker, text and authenticated creator. If it landed, run `python3 scripts/github_bridge.py state.sqlite binding.json confirm MESSAGE REMOTE` (issue **number** for roots, comment **ID** for replies). Only after verifying the request is no longer in flight and definitely did not land, run `retry-absent MESSAGE` instead. Resume polling and redeliver failed webhooks. If uncertain, leave it pending. While issue creation is pending, inbound deliveries needing a new root are deferred to avoid a second mapping. No background service, automatic reconciliation, historical GitHub backfill or live credentials are included.
 

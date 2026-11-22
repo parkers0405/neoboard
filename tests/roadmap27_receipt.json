@@ -1,0 +1,21 @@
+{
+  "issue": 27,
+  "task": 2,
+  "state_events": [["waiting",4],["ready",5],["claimed",7],["in_progress",8],["completed",12]],
+  "session": "ses_dfec6b7b8ffdeE7OoBfas6YTwV",
+  "turns": ["msg_201394ee1001TJHOI8CgZ3RNCA","msg_201395a660012dU40I9pHX7R7B"],
+  "mcp_calls": ["neoboard.tasks_list","neoboard.tasks_claim","neoboard.tasks_start","neoboard.reply","neoboard.read","neoboard.tasks_complete","neoboard.tasks_list"],
+  "reservations": ["921aee197d61914dee3e9956e903a0f1:4","921aee197d61914dee3e9956e903a0f1:11"],
+  "answer_route": "repo:19",
+  "result": "Selected cobalt.",
+  "watcher_status": [["assignment","accepted"],["answer","accepted"]],
+  "restart_cycles": [{"cursor":13,"wake":null},{"cursor":13,"wake":null}],
+  "restart_extra_turns": 0,
+  "question": 4,
+  "answer": 6,
+  "response": 7,
+  "remote_question": 9001,
+  "remote_response": 9002,
+  "decoy_session": "ses_dfec6b77dffdO8wOBAKhsSvr3l",
+  "decoy_turns": 0
+}

@@ -19,24 +19,60 @@ def positive(value):
 class Bridge:
     def __init__(self, path, cfg, board, github):
         self.cfg, self.board, self.github = cfg, board, github
+        actors = cfg.get('answer_actor_ids', [])
+        if not isinstance(actors, list):
+            raise ValueError('answer_actor_ids must be a list of positive integer IDs')
+        self.answer_actors = frozenset(positive(actor) for actor in actors)
         self.db = db = sqlite3.connect(path, timeout=60)
         db.executescript('''
             CREATE TABLE IF NOT EXISTS config(id INTEGER PRIMARY KEY, binding TEXT, cursor INTEGER);
             CREATE TABLE IF NOT EXISTS mapping(number INTEGER PRIMARY KEY, thread INTEGER UNIQUE NOT NULL);
             CREATE TABLE IF NOT EXISTS delivery(key TEXT PRIMARY KEY);
             CREATE TABLE IF NOT EXISTS imported(source TEXT PRIMARY KEY, message INTEGER UNIQUE NOT NULL);
+            CREATE TABLE IF NOT EXISTS pending_reply(source TEXT PRIMARY KEY, action TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS exported(message INTEGER PRIMARY KEY, root INTEGER NOT NULL, remote INTEGER);
         ''')
         with db:
+            db.execute('BEGIN IMMEDIATE')
             binding = json.dumps(cfg, sort_keys=True)
             db.execute('INSERT OR IGNORE INTO config VALUES(1,?,0)', (binding,))
             if db.execute('SELECT binding FROM config').fetchone()[0] != binding:
                 raise ValueError('state belongs to a different bridge configuration')
+            if 'question_thread' not in {col[1] for col in db.execute('PRAGMA table_info(exported)')}:
+                db.execute('ALTER TABLE exported ADD COLUMN question_thread INTEGER')
 
     def action(self, key, **action):
         prefix = f"gh:{self.cfg['repo_id']}:{self.cfg['channel']}:"
         idem = hashlib.sha256((prefix + key).encode()).hexdigest()
         return positive(self.board('/v1/actions', action, {'Idempotency-Key': idem})['id'])
+
+    def issue_answer(self, db, thread, body):
+        command, _, answer = (body or '').partition('\n')
+        match = re.fullmatch(r'/neoboard-answer ([1-9][0-9]{0,18})\r?', command)
+        if not match or not answer.strip():
+            return None
+        question = int(match[1])
+        if question > 2**63 - 1 or not db.execute('''SELECT 1 FROM exported
+                WHERE message=? AND question_thread=? AND remote IS NOT NULL''', (question, thread)).fetchone():
+            return None
+        # The export proves what was published; the snapshot verifies the mark still
+        # exists on that reply under a real task. Neither GitHub text nor an HTML marker is evidence.
+        messages = {m['id']: m for m in self.board('/v1/snapshot')['messages']
+                    if m['channel'] == self.cfg['channel'] and m['id'] in (question, thread)}
+        root, reply = messages.get(thread), messages.get(question)
+        if not (root and root['parent'] is None and isinstance(root.get('task'), dict)
+                and reply and reply['parent'] == thread and reply['labels'].get('watcher_kind') == 'pending_question'):
+            return None
+        return dict(type='reply_with_labels', thread=thread, text=answer.strip(), labels={
+            'watcher_kind': 'answer', 'watcher_question': match[1], 'watcher_route': f"repo:{self.cfg['repo_id']}"})
+
+    def seen_import(self, db, delivery, source):
+        if db.execute('SELECT 1 FROM delivery WHERE key=?', (delivery,)).fetchone():
+            return True
+        if db.execute('SELECT 1 FROM imported WHERE source=?', (source,)).fetchone():
+            db.execute('INSERT INTO delivery VALUES(?)', (delivery,))
+            return True
+        return False
 
     def webhook(self, event, delivery, signature, raw, secret):
         if not secret or not hmac.compare_digest(
@@ -45,7 +81,7 @@ class Bridge:
         if not delivery:
             raise ValueError('missing delivery ID')
         p = json.loads(raw)
-        if p['repository']['id'] != self.cfg['repo_id']:
+        if positive(p['repository']['id']) != self.cfg['repo_id']:
             raise ValueError('wrong repository')
         if (event, p.get('action')) not in {('issues', 'opened'), ('pull_request', 'opened'),
                 ('issue_comment', 'created'), ('pull_request_review_comment', 'created')}:
@@ -53,16 +89,17 @@ class Bridge:
         item = p['issue' if event in ('issues', 'issue_comment') else 'pull_request']
         number = positive(item['number'])
         obj = p['comment'] if event.endswith('comment') else item
-        if obj['user']['id'] == self.cfg['github_actor_id']:
+        actor = positive(obj['user']['id'])
+        if actor == self.cfg['github_actor_id']:
             return 'echo'
         key = f"{event}:{positive(obj['id'])}"
         text = (obj.get('title', '') + '\n\n' + (obj['body'] or '')).strip() or '(empty)'
+        candidate = (event == 'issue_comment' and actor in self.answer_actors
+                     and ('sender' not in p or positive(p['sender']['id']) == actor)
+                     and (obj['body'] or '').startswith('/neoboard-answer '))
         with self.db as db:
             db.execute('BEGIN IMMEDIATE')
-            if db.execute('SELECT 1 FROM delivery WHERE key=?', (delivery,)).fetchone():
-                return 'duplicate'
-            db.execute('INSERT INTO delivery VALUES(?)', (delivery,))
-            if db.execute('SELECT 1 FROM imported WHERE source=?', (key,)).fetchone():
+            if self.seen_import(db, delivery, key):
                 return 'duplicate'
             row = db.execute('SELECT thread FROM mapping WHERE number=?', (number,)).fetchone()
             if not row:
@@ -76,8 +113,27 @@ class Bridge:
                 db.execute('INSERT INTO mapping VALUES(?,?)', (number, thread))
             else:
                 thread = row[0]
-            message = self.action(key, type='reply', thread=thread, text=text)
+            reply = dict(type='reply', thread=thread, text=text)
+            if candidate:
+                # Freeze both positive and negative decisions before the board write. Its
+                # idempotency key cannot be retried with a different action after a timeout.
+                pending = db.execute('SELECT action FROM pending_reply WHERE source=?', (key,)).fetchone()
+                if pending:
+                    reply = json.loads(pending[0])
+                    if reply['thread'] != thread:
+                        raise ValueError('pending comment belongs to a different thread')
+                else:
+                    if row:
+                        reply = self.issue_answer(db, thread, obj['body']) or reply
+                    db.execute('INSERT INTO pending_reply VALUES(?,?)', (key, json.dumps(reply)))
+                    db.commit()
+                    db.execute('BEGIN IMMEDIATE')
+                    if self.seen_import(db, delivery, key):
+                        return 'duplicate'
+            message = self.action(key, **reply)
             db.execute('INSERT INTO imported VALUES(?,?)', (key, message))
+            db.execute('INSERT INTO delivery VALUES(?)', (delivery,))
+            db.execute('DELETE FROM pending_reply WHERE source=?', (key,))
         return 'imported'
 
     def cursor(self):
@@ -118,12 +174,15 @@ class Bridge:
                         if old == (None,):
                             raise RuntimeError(f'unresolved export of board message {mid}; reconcile before polling')
                         if old is None:
-                            db.execute('INSERT INTO exported VALUES(?,?,NULL)', (mid, root))
+                            question = bool(self.answer_actors and row and m['labels'].get('watcher_kind') == 'pending_question')
+                            db.execute('INSERT INTO exported(message,root,question_thread) VALUES(?,?,?)',
+                                       (mid, root, m['parent'] if question else None))
                             target = '/issues' if root else f'/issues/{row[0]}/comments'
                 if not target:
                     db.execute('UPDATE config SET cursor=?', (seq,))
             if target:
-                body = {'body': m['text'] + f'\n\n<!-- neoboard:{mid} -->'}
+                hint = f'\n\nBoard question reply ID: `{mid}`' if question else ''
+                body = {'body': m['text'] + hint + f'\n\n<!-- neoboard:{mid} -->'}
                 if root:
                     body['title'] = (m['text'].strip().split('\n')[0] or 'Board issue')[:200]
                 result = self.github('/repos/' + self.cfg['repo'] + target, body)

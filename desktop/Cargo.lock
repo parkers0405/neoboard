@@ -2819,7 +2819,7 @@ dependencies = [
 
 [[package]]
 name = "neochat"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -2844,7 +2844,7 @@ dependencies = [
 
 [[package]]
 name = "neochat-desktop"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "base64 0.22.1",
  "dirs",

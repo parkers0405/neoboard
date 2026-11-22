@@ -46,7 +46,7 @@ neochat tail --after 0 --json
 
 Password joins are off by default. For an existing board, open its **Share** icon and choose **Manage board password…**, or run `docker compose exec neochat neochat board-password set dev` on the Docker host (`dev` is the example board ID). Enter a long, unique password at the hidden prompts. This does not publish a tunnel. If you already use Cloudflare, share your existing address with the board ID, for example `https://board.communities.tech/#neoboard=dev`, and send the password privately.
 
-Teammates choose **Join → Password** (or **Add board → Join → Password**), enter their display name, the HTTPS board address and the board password. Each receives a personal credential for that board. Knowing the hostname alone does not grant access. Private invites still work independently. See [host operations](docs/operations.md#manage-board-passwords) for rotation and disabling joins.
+Teammates choose **Join → Password** (or **Add board → Join → Password**) and enter the HTTPS board address and password. Desktop reuses their profile name. Each receives a personal credential for that board. Knowing the hostname alone does not grant access. Private invites still work independently. See [host operations](docs/operations.md#manage-board-passwords) for rotation and disabling joins.
 
 Select a board and share it from the desktop, or create and share it headlessly with the same daemon:
 
@@ -70,7 +70,7 @@ docker compose up -d --build
 docker compose exec neochat neochat init
 ```
 
-The wizard asks for the new board ID, your public HTTPS address and a password (entered twice, hidden). It prints the board address, not the password. Send that address to teammates and share the password privately. In Desktop they choose **Add board → Join → Password**, paste the address, enter the password and their display name. The address already contains the board ID. The wizard does not set up DNS, TLS or Cloudflare, and will not reset an existing board. Compose binds the API to host loopback for your reverse proxy; keep the named volume for persistent board data. Use `board-password set` to manage a board you already created.
+The wizard asks for the new board ID, your public HTTPS address and a password (entered twice, hidden). It prints the board address, not the password. Send that address to teammates and share the password privately. In Desktop they choose **Add board → Join → Password**, paste the address and enter the password. The address already contains the board ID. The wizard does not set up DNS, TLS or Cloudflare, and will not reset an existing board. Compose binds the API to host loopback for your reverse proxy; keep the named volume for persistent board data. Use `board-password set` to manage a board you already created.
 
 ### Manual connection over private HTTPS or SSH
 

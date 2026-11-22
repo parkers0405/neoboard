@@ -256,38 +256,40 @@ impl Sharing {
         let board = self.board.clone();
         let token = self.board_token.clone();
         let prefix = format!("{}/", request.project);
-        let exists = tokio::task::spawn_blocking(move || {
-            Ok(board.snapshot(&token)?.channels.iter().any(|channel| channel.starts_with(&prefix)))
+        let observed = tokio::task::spawn_blocking(move || {
+            let snapshot = board.snapshot(&token)?;
+            Ok(snapshot.channels.iter().any(|channel| channel.starts_with(&prefix)).then_some(snapshot.cursor))
         }).await.map_err(|_| internal_error())?.map_err(board_error)?;
-        if !exists {
+        let Some(observed) = observed else {
             return Err((StatusCode::NOT_FOUND, "Unknown board; create it before sharing.".into()));
-        }
+        };
         let endpoint = self.endpoint().await.map_err(|error| (StatusCode::BAD_GATEWAY, error))?;
         match std::fs::remove_file(self.dir.join("share-disabled")) {
             Ok(()) => (), Err(e) if e.kind() == std::io::ErrorKind::NotFound => (), Err(_) => return Err(internal_error()),
         }
-        self.invite_for_endpoint(endpoint, request, reuse).await
+        self.invite_for_endpoint(endpoint, request, reuse, observed).await
     }
 
-    async fn invite_for_endpoint(&self, endpoint: String, request: ShareRequest, reuse: bool) -> Result<InviteFile, (StatusCode, String)> {
+    async fn invite_for_endpoint(&self, endpoint: String, request: ShareRequest, reuse: bool, observed: u64) -> Result<InviteFile, (StatusCode, String)> {
         if reuse {
             if let Some(invite) = self.lookup(&request.project, &endpoint)? { return Ok(invite); }
         }
-        let invite = self.issue_invite(endpoint, request, reuse).await?;
+        let invite = self.issue_invite(endpoint, request, reuse, observed).await?;
         self.remember(&invite).map_err(|_| internal_error())?;
         Ok(invite)
     }
 
-    async fn issue_invite(&self, endpoint: String, request: ShareRequest, shared: bool) -> Result<InviteFile, (StatusCode, String)> {
+    async fn issue_invite(&self, endpoint: String, request: ShareRequest, shared: bool, observed: u64) -> Result<InviteFile, (StatusCode, String)> {
         let board = self.board.clone();
         let admin = self.admin_token.clone();
         let expires_at = now() + 86_400;
         let scope = format!("{}/*", request.project);
         let actor = request.actor.clone();
+        let project = request.project.clone();
         // The desktop link is handed to several people; a named CLI invite is one actor.
         let invite = tokio::task::spawn_blocking(move || {
             let request = InviteRequest { actor, channels: vec![scope], expires_at: Some(expires_at) };
-            if shared { board.create_shared_invite(&admin, request) } else { board.create_invite(&admin, request) }
+            board.issue_checked(&admin, request, None, shared, Some((&project, observed)))
         }).await.map_err(|_| internal_error())?.map_err(board_error)?;
 
         // Only the scoped guest credential ever traverses the tunnel. /v1/me
@@ -532,12 +534,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_share_view_cannot_issue_after_delete_and_recreation() {
+        let dir = tempfile::tempdir().unwrap();
+        let sharing = service(dir.path());
+        let observed = sharing.board.snapshot(HOST).unwrap().cursor;
+        sharing.board.delete_board(ADMIN,"team").unwrap();
+        sharing.board.action(HOST,None,None,Action::CreateChannel {channel:"team/general".into()}).unwrap();
+        // Fail before probing a public endpoint or touching a real tunnel.
+        let err = sharing.issue_invite("unused".into(), request(), true, observed).await.err().unwrap();
+        assert_eq!(err.0,StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
     async fn invites_only_expose_the_selected_project() {
         let dir = tempfile::tempdir().unwrap();
         let sharing = service(dir.path());
         // Stand in for the SDK's forwarding leg; no public service is called.
         let (endpoint, task) = serve(crate::router(sharing.board.clone())).await;
-        let invite = sharing.issue_invite(endpoint, request(), false).await.unwrap();
+        let invite = sharing.issue_invite(endpoint, request(), false, 0).await.unwrap();
         assert_eq!(invite.project.as_deref(), Some("team"));
         assert!(invite.expires_at > now() + 86_000);
         sharing.board.action(HOST, None, None, Action::CreateChannel { channel: "team/new".into() }).unwrap();
@@ -550,19 +564,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sharing = service(dir.path());
         let (endpoint, task) = serve(crate::router(sharing.board.clone())).await;
-        let first = sharing.invite_for_endpoint(endpoint.clone(), request(), false).await.unwrap();
+        let first = sharing.invite_for_endpoint(endpoint.clone(), request(), false, 0).await.unwrap();
         // An invite issued to one named actor is never handed to everyone using the desktop link.
         let guest = |actor: &str| ShareRequest { actor: actor.into(), ..request() };
-        let desktop = sharing.invite_for_endpoint(endpoint.clone(), guest("guest-a"), true).await.unwrap();
+        let desktop = sharing.invite_for_endpoint(endpoint.clone(), guest("guest-a"), true, 0).await.unwrap();
         assert!(desktop.token != first.token);
         assert!(sharing.board.join(&first.token).is_err());
         assert!(sharing.board.join(&desktop.token).is_ok());
-        let again = sharing.invite_for_endpoint(endpoint.clone(), guest("guest-b"), true).await.unwrap();
+        let again = sharing.invite_for_endpoint(endpoint.clone(), guest("guest-b"), true, 0).await.unwrap();
         assert!(again.token == desktop.token);
-        let writer = sharing.invite_for_endpoint(endpoint.clone(), guest("writer"), false).await.unwrap();
+        let writer = sharing.invite_for_endpoint(endpoint.clone(), guest("writer"), false, 0).await.unwrap();
         assert!(writer.token != first.token);
         assert!(sharing.lookup("team", &endpoint).unwrap().is_none());
-        let second = sharing.invite_for_endpoint(endpoint.clone(), guest("guest-c"), true).await.unwrap();
+        let second = sharing.invite_for_endpoint(endpoint.clone(), guest("guest-c"), true, 0).await.unwrap();
         assert!(second.token != desktop.token);
         assert!(sharing.lookup("team", &endpoint).unwrap().unwrap().token == second.token);
         assert!(sharing.lookup("team-sandbox", &endpoint).unwrap().is_none());

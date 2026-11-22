@@ -20,18 +20,15 @@ pub enum Step { #[default] Name, Board, Connect }
 pub enum JoinMethod { #[default] Invite, Password }
 
 // The fragment names the board; it is never part of the endpoint sent to the client.
-fn password_target(address: &str, slug: &str) -> Result<(String, String), &'static str> {
+fn password_target(address: &str) -> Result<(String, String), &'static str> {
     let address = address.trim();
-    let slug = slug.trim();
     let (base, fragment) = match address.split_once('#') {
         None => (address, None),
         Some((base, fragment)) => (base, Some(fragment.strip_prefix("neoboard=")
             .filter(|id| neochat::valid_project(id)).ok_or("Use a server address or a #neoboard=BOARD link. For a private invite, choose Private invite.")?)),
     };
     let endpoint = neochat::invite_file::https_endpoint(base)?;
-    if !slug.is_empty() && fragment.is_some_and(|id| id != slug) { return Err("The board slug must match the board in the server link."); }
-    let project = fragment.unwrap_or(if slug.is_empty() { "general" } else { slug });
-    if !neochat::valid_project(project) { return Err("Enter a valid board slug (letters, digits, dashes, underscores or dots)."); }
+    let project = fragment.unwrap_or("general");
     Ok((endpoint, project.to_owned()))
 }
 
@@ -42,7 +39,6 @@ pub struct Onboarding {
     pub invite: TextEdit,
     pub method: JoinMethod,
     pub server: TextEdit,
-    pub slug: TextEdit,
     pub password: TextEdit,
     pub joining: bool,
     pub adding: bool,
@@ -54,14 +50,14 @@ pub struct Onboarding {
 impl Default for Onboarding {
     fn default() -> Self {
         Self { step: Step::Name, name: edit(""), board: edit(""), invite: edit("").secure(), joining: false,
-            method: Default::default(), server: edit(""), slug: edit(""), password: edit("").secure(),
+            method: Default::default(), server: edit(""), password: edit("").secure(),
             adding: false, busy: false, switching: false, error: None }
     }
 }
 
 impl Onboarding {
     pub fn clear_join_fields(&mut self) {
-        self.invite.clear(); self.password.clear(); self.server.clear(); self.slug.clear();
+        self.invite.clear(); self.password.clear(); self.server.clear();
         self.error = None;
     }
 
@@ -181,7 +177,8 @@ impl App {
     }
 
     pub fn onboarding_visible(&self) -> bool {
-        self.onboarding.adding || self.onboarding.switching || self.onboarding.step == Step::Connect || (!self.fixture && self.project.is_empty())
+        self.onboarding.adding || self.onboarding.switching || self.onboarding.step == Step::Connect
+            || (!self.fixture && self.project.is_empty() && self.saved_boards.entries().is_empty())
     }
 
     pub fn begin_add_board(&mut self) {
@@ -194,6 +191,7 @@ impl App {
         if self.onboarding.busy { return; }
         let name = self.onboarding.name.text.trim().to_owned();
         if name.is_empty() || name.chars().count() > 80 || name.chars().any(char::is_control) {
+            self.onboarding.step = Step::Name;
             self.onboarding.error = Some("Enter a display name (1 to 80 characters).".into());
             return;
         }
@@ -209,7 +207,7 @@ impl App {
                     Err(error) => { o.error = Some(error); return; }
                 },
                 JoinMethod::Password => {
-                    let (endpoint, project) = match password_target(&o.server.text, &o.slug.text) {
+                    let (endpoint, project) = match password_target(&o.server.text) {
                         Ok(target) => target,
                         Err(error) => { o.error = Some(error.into()); return; }
                     };
@@ -290,32 +288,30 @@ mod tests {
 
     #[test]
     fn password_join_targets_are_unambiguous_and_https_only() {
-        assert_eq!(password_target("https://boards.invalid/prefix/#neoboard=QA_42", ""),
+        assert_eq!(password_target("https://boards.invalid/prefix/#neoboard=QA_42"),
             Ok(("https://boards.invalid/prefix/".into(), "QA_42".into())));
-        for (address, slug, expected) in [
-            ("https://host", "", "general"), ("https://host/", " design ", "design"),
-            ("https://host/#neoboard=dev", "", "dev"), ("https://host/#neoboard=dev", "dev", "dev"),
+        for (address, expected) in [
+            ("https://host", "general"), ("https://host/#neoboard=dev", "dev"),
         ] {
-            assert_eq!(password_target(address, slug), Ok(("https://host/".into(), expected.into())));
+            assert_eq!(password_target(address), Ok(("https://host/".into(), expected.into())));
         }
-        for (address, slug) in [("http://localhost", ""), ("https://user:pass@host", ""), ("https://host/?key=x", ""),
-            ("https://host/#neoboard=dev&key=x", ""), ("https://host/#neoboard=dev", "other"),
-            ("https://host/#neoboard=", ""), ("https://host", "../other"), ("https://host/#foo", "")] {
-            assert!(password_target(address, slug).is_err());
+        for address in ["http://localhost", "https://user:pass@host", "https://host/?key=x",
+            "https://host/#neoboard=dev&key=x", "https://host/#neoboard=", "https://host/#foo"] {
+            assert!(password_target(address).is_err());
         }
     }
 
     #[test]
     fn password_join_is_masked_transient_and_cancellable() {
-        let mut app = App::new(); fixture::load(&mut app, false); app.begin_add_board();
+        let mut app = App::new(); fixture::load(&mut app, false); app.me = None; app.local_name = "Sam Lee".into(); app.begin_add_board();
         let (tx, rx) = mpsc::sync_channel(1); app.commands = Some(tx);
         let mut rt = rune::Runtime::new(app, view::root, (850., 600.), rune::Env::new(true, 1.));
         rt.frame(0.);
         click(&mut rt, "onboarding-join"); click(&mut rt, "method-password");
+        assert!(rt.find("onboarding-display-name").is_none() && rt.find("onboarding-slug").is_none());
         const SECRET: &str = " sentinel-secret ";
         rt.update(|a, _| {
             a.onboarding.server.replace_text("https://host/#neoboard=dev");
-            a.onboarding.name.replace_text("Sam Lee");
         });
         for _ in 0..60 { rt.frame(1./60.); }
         click(&mut rt, "onboarding-password"); rt.paste(SECRET); rt.frame(0.);

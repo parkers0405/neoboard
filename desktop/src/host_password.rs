@@ -65,6 +65,8 @@ impl App {
     }
 
     pub fn close_dialog(&mut self) {
+        if self.removal.as_ref().is_some_and(|r| r.sending) { return; }
+        self.removal = None;
         self.share.password = Panel::Closed;
         self.dialog = None;
     }

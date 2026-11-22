@@ -151,6 +151,7 @@ impl Board {
             OR EXISTS(SELECT 1 FROM messages WHERE channel=?1)", [&project], |r| r.get::<_, bool>(0))? {
             return Err(conflict("board already exists"));
         }
+        deletion::reopen(&tx, &project)?;
         insert_channel(&tx, "local", &channel)?;
         if tx.execute("INSERT INTO board_passwords VALUES (?1,?2,?3) ON CONFLICT(project) DO NOTHING",
             params![project, verifier.salt, verifier.key])? == 0 {
@@ -165,11 +166,11 @@ impl Board {
         let require_project = |db: &Connection| -> Result<()> {
             if project_exists(db, &project)? { Ok(()) } else { Err(BoardError(StatusCode::NOT_FOUND, "unknown project".into())) }
         };
-        { let db = self.lock()?; require_project(&db)?; }
+        let observed = { let db = self.lock()?; require_project(&db)?; cursor(&db)? };
         let verifier = password.map(Verifier::derive);
         let mut db = self.lock()?;
         let tx = db.transaction()?;
-        require_project(&tx)?;
+        deletion::check_view(&tx, &project, observed)?;
         if let Some(v) = verifier {
             tx.execute("INSERT INTO board_passwords VALUES (?1,?2,?3) ON CONFLICT(project) DO UPDATE SET salt=excluded.salt,pbkdf2_sha256_600k=excluded.pbkdf2_sha256_600k",
                 params![project, v.salt, v.key])?;

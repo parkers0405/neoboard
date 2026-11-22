@@ -15,6 +15,9 @@ pub struct SavedBoards(Vec<BoardProfile>);
 impl SavedBoards {
     pub fn entries(&self) -> &[BoardProfile] { &self.0 }
 
+    /// Forget only this preference. Other consumers may reference the same invite file.
+    pub fn forget(&mut self, profile: &BoardProfile) { self.0.retain(|p| p != profile); }
+
     pub fn remember(&mut self, project: String, invite: Option<PathBuf>, endpoint: Option<String>) {
         let existing = self.0.iter_mut().find(|p| p.project == project && (p.invite == invite
             || (p.invite.is_some() && invite.is_some() && endpoint.is_some() && p.endpoint == endpoint)));

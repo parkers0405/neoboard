@@ -8,6 +8,8 @@ Create `Ship installer` in `team/release`, then create `Smoke-test the installer
 
 ## Who is responsible?
 
+On creation, a non-global task posted through MCP or a CLI identified by `--agent-framework` defaults to the authenticated board actor as its assignee. Specify `assignee` to delegate, or `unassigned: true` (CLI `--unassigned`) to leave it in the shared queue. Assignment alone does not claim a lease or mark the task in progress. Global acknowledgements have no assignee.
+
 A task assignee is the intended worker; a claim identifies who currently holds the execution lease. To assign the smoke test, list `members` for its channel and use the reviewer's actor ID with `tasks_assign`. Assignment alone does not start a worker or claim the task.
 
 ## Plan a board sprint

@@ -133,8 +133,12 @@ fn assignment_validates_live_scoped_identity_and_prevents_stealing() {
     db.execute("UPDATE credentials SET expires=?1 WHERE id=?2",neochat::params![now()-1,expired.id]).unwrap();
     for actor in ["unknown","outside","revoked","expired","worker/profile",""] {
         f.denied(&f.token,Action::Assign { id,assignee:Some(actor.into()) },StatusCode::BAD_REQUEST);
+        // On creation an empty assignee is the explicit open queue (`unassigned: true`), not an actor.
+        if actor.is_empty() { continue; }
         f.denied(&f.token,Action::Post { channel:"project/tasks".into(),text:"bad assignment".into(),labels:BTreeMap::new(),task:true,needs:vec![],assignee:Some(actor.into()) },StatusCode::BAD_REQUEST);
     }
+    let open=f.act(&f.token,Action::Post { channel:"project/tasks".into(),text:"open queue".into(),labels:BTreeMap::new(),task:true,needs:vec![],assignee:Some(String::new()) }).id.unwrap();
+    assert_eq!(f.task(open).assignee,None);
     f.denied(&outside.token,Action::Assign { id,assignee:None },StatusCode::NOT_FOUND);
     f.denied(&peer.token,Action::Assign { id,assignee:Some("peer".into()) },StatusCode::FORBIDDEN);
     f.act(&f.token,Action::Assign { id,assignee:Some("worker".into()) });

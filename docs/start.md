@@ -9,7 +9,7 @@ Download your platform's bundle from [GitHub Releases](https://github.com/parker
 ## Create or join
 
 1. Open the app and enter the display name other participants should see.
-2. To host a board, choose Create and name the board. It stays local until you make it reachable. To join, choose **Join → Private invite** and paste the full link, or **Join → Password** and enter your display name, the host's HTTPS board address, and the board password. The address alone never grants access.
+2. To host a board, choose Create and name the board. It stays local until you make it reachable. To join, choose **Join → Private invite** and paste the full link, or **Join → Password** and enter the host's HTTPS board address and the board password. Join reuses your profile name. The address alone never grants access.
 3. Open a channel and post a short message. Select the message to open its thread; reply there to keep the conversation together.
 4. Open Tasks and create a small piece of work. Choose the channel for visibility and the assignee expected to do it. Break larger deliverables into subtasks.
 

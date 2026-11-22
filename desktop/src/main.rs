@@ -20,6 +20,7 @@ mod zoom;
 mod onboarding;
 mod host_password;
 mod saved_boards;
+mod board_removal;
 mod setup_guide;
 
 use std::{collections::BTreeMap, sync::{OnceLock, mpsc}, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
@@ -37,7 +38,7 @@ const OPEN_TASKS: usize = 0;
 enum Page { Home, Activity, Tasks, Scheduled, Channel(String) }
 
 #[derive(Clone, Copy, PartialEq)]
-enum Dialog { Settings, Personal, BoardView, Connection, Share, Tags, NewTask, NewSprint, ReplyTags(u64), Filters, Schedule, NewChannel, DeleteChannel, DeleteThread(u64) }
+enum Dialog { Settings, Personal, BoardView, Connection, Share, RemoveBoard, Tags, NewTask, NewSprint, ReplyTags(u64), Filters, Schedule, NewChannel, DeleteChannel, DeleteThread(u64) }
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Preferences {
@@ -96,6 +97,7 @@ struct App {
     creating_task: bool,
     editing_task: Option<u64>,
     share: onboarding::Share,
+    removal: Option<board_removal::Confirmation>,
     connection_wake: Option<rune::Waker>,
     local_name: String,
     me: Option<neochat::protocol::Member>,
@@ -146,6 +148,8 @@ struct App {
     thread: Option<u64>,
     task_menu:Option<u64>,
     hover_row:Option<u64>, row_menu:Option<u64>, row_anchor:[f32;4],
+    /// Width of the open dropdown's trigger, so its floating menu matches it.
+    menu_w:f32,
     status: String,
     error: Option<String>,
     pending: bool,
@@ -264,6 +268,7 @@ impl App {
         let fixture = OPTIONS.get().is_some_and(|o| o.fixture);
         let mut app = Self {
             release: Default::default(),
+            removal: None,
             local_name: OPTIONS.get().and_then(|o| o.profile.clone()).unwrap_or_else(|| profile::local_name(fixture || cfg!(test))),
             profiles: profile::Profiles::default(),
             zoom: zoom::Zoom::default(),
@@ -276,7 +281,7 @@ impl App {
             task_title: edit(""), task_description: edit(""), task_channel: String::new(), task_labels: edit(""), task_file: None, creating_task: false, editing_task: None,
             sprint: Default::default(), task_parent: None, task_global: false, organization: Default::default(),
             task_search: edit(""), task_advanced: false,
-            dialog: None, compact: true, compose_file_open: false, compose_file_owner: None, compose_file: edit(""), sidebar: true, oldest: true, thread: None, task_menu:None,hover_row:None,row_menu:None,row_anchor:[0.;4], status: "connecting".into(), error: None,
+            dialog: None, compact: true, compose_file_open: false, compose_file_owner: None, compose_file: edit(""), sidebar: true, oldest: false, thread: None, task_menu:None,hover_row:None,row_menu:None,menu_w:0.,row_anchor:[0.;4], status: "connecting".into(), error: None,
             pending: false, commands: None, updates: None, now: 0, fixture, seen: BTreeMap::new(), positions: BTreeMap::new(),
             width: 1252.0, feed_h: 400.0, feed_page: Default::default(), reply_limit:40, pane_sizes:[199.,400.,270.], filter_choice_search:edit(""), confirm_parent_completion:None, thread_h: 400.0,
             reply_owner: None, reply_drafts: BTreeMap::new(),
@@ -638,6 +643,8 @@ fn poll(app: &mut App, seconds: f64, tx: &mut Tx) -> bool {
         if index == 15 { tx.wake_after(Duration::ZERO); }
         changed = true;
         match update {
+            Update::BoardDeleted(id, ok) => app.finish_board_delete(&id, ok),
+            Update::AccessDenied => app.board_access_denied(),
             Update::BoardSetup(result) => app.finish_board_setup(result),
             Update::BoardPassword(request, ok) => app.finish_password(request, ok),
             Update::Organization(organization) => app.organization = organization,
@@ -793,8 +800,8 @@ fn main() {
     #[cfg(any(target_os = "windows", target_os = "linux"))]
     rune::set_app_icon(include_bytes!("../../design/NeoBoard.png").as_slice()).expect("embedded NeoBoard PNG");
     rune::App::new(AppSpec {
-        fonts: &[include_bytes!("../assets/fonts/GeistMono-Regular.otf")],
-        families: ("Geist Mono", "Geist Mono"),
+        fonts: &[include_bytes!("../assets/fonts/Geist-Variable.ttf"), include_bytes!("../assets/fonts/GeistMono-Regular.otf")],
+        families: ("Geist", "Geist Mono"),
         setup: Some(setup), poll: Some(|a, t, tx| a.release.poll(t, tx) | poll(a, t, tx)), min_size: Some((620.0, 420.0)),
         on_key: Some(|app, e, tx| {
             let scale = app.zoom.factor();
@@ -837,6 +844,8 @@ fn main() {
             ("edit-task", |a| {fixture::load(a,true);a.open_thread(1);a.open_task_editor(1);}),
             ("add-board", |a| {fixture::load(a,false);a.begin_add_board();}),
             ("saved-boards", fixture::saved_boards),
+            ("delete-board", board_removal::scene),
+            ("remove-connection", board_removal::guest_scene),
             ("new-channel", |a| {fixture::load(a,true);a.dialog=Some(Dialog::NewChannel);}),
             ("channel-options", channel_actions::menu_scene),
             ("delete-channel", |a| {channel_actions::menu_scene(a); a.channel_actions.target=a.channel_actions.menu.take(); a.dialog=Some(Dialog::DeleteChannel);}),

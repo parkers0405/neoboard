@@ -1,0 +1,23 @@
+[Unit]
+Description=Opt-in NeoBoard actor inbox wake consumer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=neoboard-inbox
+Group=neoboard-inbox
+UMask=0077
+StateDirectory=neoboard-inbox
+StateDirectoryMode=0700
+EnvironmentFile=/etc/neoboard/inbox.env
+ExecStart=/opt/neoboard/venv/bin/python -B /opt/neoboard/scripts/inbox_watcher.py --db /var/lib/neoboard-inbox/inbox.db run
+Restart=on-abnormal
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+
+[Install]
+WantedBy=multi-user.target

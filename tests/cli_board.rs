@@ -37,6 +37,22 @@ fn cli(dir: &Path, args: &[&str]) -> String {
 }
 
 #[test]
+fn agent_created_work_defaults_to_authenticated_actor_not_framework() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let (_daemon, client) = start(dir);
+    for (args, expected) in [
+        (vec!["--agent-framework", "Neoism", "tasks", "create", "work", "Mine"], Some("local")),
+        (vec!["--agent-framework", "Neoism", "tasks", "create", "work", "Queue", "--unassigned"], None),
+    ] {
+        let id: u64 = cli(dir, &args).parse().unwrap();
+        let task = client.snapshot().unwrap().messages.into_iter().find(|m| m.id == id).unwrap().task.unwrap();
+        assert_eq!(task.assignee.as_deref(), expected);
+        assert!(task.owner.is_none());
+    }
+}
+
+#[test]
 fn sprint_commands() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();

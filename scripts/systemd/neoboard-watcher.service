@@ -1,0 +1,23 @@
+[Unit]
+Description=NeoBoard assignment and reply watcher
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=neoboard-watcher
+Group=neoboard-watcher
+UMask=0077
+StateDirectory=neoboard-watcher
+StateDirectoryMode=0700
+EnvironmentFile=/etc/neoboard/watcher.env
+ExecStart=/opt/neoboard/venv/bin/python -B /opt/neoboard/scripts/board_watcher.py --db /var/lib/neoboard-watcher/worker.db run --interval 2
+Restart=on-abnormal
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

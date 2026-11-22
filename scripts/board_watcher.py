@@ -17,6 +17,8 @@ from urllib import error, parse, request
 import turso
 from filelock import FileLock
 
+import board_watcher_questions as qa
+
 
 class NoRedirect(request.HTTPRedirectHandler):
     def redirect_request(self, *args):
@@ -78,11 +80,14 @@ def initialize(db, args):
             db.execute('CREATE TABLE assignment(task INTEGER PRIMARY KEY, actor TEXT NOT NULL)')
             db.execute('''CREATE TABLE wake(cursor INTEGER PRIMARY KEY, task INTEGER NOT NULL, actor TEXT NOT NULL,
                        endpoint TEXT, session TEXT, status TEXT NOT NULL, checked INTEGER NOT NULL DEFAULT 0)''')
+            qa.schema(db)
 
 
 def assignment(db, event, msg):
     kind = event['type']
     if kind == 'channel_deleted':
+        qa.retire(db, '1=1')
+        db.execute('DELETE FROM live_lease')
         db.execute('DELETE FROM assignment')
         db.execute("UPDATE wake SET status='superseded' WHERE status IN ('pending','busy','unavailable')")
         return
@@ -91,8 +96,11 @@ def assignment(db, event, msg):
     task = msg['id']
     if type(task) is not int or task <= 0:
         raise ValueError('invalid task id')
+    if kind == 'message' and msg.get('parent') is not None:
+        return qa.observe_reply(db, event, msg)
     info = msg.get('task') or {}
-    actor = info.get('assignee') if info.get('state') in ('ready', 'waiting', 'blocked', 'claimed') else None
+    qa.observe_root(db, task, info, event.get('created_at'))
+    actor = info.get('assignee') if info.get('state') in ('ready', 'waiting', 'blocked', 'claimed', 'in_progress') else None
     old = db.execute('SELECT actor FROM assignment WHERE task=?', (task,)).fetchone()
     if (old[0] if old else None) == actor:
         return
@@ -173,7 +181,7 @@ def poll(path, wait):
                            (delivery_id, seq, json.dumps(payload)))
             cursor = seq
         db.execute('UPDATE watcher SET cursor=?', (cursor,))
-    return dict(cursor=cursor)
+    return dict(cursor=cursor, events=len(events))
 
 
 def consume(db, args):
@@ -214,10 +222,19 @@ def bind(db, args):
             or url.username is not None or url.query or url.fragment or url.path not in ('', '/')
             or not args.actor or not re.fullmatch(r'ses_[a-zA-Z0-9_-]+', args.session)):
         raise ValueError('expected exact actor, loopback Neoism origin and ses_ session ID')
-    db.execute('INSERT INTO binding VALUES(?,?,?)', (args.actor, args.endpoint.rstrip('/'), args.session))
+    with atomic(db):
+        db.execute('INSERT INTO binding VALUES(?,?,?)', (args.actor, args.endpoint.rstrip('/'), args.session))
+        qa.policies(db, args.actor, args.answer_actor, args.bridge_route)
 
 
-def wake_one(path):
+def catch_up(path):
+    while True:
+        page = poll(path, 0)
+        if not page['events']:
+            return page['cursor']
+
+
+def wake_one(path, caught_up=False):
     token = os.environ.get('NEOISM_WAKE_TOKEN')
     if not token:
         raise ValueError('set NEOISM_WAKE_TOKEN')
@@ -225,13 +242,17 @@ def wake_one(path):
     headers = {'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json'}
     # Serialize wake consumers, without holding the Turso handle during HTTP.
     with FileLock(str(path) + '.wake.lock', timeout=30):
-        with store(path) as db:
-            row = db.execute("SELECT * FROM wake WHERE status IN ('pending','busy','unavailable') ORDER BY checked,cursor LIMIT 1").fetchone()
+        if not caught_up:
+            catch_up(path)
+        with store(path) as db, atomic(db):
+            qa.expire(db, int(time.time()))
+            row = db.execute(qa.WAKE_VIEW + f' WHERE w.status IN {qa.RETRYABLE} ORDER BY w.checked,w.cursor LIMIT 1').fetchone()
             if row is None:
                 return None
             item = dict(row)
             del row
-            cfg = json.loads(db.execute('SELECT config FROM watcher').fetchone()[0])
+            config, namespace = db.execute('SELECT config,namespace FROM watcher').fetchone()
+            cfg = json.loads(config)
         base = item['endpoint'] + '/v2/sessions'
         target = base + '/' + item['session']
 
@@ -242,21 +263,30 @@ def wake_one(path):
         try:
             # Idle sessions can be absent from the status map; absence alone
             # does not establish that the bound session exists.
-            if get(target)['id'] != item['session']:
-                raise ValueError('wrong session')
-            status = get(base + '/status').get(item['session'], {'type': 'idle'})
-            idle = status['type'] == 'idle' and not (status.get('compactionQueued') or status.get('runID'))
-            outcome = 'uncertain' if idle else 'busy'
+            if get(target)['id'] == item['session']:
+                status = get(base + '/status').get(item['session'], {'type': 'idle'})
+                idle = status['type'] == 'idle' and not (status.get('compactionQueued') or status.get('runID'))
+                outcome = 'uncertain' if idle else 'busy'
+            else:
+                outcome = 'stale_session'
+        except error.HTTPError as exc:
+            outcome = 'unsupported_or_missing' if exc.code in (404, 405, 501) else 'unavailable'
         except (OSError, IncompleteRead, ValueError, TypeError, KeyError, AttributeError):
             outcome = 'unavailable'
-        with store(path) as db:
+        if outcome == 'uncertain':
+            catch_up(path)  # Preflight could have taken seconds; never dispatch a known stale page.
+        with store(path) as db, atomic(db):
+            if db.execute('SELECT namespace FROM watcher').fetchone()[0] != namespace:
+                raise ValueError('subscription replaced during wake')
+            if not qa.eligible(db, item, int(time.time())):
+                outcome = 'superseded'
             # Commit a non-retryable reservation *before* the external effect.
             changed = db.execute("UPDATE wake SET status=?, checked=? WHERE cursor=? AND status IN ('pending','busy','unavailable')",
                                  (outcome, time.time_ns(), item['cursor']))
             if not changed.rowcount:
                 return dict(cursor=item['cursor'], status='superseded')
         if outcome == 'uncertain':
-            body = json.dumps({'prompt': f"NeoBoard assignment: check task #{item['task']} in channel {cfg['channel']}. Verify the current assignment before acting."}).encode()
+            body = json.dumps({'prompt': qa.prompt(item, cfg['channel'])}).encode()
             try:
                 with http.open(request.Request(target + '/prompt-if-idle', body, headers), timeout=10) as res:
                     if res.status == 204:
@@ -277,13 +307,41 @@ def wake_one(path):
                     outcome = 'rejected'
             except (OSError, IncompleteRead):
                 pass
-            with store(path) as db:
-                if outcome == 'busy' and not db.execute('''SELECT 1 FROM assignment WHERE task=? AND actor=?
-                        AND NOT EXISTS (SELECT 1 FROM wake WHERE task=? AND cursor>?)''',
-                        (item['task'], item['actor'], item['task'], item['cursor'])).fetchone():
+            with store(path) as db, atomic(db):
+                if db.execute('SELECT namespace FROM watcher').fetchone()[0] != namespace:
+                    raise ValueError('subscription replaced during POST')
+                if outcome == 'busy' and (not qa.eligible(db, item, int(time.time())) or
+                        item['kind'] == 'assignment' and db.execute('''SELECT 1 FROM wake WHERE task=? AND cursor>?
+                        UNION ALL SELECT 1 FROM question WHERE task=? AND cursor>?''',
+                        (item['task'], item['cursor'], item['task'], item['cursor'])).fetchone()):
                     outcome = 'superseded'
                 db.execute('UPDATE wake SET status=? WHERE cursor=?', (outcome, item['cursor']))
         return dict(cursor=item['cursor'], status=outcome)
+
+
+def run(path, args):
+    # A service manager owns restart policy. Never dispatch through a poll failure.
+    with FileLock(str(path) + '.run.lock', timeout=0):
+        with store(path) as db:
+            if json.loads(db.execute('SELECT config FROM watcher').fetchone()[0])['match'] != 'assignment':
+                raise ValueError('run requires an assignment subscription')
+        delay = 1
+        while True:
+            try:
+                cursor = catch_up(path)
+                result = wake_one(path, caught_up=True)
+            except (error.URLError, TimeoutError, ConnectionError, IncompleteRead) as exc:
+                if args.once or isinstance(exc, error.HTTPError) and exc.code < 500 and exc.code != 429:
+                    raise
+                print(json.dumps(dict(status='poll_retry', error=str(exc), retry_in=delay)), file=sys.stderr, flush=True)
+                time.sleep(delay)
+                delay = min(60, delay * 2)
+                continue
+            print(json.dumps(dict(cursor=cursor, wake=result)), flush=True)
+            if args.once:
+                return
+            delay = 1
+            time.sleep(args.interval)
 
 
 def main():
@@ -303,10 +361,17 @@ def main():
     binding = sub.add_parser('bind')
     for field in ('actor', 'endpoint', 'session'):
         binding.add_argument('--' + field, required=True)
+    binding.add_argument('--answer-actor', action='append', default=[])
+    binding.add_argument('--bridge-route', nargs=2, metavar=('ACTOR','ROUTE_ID'), action='append', default=[])
+    sub.add_parser('upgrade', help='add question ledger to existing assignment DB without replay')
     sub.add_parser('wake')
-    status = sub.add_parser('wake-status')
-    status.add_argument('--after', type=int, default=0)
-    status.add_argument('--limit', type=positive, default=100)
+    service = sub.add_parser('run')
+    service.add_argument('--interval', type=positive, default=1)
+    service.add_argument('--once', action='store_true')
+    for name in ('wake-status', 'question-status'):
+        status = sub.add_parser(name)
+        status.add_argument('--after', type=int, default=0)
+        status.add_argument('--limit', type=positive, default=100)
     inspect = sub.add_parser('inspect')
     inspect.add_argument('--after', type=int, default=0)
     inspect.add_argument('--limit', type=positive, default=100)
@@ -322,6 +387,8 @@ def main():
     args = p.parse_args()
     os.umask(0o077)
     path = Path(args.db).resolve()
+    if args.cmd == 'run':
+        return run(path, args)
     if args.cmd == 'follow':
         delay = 1
         while True:
@@ -333,7 +400,7 @@ def main():
                 time.sleep(delay)
                 delay = min(60, delay * 2)
     if args.cmd == 'poll':
-        result = poll(path, 0)
+        result = dict(cursor=poll(path, 0)['cursor'])
     elif args.cmd == 'wake':
         result = wake_one(path)
     else:
@@ -344,8 +411,16 @@ def main():
             if args.cmd == 'bind':
                 bind(db, args)
                 return
-            if args.cmd == 'wake-status':
-                print(json.dumps([dict(r) for r in db.execute('SELECT * FROM wake WHERE cursor>? ORDER BY cursor LIMIT ?', (args.after, args.limit))]))
+            if args.cmd == 'upgrade':
+                if json.loads(db.execute('SELECT config FROM watcher').fetchone()[0])['match'] != 'assignment':
+                    raise ValueError('upgrade requires an assignment subscription')
+                with atomic(db):
+                    qa.schema(db)
+                return
+            if args.cmd in ('wake-status', 'question-status'):
+                query = (qa.WAKE_VIEW + ' WHERE w.cursor>? ORDER BY w.cursor' if args.cmd == 'wake-status' else
+                         'SELECT * FROM question WHERE cursor>? ORDER BY cursor')
+                print(json.dumps([dict(r) for r in db.execute(query + ' LIMIT ?', (args.after, args.limit))]))
                 return
             if args.cmd != 'inspect':
                 print(json.dumps(consume(db, args)))

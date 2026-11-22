@@ -1,5 +1,7 @@
 //! Blocking client shared by the CLI and the desktop's network worker.
 mod board_password;
+mod notifications;
+pub use notifications::{InboxItem, InboxPage, Subscription};
 pub use board_password::{join_with_password, MAX_BOARD_PASSWORD_BYTES};
 use crate::protocol::{Action, Discovery, DisplayNameRequest, Event, Invite, InviteRequest, Member, Organization, Outcome, Reaction, ScheduledPost, Snapshot};
 use reqwest::{blocking, header, Url};
@@ -95,6 +97,15 @@ impl Client {
 
     pub fn snapshot(&self) -> Result<Snapshot, ClientError> {
         self.request(self.http.get(self.url("v1/snapshot")))
+    }
+
+    /// Permanently delete one named namespace using the local daemon admin credential.
+    pub fn delete_board(&self, project: &str) -> Result<(), ClientError> {
+        if !crate::valid_project(project) { return Err(ClientError("invalid board project".into())); }
+        if !is_loopback(&self.endpoint) { return Err(ClientError("board deletion requires a local daemon".into())); }
+        let response = self.send(self.http.delete(self.url(&format!("v1/admin/boards/{project}"))))?;
+        if response.status().as_u16() != 204 { return Err(ClientError("unexpected board deletion response".into())); }
+        Ok(())
     }
 
     pub fn organization(&self) -> Result<Organization, ClientError> {

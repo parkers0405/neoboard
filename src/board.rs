@@ -1,5 +1,7 @@
 //! Embedded Turso is the single writer authority. Mutations, derived task transitions and events share a transaction.
 use crate::protocol::*;
+mod deletion;
+mod notifications;
 mod password;
 use axum::{extract::{Path, Query, State}, http::{HeaderMap, StatusCode}, response::{IntoResponse, Response}, routing::{delete, get, post}, Json, Router};
 use rand::RngCore;
@@ -79,6 +81,8 @@ impl Board {
             CREATE TABLE IF NOT EXISTS board_passwords(project TEXT PRIMARY KEY, salt BLOB NOT NULL CHECK(length(salt)=16), pbkdf2_sha256_600k BLOB NOT NULL CHECK(length(pbkdf2_sha256_600k)=32));
             CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY AUTOINCREMENT, channel TEXT NOT NULL, creator TEXT NOT NULL, body TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS events(cursor INTEGER PRIMARY KEY AUTOINCREMENT, channel TEXT NOT NULL, body TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS snapshot_floors(credential INTEGER PRIMARY KEY, cursor INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS board_deletions(project TEXT PRIMARY KEY, cursor INTEGER NOT NULL, closed INTEGER NOT NULL);
             CREATE INDEX IF NOT EXISTS event_channels ON events(channel,cursor);
             CREATE TABLE IF NOT EXISTS credentials(id INTEGER PRIMARY KEY AUTOINCREMENT, hash TEXT UNIQUE NOT NULL, actor TEXT UNIQUE NOT NULL, channels TEXT NOT NULL, expires INTEGER, revoked INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS actor_display_names(credential INTEGER PRIMARY KEY REFERENCES credentials(id), name TEXT NOT NULL);
@@ -109,6 +113,7 @@ impl Board {
             CREATE TABLE IF NOT EXISTS schedules(id INTEGER PRIMARY KEY AUTOINCREMENT, credential INTEGER NOT NULL, actor TEXT NOT NULL, channel TEXT NOT NULL, text TEXT NOT NULL, labels TEXT NOT NULL, publish_at INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS schedule_senders(schedule INTEGER PRIMARY KEY REFERENCES schedules(id) ON DELETE CASCADE, sender TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS schedule_threads(schedule INTEGER PRIMARY KEY REFERENCES schedules(id) ON DELETE CASCADE, thread INTEGER NOT NULL REFERENCES messages(id), internal INTEGER NOT NULL, fired INTEGER NOT NULL DEFAULT 0);")?;
+        notifications::init(&db)?;
         db.execute("INSERT OR IGNORE INTO credentials(hash,actor,channels) VALUES (?1,'local','[]')", [digest(board_token)])?;
         // Older boards stored file metadata only in the attachment table.
         db.execute("UPDATE messages SET body=json_set(body,'$.attachments',json((
@@ -142,9 +147,7 @@ impl Board {
     /// An invite several people may open. Each of them exchanges it with `join` for an
     /// identity of their own, so a display name or a task never belongs to all of them.
     pub fn create_shared_invite(&self, admin: &str, request: InviteRequest) -> Result<Invite> {
-        let invite = self.issue(admin, request, None)?;
-        self.lock()?.execute("INSERT INTO shared_invites VALUES (?1)", [sql_id(invite.id)?])?;
-        Ok(invite)
+        self.issue_checked(admin, request, None, true, None)
     }
     /// Exchange a shared invite for a personal credential with the invite's scope. It
     /// outlives the invite, renewing while it is used. Revoking the invite revokes every
@@ -179,6 +182,9 @@ impl Board {
             params![digest(token), serde_json::to_string(&[format!("{project}/*")])?, expires], |row| row.get(0))?)
     }
     fn issue(&self, admin: &str, request: InviteRequest, grants: Option<BTreeSet<Grant>>) -> Result<Invite> {
+        self.issue_checked(admin, request, grants, false, None)
+    }
+    pub(crate) fn issue_checked(&self, admin: &str, request: InviteRequest, grants: Option<BTreeSet<Grant>>, shared: bool, project_view: Option<(&str,u64)>) -> Result<Invite> {
         if digest(admin) != self.admin_hash { return Err(unauthorized()); }
         validate_name(&request.actor)?;
         if request.actor == "local" || request.actor == "system" { return Err(invalid("reserved actor")); }
@@ -188,12 +194,14 @@ impl Board {
         let token = random_token();
         let mut conn = self.lock()?;
         let db = conn.transaction()?;
+        if let Some((project, cursor)) = project_view { deletion::check_view(&db, project, cursor)?; }
         let exists: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM credentials WHERE actor=?1)", [&request.actor], |r| r.get(0))?;
         if exists { return Err(conflict("actor already registered; use a new actor identity")); }
         // Legacy daemons must not authenticate a restricted invite on downgrade.
         let hash = if grants.is_some() { format!("restricted:{}",digest(&token)) } else { digest(&token) };
         db.execute("INSERT INTO credentials(hash,actor,channels,expires) VALUES (?1,?2,?3,?4)", params![hash,request.actor,serde_json::to_string(&request.channels)?,request.expires_at])?;
         let id = db.last_insert_rowid() as u64;
+        if shared { db.execute("INSERT INTO shared_invites VALUES (?1)", [id])?; }
         if let Some(grants) = grants { db.execute("INSERT INTO credential_grants VALUES (?1,?2)", params![id,serde_json::to_string(&grants)?])?; }
         db.commit()?;
         Ok(Invite { id, token, actor: request.actor, channels: request.channels, expires_at: request.expires_at })
@@ -314,13 +322,16 @@ impl Board {
         let caller = Self::identity(&db, token, Some(Grant::Read))?;
         caller.check(channel)?;
         validate_channel(channel)?;
+        Self::directory(&db,channel,false)
+    }
+    fn directory(db: &Connection, channel: &str, global: bool) -> Result<Vec<Member>> {
         let rows = db.prepare("SELECT c.id,c.actor,c.channels,n.name FROM credentials c LEFT JOIN actor_display_names n ON n.credential=c.id WHERE c.revoked=0 AND (c.expires IS NULL OR c.expires>?1) AND NOT (n.name IS NULL AND c.id IN (SELECT credential FROM shared_invites)) ORDER BY c.actor")?
             .query_map([now()], |r| Ok((r.get::<_,u64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,Option<String>>(3)?)))?
             .collect::<std::result::Result<Vec<_>,_>>()?;
         let mut members = Vec::new();
         for (id,actor,channels,display_name) in rows {
             let identity = Identity { id, actor, channels: serde_json::from_str(&channels)? };
-            if identity.permits(channel) { members.push(Member { actor: identity.actor, display_name }); }
+            if permits_message(&identity,channel,global) { members.push(Member { actor: identity.actor, display_name }); }
         }
         Ok(members)
     }
@@ -344,6 +355,9 @@ impl Board {
         let mut db = self.lock()?;
         let tx = db.transaction()?;
         let identity = Self::identity(&tx, token, Some(Grant::Read))?;
+        if tx.query_row("SELECT EXISTS(SELECT 1 FROM snapshot_floors WHERE credential=?1 AND cursor>?2)", params![identity.id,sql_id(after)?], |r| r.get::<_,bool>(0))? {
+            return Err(conflict("board access changed; discard cached state and fetch a new snapshot"));
+        }
         maintain(&tx)?;
         let projects: Vec<_> = identity.channels.iter().filter_map(|c| project_scope(c)).collect();
         // Apply visibility BEFORE paging. Filtering a global page afterwards can return an
@@ -437,16 +451,27 @@ impl Board {
             return Err(invalid("invalid sender metadata"));
         }
         let request = serde_json::to_string(&(profile, &action))?;
+        let mut fingerprint = None;
         if let Some(key) = key {
             if key.is_empty() || key.len() > 128 { return Err(invalid("idempotency key must be 1..128 bytes")); }
             let cached: Option<(String,String)> = tx.query_row("SELECT request,outcome FROM idempotency WHERE credential=?1 AND key=?2", params![identity.id,key], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
-            if let Some((prior,outcome)) = cached { if prior != request { return Err(conflict("idempotency key reused with different action")); } return Ok(serde_json::from_str(&outcome)?); }
+            if let Some((prior,outcome)) = cached {
+                if prior != request && !prior.split_once(':').is_some_and(|(project, hash)| crate::valid_project(project) && hash == digest(&request)) {
+                    return Err(conflict("idempotency key retired or reused with different action"));
+                }
+                return Ok(serde_json::from_str(&outcome)?);
+            }
+            // Resolve before apply: DeleteThread and CancelSchedule remove their targets.
+            fingerprint = deletion::fingerprint(&tx, &action, &request)?;
         }
         maintain(&tx)?;
         let id = apply(&tx, &identity, &author, sender, action)?;
         settle_tasks(&tx)?;
         let outcome = Outcome { id, cursor: cursor(&tx)? };
-        if let Some(key) = key { tx.execute("INSERT INTO idempotency VALUES (?1,?2,?3,?4)", params![identity.id,key,request,serde_json::to_string(&outcome)?])?; }
+        if let Some(key) = key {
+            let fingerprint = fingerprint.ok_or_else(|| invalid("missing action namespace"))?;
+            tx.execute("INSERT INTO idempotency VALUES (?1,?2,?3,?4)", params![identity.id,key,fingerprint,serde_json::to_string(&outcome)?])?;
+        }
         tx.commit()?; Ok(outcome)
     }
 }
@@ -482,7 +507,8 @@ fn validate_labels(labels: &BTreeMap<String,String>) -> Result<()> {
     if labels.len()>64 { return Err(invalid("at most 64 labels")); }
     for (k,v) in labels { validate_name(k)?; if v.len()>1024 || v.contains('\0') { return Err(invalid("invalid label value")); } } Ok(())
 }
-fn cursor(tx: &Transaction<'_>) -> Result<u64> { Ok(tx.query_row("SELECT COALESCE(MAX(cursor),0) FROM events", [], |r| r.get(0))?) }
+// The high-water mark survives event pruning (including a namespace reset).
+fn cursor(db: &Connection) -> Result<u64> { Ok(db.query_row("SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name='events'),0)", [], |r| r.get(0))?) }
 fn emit(tx: &Transaction<'_>, actor: &str, channel: &str, kind: EventKind) -> Result<()> {
     let event = Event { cursor: 0, created_at: now(), actor: actor.into(), kind };
     tx.execute("INSERT INTO events(channel,body) VALUES (?1,?2)", params![channel,serde_json::to_string(&event)?])?; Ok(())
@@ -524,7 +550,8 @@ fn message(tx: &Transaction<'_>, id: u64, identity: &Identity) -> Result<Message
     Ok(msg)
 }
 fn emit_message(tx: &Transaction<'_>, actor: &str, m: &Message) -> Result<()> {
-    emit(tx,actor,&message_audience(tx,m)?,EventKind::Message { message: m.clone() })
+    emit(tx,actor,&message_audience(tx,m)?,EventKind::Message { message: m.clone() })?;
+    notifications::on_message(tx,tx.last_insert_rowid() as u64,actor,m)
 }
 fn save(tx: &Transaction<'_>, actor: &str, m: &Message) -> Result<()> {
     tx.execute("UPDATE messages SET body=?1 WHERE id=?2", params![serde_json::to_string(m)?,m.id])?;
@@ -586,6 +613,7 @@ fn validate_global_fields(labels: &BTreeMap<String,String>, needs: &[u64], assig
 }
 fn ensure_channel(tx: &Transaction<'_>, identity: &Identity, channel: &str) -> Result<()> {
     validate_channel(channel)?; identity.check(channel)?;
+    deletion::require_open(tx, board_namespace(channel))?;
     insert_channel(tx, &identity.actor, channel)
 }
 // Callers validate the channel and authorize the actor before inserting.
@@ -666,11 +694,16 @@ fn open_sprint(tx: &Transaction<'_>, channel: &str, id: u64) -> Result<()> {
 fn apply(tx: &Transaction<'_>, who: &Identity, author: &str, sender: Option<&str>, action: Action) -> Result<Option<u64>> {
     use Action::*;
     match action {
-        CreateChannel { channel } => { ensure_channel(tx,who,&channel)?; Ok(None) }
+        CreateChannel { channel } => {
+            if who.actor == "local" { deletion::reopen(tx, board_namespace(&channel))?; }
+            ensure_channel(tx,who,&channel)?;
+            Ok(None)
+        }
         CreateSprint { board,title,description } => {
             validate_channel(&board)?;
             if board.contains('/') { return Err(invalid("board must be a single channel segment")); }
             if !who.permits_board(&board) { return Err(forbidden()); }
+            deletion::require_open(tx, &board)?;
             validate_text(&title)?;
             if title.len() > 256 || title.chars().any(char::is_control) { return Err(invalid("invalid sprint title")); }
             if description.len() > 65536 || description.contains('\0') { return Err(invalid("invalid sprint description")); }
@@ -748,6 +781,7 @@ fn apply(tx: &Transaction<'_>, who: &Identity, author: &str, sender: Option<&str
             if board.contains('/') { return Err(invalid("board must be a single channel segment")); }
             validate_channel(&board)?;
             if !who.permits_board(&board) { return Err(forbidden()); }
+            deletion::require_open(tx, &board)?;
             if name.trim() != name || name.is_empty() || name.len() > 128
                 || name.chars().any(|c| c.is_control() || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')) {
                 return Err(invalid("area name must be 1..128 bytes without surrounding whitespace, control or bidi override characters"));
@@ -781,12 +815,19 @@ fn apply(tx: &Transaction<'_>, who: &Identity, author: &str, sender: Option<&str
         }
         PostTask { mut channel,text,labels,needs,assignee,area,parent,global } => {
             validate_text(&text)?; validate_labels(&labels)?; validate_channel(&channel)?;
+            let agent = sender.is_some_and(|s| s == "mcp" || s.starts_with("mcp:") || s.starts_with("cli:"));
+            let assignee = match assignee {
+                Some(id) if id.is_empty() => None, // Explicit open queue; never infer a recipient.
+                None if agent && !global => Some(who.actor.clone()),
+                other => other,
+            };
             let p = TaskPlacement { area,parent,global,done_by:Vec::new() };
             validate_global_fields(&labels,&needs,assignee.as_deref(),&p)?;
             if needs.len()>128 { return Err(invalid("at most 128 dependencies")); }
             if global {
                 channel = board_namespace(&channel).to_owned();
                 if !who.permits_board(&channel) { return Err(forbidden()); }
+                deletion::require_open(tx, &channel)?;
             } else {
                 who.check(&channel)?;
             }
@@ -1101,9 +1142,10 @@ pub fn router(board: Board) -> Router {
         .route("/v1/members",get(http_members)).route("/v1/display-name",post(http_display_name)).route("/v1/me",get(http_me)).route("/v1/join",post(http_join))
         .route("/v1/admin/invites",post(http_invite)).route("/v1/admin/restricted-invites",post(http_restricted_invite))
         .route("/v1/admin/invites/{id}",delete(http_revoke).get(http_explain))
+        .route("/v1/admin/boards/{project}",delete(deletion::http_delete))
         .route("/v1/admin/invites/{id}/grants/{grant}",delete(http_revoke_grant))
         .route("/v1/attachments/{id}",get(http_download_attachment))
-        .layer(axum::extract::DefaultBodyLimit::max(128*1024)).merge(uploads).merge(password::routes()).with_state(board)
+        .merge(notifications::routes()).layer(axum::extract::DefaultBodyLimit::max(128*1024)).merge(uploads).merge(password::routes()).with_state(board)
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1121,8 +1163,8 @@ async fn http_download_attachment(State(board):State<Board>, headers:HeaderMap, 
     let bytes = blocking(move || board.download_attachment(&token,id)).await?;
     Ok(([("content-type","application/octet-stream"),("content-disposition","attachment"),("x-content-type-options","nosniff"),("cache-control","no-store"),("content-security-policy","sandbox; default-src 'none'")],bytes).into_response())
 }
-async fn http_snapshot(State(board):State<Board>,headers:HeaderMap)->Result<Json<Snapshot>> {
-    let token=bearer(&headers)?; Ok(Json(blocking(move||board.snapshot(&token)).await?))
+async fn http_snapshot(State(board):State<Board>,headers:HeaderMap)->Result<impl IntoResponse> {
+    let token=bearer(&headers)?; Ok(([("cache-control","no-store")],Json(blocking(move||board.snapshot(&token)).await?)))
 }
 #[derive(Deserialize)]
 struct OwnedAreasQuery { owner: String }

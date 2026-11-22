@@ -56,6 +56,7 @@ impl Options {
 }
 
 pub enum Command {
+    DeleteBoard(String),
     CreateBoard { id: String, name: String },
     JoinBoard { invite: JoinSource, name: String },
     Host { id: String, request: u64, operation: HostOp },
@@ -89,12 +90,33 @@ pub struct HostState { pub route: neochat::sharing::RouteState, pub link: Option
 
 // Host administration never uses the current session's bearer or an explicit endpoint,
 // even if the latter points to localhost. Discovery itself performs no network I/O.
-fn change_password(opts: &Options, id: &str, password: Option<JoinPassword>) -> bool {
-    if opts.fixture || opts.invite.is_some() || opts.endpoint.is_some() || opts.project.as_deref().is_some_and(|p| p != id) { return false; }
-    let Ok(admin) = Client::discover_admin(opts.data_dir.as_deref()) else { return false; };
+fn local_admin(opts: &Options, id: &str) -> Option<Client> {
+    if !neochat::valid_project(id) || opts.fixture || opts.invite.is_some() || opts.endpoint.is_some() || opts.project.as_deref().is_some_and(|p| p != id) { return None; }
+    let admin = Client::discover_admin(opts.data_dir.as_deref()).ok()?;
     let local = reqwest::Url::parse(admin.endpoint()).ok().is_some_and(|url| url.host_str().is_some_and(|host|
         host == "localhost" || host.trim_matches(['[', ']']).parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())));
-    local && admin.set_board_password(id, password.as_ref().map(|p| p.0.as_str())).is_ok()
+    local.then_some(admin)
+}
+
+fn change_password(opts: &Options, id: &str, password: Option<JoinPassword>) -> bool {
+    local_admin(opts, id).is_some_and(|admin| admin.set_board_password(id, password.as_ref().map(|p| p.0.as_str())).is_ok())
+}
+
+fn delete_local_board(opts: &Options, id: &str) -> bool {
+    local_admin(opts, id).is_some_and(|admin| admin.delete_board(id).is_ok())
+}
+
+// ClientError currently exposes the HTTP status in its Display prefix only. Never
+// interpret arbitrary response-body text or a transport timeout as revocation.
+fn access_denied(opts: &Options, error: &neochat::client::ClientError) -> bool {
+    let text = error.to_string();
+    let code = text.strip_prefix("Neoboard request failed: ").unwrap_or(&text).split_whitespace().next();
+    (opts.invite.is_some() || opts.endpoint.is_some()) && matches!(code, Some("401" | "403"))
+}
+
+fn missing_guest_board(opts: &Options, snapshot: &Snapshot) -> bool {
+    (opts.invite.is_some() || opts.endpoint.is_some()) && opts.project.as_deref()
+        .is_some_and(|id| !snapshot.channels.iter().any(|c| crate::projects::contains(id, c)))
 }
 
 fn host_control(dir: Option<&std::path::Path>, id: &str, op: HostOp) -> Result<HostState, String> {
@@ -117,6 +139,8 @@ fn host_control(dir: Option<&std::path::Path>, id: &str, op: HostOp) -> Result<H
 }
 
 pub enum Update {
+    BoardDeleted(String, bool),
+    AccessDenied,
     BoardSetup(Result<BoardSetup, String>),
     Host(u64, Result<HostState, String>),
     BoardPassword(u64, bool),
@@ -290,6 +314,7 @@ pub fn start(mut opts: Options, wake: rune::Waker) -> (mpsc::SyncSender<Command>
                         Ok(Command::SwitchBoard { id, path }) => if !change_board(&mut opts, path.map(JoinSource::File), None, Some(id)).0 { break; },
                         Ok(Command::Host { request, .. }) => if !send(Update::Host(request, Err("The local board is offline.".into()))) { break; },
                         Ok(Command::BoardPassword { request, .. }) => if !send(Update::BoardPassword(request, false)) { break; },
+                        Ok(Command::DeleteBoard(id)) => if !send(Update::BoardDeleted(id, false)) { break; },
                         Ok(Command::CreateBoard { .. }) => if !send(Update::BoardSetup(Err(e.to_string()))) { break; },
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
                         _ => {},
@@ -298,21 +323,28 @@ pub fn start(mut opts: Options, wake: rune::Waker) -> (mpsc::SyncSender<Command>
                 }
             };
             let mut directories=std::collections::BTreeMap::new();
-            let mut cursor = match client.snapshot() {
+            // A broader credential can survive deletion with reduced scope: HTTP 200
+            // on the next snapshot does not mean the selected board is still live.
+            let result = client.snapshot().map_err(|e| if access_denied(&opts, &e) { Update::AccessDenied }
+                else { Update::Status(format!("offline · {e}")) }).and_then(|s| {
+                if missing_guest_board(&opts, &s) { Err(Update::AccessDenied) } else { Ok(s) }
+            });
+            let mut cursor = match result {
                 Ok(snapshot) => {
                     let cursor = snapshot.cursor;
                     for m in &snapshot.messages {directories.insert(m.channel.clone(),None::<std::time::Instant>);}
                     if !send(Update::Snapshot(snapshot)) { break; }
                     cursor
                 }
-                Err(e) => {
-                    if !send(Update::Status(format!("offline · {e}"))) { break; }
+                Err(update) => {
+                    if !send(update) { break; }
                     match rx.recv_timeout(Duration::from_secs(2)) {
                         Ok(Command::JoinBoard { invite, name }) => if !change_board(&mut opts, Some(invite), Some(&name), None).0 { break; },
                         Ok(Command::SwitchBoard { id, path }) => if !change_board(&mut opts, path.map(JoinSource::File), None, Some(id)).0 { break; },
                         Ok(Command::Host { request, .. }) => if !send(Update::Host(request, Err("The local board is offline.".into()))) { break; },
                         Ok(Command::BoardPassword { request, .. }) => if !send(Update::BoardPassword(request, false)) { break; },
-                        Ok(Command::CreateBoard { .. }) => if !send(Update::BoardSetup(Err(e.to_string()))) { break; },
+                        Ok(Command::DeleteBoard(id)) => if !send(Update::BoardDeleted(id, false)) { break; },
+                        Ok(Command::CreateBoard { .. }) => if !send(Update::BoardSetup(Err("Board unavailable.".into()))) { break; },
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
                         _ => {},
                     }
@@ -347,6 +379,13 @@ pub fn start(mut opts: Options, wake: rune::Waker) -> (mpsc::SyncSender<Command>
                             }
                             Command::BoardPassword { id, request, password } => {
                                 if !send(Update::BoardPassword(request, change_password(&opts, &id, password))) { return; }
+                            }
+                            Command::DeleteBoard(id) => {
+                                let ok = delete_local_board(&opts, &id);
+                                if ok && opts.project.as_ref() == Some(&id) { opts.project = None; }
+                                if !send(Update::BoardDeleted(id, ok)) { return; }
+                                // Rehydrate from the authoritative snapshot, even on a lost response.
+                                continue 'connection;
                             }
                             Command::CreateBoard { id, name } => {
                                 let result = (|| -> Result<_, String> {
@@ -428,7 +467,10 @@ pub fn start(mut opts: Options, wake: rune::Waker) -> (mpsc::SyncSender<Command>
                             if !send(Update::Organization(organization)) { return; }
                         }
                     },
-                    Err(e) => { if !send(Update::Status(format!("reconnecting · {e}"))) { return; } break; }
+                    Err(e) => {
+                        let update = if access_denied(&opts, &e) { Update::AccessDenied } else { Update::Status(format!("reconnecting · {e}")) };
+                        if !send(update) { return; } break;
+                    }
                 }
             }
             std::thread::sleep(Duration::from_secs(1));
@@ -440,6 +482,54 @@ pub fn start(mut opts: Options, wake: rune::Waker) -> (mpsc::SyncSender<Command>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn board_removal_uses_local_admin_only() {
+        use std::io::{BufRead, BufReader, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::fs::write(dir.path().join("endpoint.json"), serde_json::json!({"url":url,"token":"ordinary"}).to_string()).unwrap();
+        std::fs::write(dir.path().join("admin-token"), "fixture-admin").unwrap();
+        let opts = Options { data_dir: Some(dir.path().into()), ..Default::default() };
+        for denied in [Options { invite: Some("test".into()), ..opts.clone() }, Options { endpoint: Some(url), ..opts.clone() },
+            Options { project: Some("different".into()), ..opts.clone() }, Options { fixture: true, ..opts.clone() }] {
+            assert!(!delete_local_board(&denied, "disposable"));
+        }
+        let handler = std::thread::spawn(move || {
+            let (mut sock,_) = listener.accept().unwrap();
+            let mut lines = BufReader::new(&sock).lines().map(Result::unwrap);
+            assert_eq!(lines.next().unwrap(), "DELETE /v1/admin/boards/disposable HTTP/1.1");
+            assert!(lines.take_while(|s| !s.is_empty()).any(|h| h.eq_ignore_ascii_case("authorization: Bearer fixture-admin")));
+            sock.write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n").unwrap();
+        });
+        assert!(delete_local_board(&opts, "disposable")); handler.join().unwrap();
+    }
+
+    #[test]
+    fn board_removal_rejects_revoked_credentials_and_reduced_guest_scope() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}",listener.local_addr().unwrap());
+        let handler = std::thread::spawn(move || {
+            for status in ["401 Unauthorized", "403 Forbidden", "503 Service Unavailable"] {
+                let (mut sock,_) = listener.accept().unwrap();
+                let mut req = [0;2048]; let _ = sock.read(&mut req).unwrap();
+                write!(sock,"HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            }
+        });
+        let local = Options { project: Some("demo".into()), ..Default::default() };
+        let guest = Options { endpoint: Some(url.clone()), ..local.clone() };
+        let client = Client::new(&url,"disposable",None).unwrap();
+        for denied in [true,true,false] {
+            let err = client.snapshot().unwrap_err();
+            assert_eq!(access_denied(&guest,&err), denied); assert!(!access_denied(&local,&err));
+        }
+        handler.join().unwrap();
+        let mut snapshot = Snapshot { cursor: 0, channels: vec!["demo-2/general".into()], messages: vec![] };
+        assert!(missing_guest_board(&guest, &snapshot)); assert!(!missing_guest_board(&local, &snapshot));
+        snapshot.channels.push("demo/general".into()); assert!(!missing_guest_board(&guest, &snapshot));
+    }
 
     #[test]
     fn host_password_uses_only_local_admin_and_never_a_share_route() {

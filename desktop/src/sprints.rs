@@ -17,6 +17,9 @@ impl Default for State {
 }
 
 impl State {
+    pub fn draft_fields(&self) -> [(&'static str, &str); 2] {
+        [("Sprint title", &self.title.text), ("Sprint description", &self.description.text)]
+    }
     pub fn clear_draft(&mut self) {
         self.assignment = None;
         self.title = edit("");
@@ -58,11 +61,14 @@ impl App {
     }
 }
 
-pub(super) fn tabs(app: &App, header: El) -> El {
-    let tab = |button: El, active| button.border_sides([0.,0.,if active {2.}else{0.},0.],gray(200)).hover(gray(24));
-    header.child(row().gap(3.)
-        .child(tab(button("Tasks", |a| { a.sprint.reset_view(); a.thread = None; }).key("tasks-tab"), !app.sprint.show))
-        .child(tab(button("Sprints", |a| { a.sprint.reset_view(); a.sprint.show = true; a.thread = None; }).key("sprints-tab"), app.sprint.show)))
+/// Tasks or Sprints, as a segmented switch at the top of the filter panel.
+pub(super) fn tabs(app: &App) -> El {
+    let tab = |name: &str, key: &str, active: bool| el().key(key.to_owned()).w(0.).grow(1.).h(28.).center().radius(7.)
+        .fill(gray(if active { 40 } else { 14 })).hover(gray(if active { 40 } else { 26 }))
+        .child(label(name).font(rune::TextStyle::new(13., if active { 600. } else { 450. })).color(gray(if active { 240 } else { 160 })));
+    row().w_full().gap(2.).padding(3.).radius(10.).fill(gray(14)).border(1., gray(44))
+        .child(tab("Tasks", "tasks-tab", !app.sprint.show).on_press(|a: &mut App| { a.sprint.reset_view(); a.thread = None; a.dialog = None; a.details_picker = None; }))
+        .child(tab("Sprints", "sprints-tab", app.sprint.show).on_press(|a: &mut App| { a.sprint.reset_view(); a.sprint.show = true; a.thread = None; a.dialog = None; a.details_picker = None; }))
 }
 
 pub(super) fn current(app: &App) -> Option<&neochat::protocol::Sprint> {
@@ -105,7 +111,7 @@ fn selected(app: &App) -> Option<u64> {
 pub(super) fn assignment(app: &App) -> El {
     let selected = selected(app);
     let title = selected.map(|id| app.organization.sprints.get(&id).map_or_else(|| format!("#{id}"), |s| s.title.clone())).unwrap_or_else(|| "None".into());
-    task_form::selector("Sprint", "pick-sprint", title)
+    task_form::selector(app, "Sprint", "pick-sprint", title)
 }
 
 pub(super) fn choices(app: &App, rows: &mut task_form::Choices) {
@@ -199,7 +205,7 @@ mod tests {
         let mut rt = rune::Runtime::new(app,view::root,(1252.,900.),rune::Env::new(true,1.));
         click(&mut rt,"new-task"); type_in(&mut rt,"task-title","Do not lose this");
         click(&mut rt,"pick-needs");
-        assert!(rt.find("task-title").is_none());
+        assert!(rt.find("task-title").is_some(), "the menu floats over the form");
         type_in(&mut rt,"task-picker-search","RECONNECT");
         rt.frame(1./60.);
         assert!(rt.find("needs-3").is_none());
@@ -209,7 +215,7 @@ mod tests {
         assert!(rt.state.dialog == Some(Dialog::NewTask));
         assert!(rt.state.details_picker.is_none());
         click(&mut rt,"pick-parent"); assert!(rt.state.task_search.text.is_empty());
-        click(&mut rt,"task-picker-back");
+        click(&mut rt,"pick-parent"); assert!(rt.state.details_picker.is_none(), "the field closes its own menu");
         assert!(rt.find("task-global-toggle").is_none());
         click(&mut rt,"task-advanced"); click(&mut rt,"task-global-toggle");
         assert!(rt.state.task_global && rt.find("pick-channel").is_none());
@@ -240,8 +246,8 @@ mod tests {
         let mut app = App::new(); fixture::load(&mut app,true);
         let (commands,rx) = mpsc::sync_channel(8); app.commands = Some(commands);
         let mut rt = rune::Runtime::new(app,view::root,(1252.,800.),rune::Env::new(true,1.));
-        click(&mut rt,"sprints-tab");
-        assert!(rt.find("new-task").is_none() && rt.find("filters").is_none());
+        click(&mut rt,"filters"); click(&mut rt,"sprints-tab");
+        assert!(rt.find("new-task").is_none() && rt.find("filters").is_some(), "the filter panel is the way back to Tasks");
         click(&mut rt,"new-sprint-action"); click(&mut rt,"sprint-dismiss");
         assert!(rt.state.dialog.is_none() && rx.try_recv().is_err());
         click(&mut rt,"new-sprint-action"); type_in(&mut rt,"sprint-title","Beta"); click(&mut rt,"submit-sprint");
@@ -261,7 +267,7 @@ mod tests {
         rt.update(|a,_| { a.dialog=None; a.pending=false; a.organization.sprints.get_mut(&19).unwrap().finished=true; });
         for _ in 0..5 { rt.frame(1./60.); }
         assert!(rt.find("new-task").is_none() && rt.find("new-sprint-action").is_none());
-        click(&mut rt,"tasks-tab");
+        click(&mut rt,"filters"); click(&mut rt,"tasks-tab");
         assert!(rt.find("new-task").is_some() && rt.find("filters").is_some());
     }
 
@@ -272,11 +278,11 @@ mod tests {
         app.organization.task_sprints.insert(1,19);
         let (commands,rx) = mpsc::sync_channel(8); app.commands = Some(commands);
         let mut rt = rune::Runtime::new(app,view::root,(1252.,800.),rune::Env::new(true,1.));
-        click(&mut rt,"sprints-tab"); click(&mut rt,"sprint-19"); click(&mut rt,"sprint-thread-1");
+        click(&mut rt,"filters"); click(&mut rt,"sprints-tab"); click(&mut rt,"sprint-19"); click(&mut rt,"sprint-thread-1");
         assert_eq!(rt.state.thread,Some(1)); click(&mut rt,"sprint-back"); assert_eq!(rt.state.thread,None);
         click(&mut rt,"sprint-19"); click(&mut rt,"finish-sprint"); assert!(rx.try_recv().is_err());
         click(&mut rt,"finish-anyway"); assert!(matches!(rx.try_recv(),Ok(Command::Action {action: Action::FinishSprint {id:19,allow_unfinished:true},..})));
-        rt.state.pending=false; click(&mut rt,"tasks-tab"); rt.state.open_task_editor(1);
+        rt.state.pending=false; click(&mut rt,"filters"); click(&mut rt,"tasks-tab"); rt.state.open_task_editor(1);
         click(&mut rt,"pick-sprint"); click(&mut rt,"assign-sprint-0");
         assert!(matches!(rx.try_recv(),Ok(Command::Action {action: Action::SetTaskSprint {id:1,sprint:None},..})));
         rt.state.pending=false; click(&mut rt,"dialog-close"); click(&mut rt,"new-task"); click(&mut rt,"pick-sprint"); click(&mut rt,"assign-sprint-19");

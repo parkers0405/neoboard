@@ -109,6 +109,8 @@ enum Tasks {
         #[arg(long = "label")] labels: Vec<String>,
         #[arg(long = "needs")] needs: Vec<u64>,
         #[arg(long)] assignee: Option<String>,
+        /// Leave this task in the open queue instead of assigning it to the creating agent.
+        #[arg(long, conflicts_with="assignee")] unassigned: bool,
         #[arg(long)] parent: Option<u64>,
         #[arg(long)] global: bool,
         #[arg(long, conflicts_with_all = ["parent", "global"])] sprint: Option<u64>,
@@ -286,7 +288,8 @@ fn run(cli: Cli) -> Result<()> {
             Tasks::SetSprint { id, sprint } => Action::SetTaskSprint { id, sprint },
             Tasks::List { channel, include_global, sprint, state } => return show_messages(&client, json, channel.as_deref(), None, Some(include_global), sprint, state),
             Tasks::Placements => return print_json(&client.task_placements()?),
-            Tasks::Create { channel, text, description, labels, needs, assignee, parent, global, sprint } => {
+            Tasks::Create { channel, text, description, labels, needs, assignee, unassigned, parent, global, sprint } => {
+                let assignee = if unassigned { Some(String::new()) } else { assignee };
                 let text = task_body(text,description)?;
                 let labels = parse_labels(labels)?;
                 if let Some(sprint) = sprint {

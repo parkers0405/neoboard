@@ -25,7 +25,7 @@ def msg(cursor, channel='project/dev', id=1, parent=None, label=None, state=None
                 labels={} if label is None else {'status': label}, task={'state': state} if state else None))
 
 
-class WatcherTest(unittest.TestCase):
+class WatcherFixture(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -34,6 +34,10 @@ class WatcherTest(unittest.TestCase):
         self.status = 200
         self.cursors = []
         self.session_status = {}
+        self.on_status = None
+        self.returned_session = 'ses_fixture'
+        self.page_size = 1000
+        self.watch_token = 'fixture'
         self.prompts = []
         self.post_status = 204
         self.posts = []
@@ -46,7 +50,9 @@ class WatcherTest(unittest.TestCase):
             def do_GET(self):
                 url = urlsplit(self.path)
                 if url.path.startswith('/v2/') and self.headers.get('Authorization') == 'Bearer neo-fixture':
-                    data = {'/v2/sessions/ses_fixture': {'id': 'ses_fixture'},
+                    if url.path == '/v2/sessions/status' and fixture.on_status:
+                        fixture.on_status()
+                    data = {'/v2/sessions/ses_fixture': {'id': fixture.returned_session},
                             '/v2/sessions/status': fixture.session_status}
                     if url.path not in data:
                         self.send_error(404)
@@ -62,7 +68,7 @@ class WatcherTest(unittest.TestCase):
                 fixture.cursors.append(cursor)
                 self.send_response(fixture.status)
                 self.end_headers()
-                self.wfile.write(json.dumps([e for e in fixture.events if e['cursor'] > cursor]).encode())
+                self.wfile.write(json.dumps([e for e in fixture.events if e['cursor'] > cursor][:fixture.page_size]).encode())
 
             def do_POST(self):
                 fixture.posts.append(self.path)
@@ -93,7 +99,7 @@ class WatcherTest(unittest.TestCase):
 
     def cli(self, *args, fails=False):
         p = subprocess.run([sys.executable, str(CLI), '--db', str(self.db), *args],
-                           env=dict(os.environ, NEOBOARD_WATCH_TOKEN='fixture', NEOISM_WAKE_TOKEN='neo-fixture'),
+                           env=dict(os.environ, NEOBOARD_WATCH_TOKEN=self.watch_token, NEOISM_WAKE_TOKEN='neo-fixture'),
                            capture_output=True, text=True, timeout=10)
         if fails:
             self.assertNotEqual(p.returncode, 0)
@@ -104,6 +110,8 @@ class WatcherTest(unittest.TestCase):
     def init(self, mode, *args):
         self.cli('init', '--endpoint', self.url, '--match', mode, '--channel', 'project/dev', *args)
 
+
+class WatcherTest(WatcherFixture):
     def test_atomic_restart_retry_and_replay(self):
         self.init('label', '--label', 'status', '--before', 'open', '--after', 'closed')
         with closing(turso.connect(str(self.db))) as db:
@@ -211,7 +219,10 @@ class WatcherTest(unittest.TestCase):
         self.cli('replay', self.cli('inspect')['deliveries'][1]['id'])
         self.cli('poll')
         self.assertIsNone(self.cli('wake'))
-        self.assertEqual(self.prompts, [{'prompt': 'NeoBoard assignment: check task #16 in channel project/dev. Verify the current assignment before acting.'}])
+        [prompt] = self.prompts
+        for required in ('task #16', 'project/dev', 'scoped board MCP', 'tasks_claim', 'tasks_start', 'pending_question', 'tasks_complete'):
+            self.assertIn(required, prompt['prompt'])
+        self.assertNotIn('ses_other', prompt['prompt'])
         self.assertEqual([r['status'] for r in self.cli('wake-status')], ['unbound', 'accepted'])
 
     def test_ambiguous_wake_never_retried(self):
@@ -233,7 +244,7 @@ class WatcherTest(unittest.TestCase):
         self.cli('poll')
         self.reply_gate.clear()
         with subprocess.Popen([sys.executable, str(CLI), '--db', str(self.db), 'wake'],
-                              env=dict(os.environ, NEOISM_WAKE_TOKEN='neo-fixture')) as process:
+                              env=dict(os.environ, NEOISM_WAKE_TOKEN='neo-fixture', NEOBOARD_WATCH_TOKEN='fixture')) as process:
             try:
                 self.assertTrue(self.received.wait(5))
             finally:

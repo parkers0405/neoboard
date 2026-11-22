@@ -116,6 +116,97 @@ fn daemon_grants_apply_to_stdio_tools() {
 }
 
 #[test]
+fn private_callbacks_survive_delegation_and_replay_over_stdio() {
+    use neochat::protocol::Grant;
+    let tmp = tempfile::tempdir().unwrap();
+    let (_daemon, d) = daemon(tmp.path());
+    let admin = Client::discover_admin(Some(tmp.path())).unwrap();
+    let scoped = |actor: &str| InviteRequest { actor: actor.into(), channels: vec!["general".into()], expires_at: None };
+    let parent = admin.restricted_invite(&scoped("parent"), &[Grant::Read, Grant::Notifications, Grant::PostTask, Grant::Assign]).unwrap();
+    let worker = admin.invite(&scoped("worker")).unwrap();
+    let mut p = Peer::new(&d.url, &parent.token, "parent");
+    let mut w = Peer::new(&d.url, &worker.token, "worker");
+    let mut host = Peer::new(&d.url, &d.token, "host");
+    let code = |r: Value| r["structuredContent"]["error"]["code"].clone();
+
+    let task = p.ok("tasks_create", json!({"channel":"general","title":"Verify result","assignee":"worker"}));
+    let id = &task["id"];
+    let filter = json!({"thread":id,"kind":"completed","after_cursor":task["cursor"]});
+    w.ok("tasks_claim", json!({"id":id,"lease_secs":60}));
+    w.ok("tasks_start", json!({"id":id}));
+    w.ok("tasks_complete", json!({"id":id,"text":"verified"}));
+    assert_eq!(p.ok("inbox_list", json!({}))["items"], json!([]));
+    let completed = p.ok("callbacks_register", filter.clone());
+    assert_eq!(completed["after_cursor"], task["cursor"]);
+    assert!(completed["registered_cursor"].as_u64().unwrap() > task["cursor"].as_u64().unwrap());
+    assert_eq!(p.ok("callbacks_register", filter.clone()), completed);
+    assert_eq!(code(p.tool("callbacks_register", json!({"thread":id,"kind":"completed","after_cursor":completed["registered_cursor"]}))), "conflict");
+    let by_worker = p.ok("callbacks_register", json!({"thread":id,"kind":"reply","author":"worker"}));
+    assert_eq!(by_worker["after_cursor"], by_worker["registered_cursor"]);
+    assert_eq!(p.ok("callbacks_list", json!({}))["callbacks"], json!([completed, by_worker]));
+    host.ok("reply", json!({"thread":id,"text":"not by worker"}));
+    let reply = w.ok("reply", json!({"thread":id,"text":"review details"}));
+
+    let hidden = host.ok("post", json!({"channel":"private","text":"@parent hidden mention"}));
+    assert_eq!(code(p.tool("callbacks_register", json!({"thread":hidden["id"],"kind":"reply","author":"local","after_cursor":0}))), "not_found");
+    assert_eq!(code(p.tool("callbacks_register", json!({"thread":id,"kind":"reply"}))), "invalid_action");
+    assert_eq!(code(p.tool("callbacks_register", json!({"thread":id,"kind":"failed","author":"worker"}))), "invalid_action");
+    for args in [json!({"actor":"worker"}), json!({"limit":501})] {
+        assert_eq!(p.rpc("tools/call", json!({"name":"inbox_list","arguments":args}))["error"]["code"], -32602);
+    }
+    let page = p.ok("inbox_list", json!({"limit":1}));
+    assert_eq!(page["actor"], "parent");
+    let first = &page["items"][0];
+    assert_eq!(first["kind"], "completed");
+    assert_eq!(first["thread"], *id);
+    assert_eq!(first["actor"], "worker");
+    assert_eq!(page["next_after"], first["id"]);
+    assert_eq!(p.ok("inbox_list", json!({"limit":1})), page);
+    let rest = p.ok("inbox_list", json!({"after":page["next_after"]}));
+    assert_eq!(rest["items"].as_array().unwrap().len(), 1);
+    let item = &rest["items"][0];
+    assert_eq!(item["kind"], "reply");
+    assert_eq!(item["author"], "worker");
+    assert_eq!(item["message_id"], reply["id"]);
+    assert_eq!(item["cursor"], reply["cursor"]);
+    let mark = json!({"id":first["id"],"read":true});
+    let cancel = json!({"id":completed["id"]});
+    assert_eq!(w.ok("inbox_list", json!({}))["items"], json!([]));
+    assert_eq!(w.ok("callbacks_list", json!({}))["callbacks"], json!([]));
+    assert_eq!(code(w.tool("inbox_set_read", mark.clone())), "not_found");
+    assert_eq!(code(w.tool("callbacks_cancel", cancel.clone())), "not_found");
+    assert_eq!(p.ok("inbox_set_read", mark.clone()), mark);
+    assert_eq!(p.ok("callbacks_cancel", cancel), json!({"id":completed["id"],"canceled":true}));
+    p.ok("callbacks_cancel", json!({"id":by_worker["id"]}));
+    w.ok("reply", json!({"thread":id,"text":"after cancel"}));
+    p.ok("callbacks_register", filter.clone()); // Replay cannot duplicate or reset the read delivery.
+    assert_eq!(p.ok("inbox_list", json!({}))["items"], json!([item]));
+    let mut read_item = first.clone();
+    read_item["read"] = json!(true);
+    assert_eq!(p.ok("inbox_list", json!({"read":true}))["items"], json!([read_item]));
+    p.ok("inbox_set_read", json!({"id":first["id"],"read":false}));
+
+    // A mention is a delivery even with no active reply filter. Replaying an exact
+    // profile byline later must preserve the original mention ID and reason.
+    let profile = Client::new(&d.url, &worker.token, Some("build")).unwrap();
+    let profiled = profile.action(&Action::Reply { thread:id.as_u64().unwrap(), text:"@parent build details".into() }).unwrap();
+    let mention_page = p.ok("inbox_list", json!({"after":item["id"]}));
+    let mention = &mention_page["items"][0];
+    assert_eq!(mention["kind"], "mention");
+    assert_eq!(mention["author"], "worker/build");
+    assert_eq!(mention["cursor"], profiled.cursor);
+    let by_profile = p.ok("callbacks_register", json!({"thread":id,"kind":"reply","author":"worker/build","after_cursor":task["cursor"]}));
+    assert_eq!(by_profile["author"], "worker/build");
+    assert_eq!(p.ok("inbox_list", json!({"after":item["id"]})), mention_page);
+    admin.revoke_grant(parent.id, Grant::Notifications).unwrap();
+    assert_eq!(code(p.tool("inbox_set_read", mark)), "forbidden");
+    assert_eq!(code(p.tool("callbacks_register", filter)), "forbidden");
+    assert_eq!(p.ok("inbox_list", json!({}))["items"], json!([first,item,mention]));
+    admin.revoke_invite(parent.id).unwrap();
+    assert_eq!(code(p.tool("inbox_list", json!({}))), "unauthenticated");
+}
+
+#[test]
 fn ordinary_board_parity_over_scoped_stdio() {
     use neochat::protocol::Grant;
     let tmp = tempfile::tempdir().unwrap();
@@ -311,6 +402,9 @@ fn explicit_task_fields_round_trip_and_legacy_text_is_preserved() {
         assert_eq!(msg["title"], title);
         assert_eq!(msg["description"], body);
         assert_eq!(msg["text"], format!("{title}\n\n{body}"));
+        assert_eq!(msg["task"]["assignee"], msg["author_id"]);
+        assert!(!msg["task"]["assignee"].is_null());
+        assert!(msg["task"]["owner"].is_null());
     }
     let updated = peer.ok("tasks_update", json!({"id":id,"title":"Smaller task"}));
     assert_eq!(updated["description"], "");
@@ -396,13 +490,13 @@ fn two_actors_coordinate_over_stdio_with_private_isolation() {
     assert_eq!(a.rpc("ping", json!({}))["result"], json!({}));
     let catalog = a.rpc("tools/list", json!({}));
     let names: Vec<_> = catalog["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-    assert_eq!(names, ["channels","read","post","reply","wait","tasks_list","tasks_create","tasks_claim","tasks_start","tasks_claim_next","tasks_renew","tasks_complete","tasks_fail","members","tasks_assign","tasks_block","tasks_unblock","tasks_cancel","tasks_placements","tasks_update","tasks_acknowledge","docs_list","docs_read","docs_search","channel_create","edit","labels","react","reactions","attachments","schedule","schedules","cancel_schedule","sprints_list","sprints_create","tasks_set_sprint","sprints_finish"]);
+    assert_eq!(names, ["channels","read","post","reply","wait","tasks_list","tasks_create","tasks_claim","tasks_start","tasks_claim_next","tasks_renew","tasks_complete","tasks_fail","members","tasks_assign","tasks_block","tasks_unblock","tasks_cancel","tasks_placements","tasks_update","tasks_acknowledge","docs_list","docs_read","docs_search","channel_create","edit","labels","react","reactions","attachments","schedule","schedules","cancel_schedule","sprints_list","sprints_create","tasks_set_sprint","sprints_finish","inbox_list","inbox_set_read","callbacks_register","callbacks_list","callbacks_cancel"]);
     for tool in catalog["result"]["tools"].as_array().unwrap() {
         assert_eq!(tool["inputSchema"]["additionalProperties"], false);
         assert!(tool["inputSchema"]["properties"].get("area").is_none());
     }
 
-    let task = a.ok("tasks_create", json!({"channel":"work","text":"coordinate two independent actors"}));
+    let task = a.ok("tasks_create", json!({"channel":"work","text":"coordinate two independent actors","unassigned":true}));
     let id = task["id"].as_u64().unwrap();
     let task_cursor = task["cursor"].as_u64().unwrap();
     let listed = b.ok("tasks_list", json!({"channel":"work"}));
@@ -414,6 +508,7 @@ fn two_actors_coordinate_over_stdio_with_private_isolation() {
     assert_eq!(listed["messages"][0]["sender"], "mcp:Claude Code");
     assert_eq!(listed["messages"][0]["labels"], json!({}));
     assert_eq!(listed["messages"][0]["id"], id);
+    assert!(listed["messages"][0]["task"]["assignee"].is_null());
 
     // Both attempt to claim; exactly one owns the lease, and ownership is actor-bound.
     let claim = b.ok("tasks_claim_next", json!({"channel":"work","lease_secs":60,"assignment":"unassigned"}));
@@ -548,6 +643,18 @@ fn boards_file_routes_each_call_from_one_stdio_peer() {
     for (id, marker) in [(alpha, "alpha-only"), (beta, "beta-only")] {
         peer.ok("post", json!({"board_id":id,"channel":"check","text":marker}));
     }
+    let mut explicit = Peer::new(&first.url, &first.token, "observer");
+    let thread = explicit.ok("post", json!({"channel":"check","text":"callback target"}))["id"].clone();
+    let sub = peer.ok("callbacks_register", json!({"board_id":alpha,"thread":thread,"kind":"reply","author":"local"}));
+    explicit.ok("reply", json!({"thread":thread,"text":"alpha-only delivery"}));
+    let delivery = peer.ok("inbox_list", json!({"board_id":alpha}))["items"][0].clone();
+    assert_eq!(delivery["text"], "alpha-only delivery");
+    assert_eq!(peer.ok("inbox_list", json!({"board_id":beta}))["items"], json!([]));
+    assert_eq!(peer.ok("callbacks_list", json!({"board_id":beta}))["callbacks"], json!([]));
+    peer.ok("inbox_set_read", json!({"board_id":alpha,"id":delivery["id"],"read":true}));
+    peer.ok("callbacks_cancel", json!({"board_id":alpha,"id":sub["id"]}));
+    assert_eq!(explicit.ok("inbox_list", json!({"read":true}))["items"][0]["id"], delivery["id"]);
+    assert_eq!(explicit.ok("callbacks_list", json!({}))["callbacks"], json!([]));
     for bad in [json!({}), json!({"board_id":"unknown"}), json!({"board_id":"Team"}), json!({"board_id":null})] {
         let mut args = bad.clone();
         args["channel"] = json!("check");

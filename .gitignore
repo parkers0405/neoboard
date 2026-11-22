@@ -4,3 +4,4 @@ target/
 .env.*
 *.sqlite*
 *.db
+__pycache__/

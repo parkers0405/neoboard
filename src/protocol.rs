@@ -16,6 +16,9 @@ pub struct Attachment {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+/// A point-in-time view, not proof of continuing access. On HTTP 409 from
+/// events discard cached board data, refetch snapshot and ancillary state,
+/// and resume at the new cursor. On 401 discard the view and reauthenticate.
 pub struct Snapshot {
     pub cursor: u64,
     pub channels: Vec<String>,
@@ -233,6 +236,7 @@ pub struct Discovery { pub url: String, pub token: String }
 #[serde(rename_all = "snake_case")]
 #[value(rename_all = "snake_case")]
 pub enum Grant {
+    Notifications,
     Read, Attach, DisplayName, Post, PostTask, Reply, EditTask,
     CreateSprint, FinishSprint,
     #[value(skip)] CreateArea,

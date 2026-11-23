@@ -340,9 +340,7 @@ impl Board {
         let identity = Self::identity(&db, token, Some(Grant::DisplayName))?;
         // Allow human names, including spaces and Unicode, but not control or
         // bidi override characters that can spoof surrounding UI text.
-        if name.len() > 256 || name.chars().any(|c| c.is_control() || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')) {
-            return Err(invalid("display name must be at most 256 bytes without control or bidi override characters"));
-        }
+        crate::protocol::validate_display_name(name).map_err(invalid)?;
         let name = name.trim();
         if name.is_empty() {
             db.execute("DELETE FROM actor_display_names WHERE credential=?1", [identity.id])?;
@@ -1177,11 +1175,12 @@ async fn http_organization(State(board):State<Board>,headers:HeaderMap)->Result<
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MembersQuery { channel: String }
-async fn http_me(State(board):State<Board>,headers:HeaderMap)->Result<Json<Member>> {
+async fn http_me(State(board):State<Board>,headers:HeaderMap)->Result<Json<crate::protocol::Membership>> {
     let token=bearer(&headers)?;Ok(Json(blocking(move||{
         let db=board.lock()?;let who=Board::identity(&db,&token,Some(Grant::Read))?;
         let name=db.query_row("SELECT name FROM actor_display_names WHERE credential=?1",[who.id],|r|r.get(0)).optional()?;
-        Ok(Member{actor:who.actor,display_name:name})
+        let shared: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM shared_invites WHERE credential=?1)", [who.id], |r| r.get(0))?;
+        Ok(crate::protocol::Membership { member: Member{actor:who.actor,display_name:name}, personal: Some(!shared) })
     }).await?))
 }
 async fn http_join(State(board):State<Board>,headers:HeaderMap)->Result<Json<Invite>> {

@@ -118,6 +118,7 @@ impl App {
         self.commands = None;
         self.updates = None;
         self.status = "disconnected".into();
+        self.personal.reset_connection();
     }
 
     pub fn reconnect_guest(&mut self) {
@@ -184,17 +185,11 @@ impl App {
     pub fn begin_add_board(&mut self) {
         self.project_menu = false;
         self.onboarding = Onboarding { adding: true, step: Step::Board, joining: self.remote(),
-            name: edit(self.me.as_ref().and_then(|m| m.display_name.as_deref()).unwrap_or(&self.local_name)), ..Default::default() };
+            name: edit(self.device_label()), ..Default::default() };
     }
 
     pub fn submit_board_setup(&mut self) {
         if self.onboarding.busy { return; }
-        let name = self.onboarding.name.text.trim().to_owned();
-        if name.is_empty() || name.chars().count() > 80 || name.chars().any(char::is_control) {
-            self.onboarding.step = Step::Name;
-            self.onboarding.error = Some("Enter a display name (1 to 80 characters).".into());
-            return;
-        }
         let command = if self.onboarding.joining {
             if self.has_unsent_work() {
                 self.onboarding.error = Some("Finish or clear your drafts before joining another server.".into());
@@ -217,7 +212,7 @@ impl App {
                     connection::JoinSource::Password { endpoint, project, password }
                 }
             };
-            Command::JoinBoard { invite, name }
+            Command::JoinBoard { invite }
         } else {
             let id = self.onboarding.board.text.split_whitespace().collect::<Vec<_>>().join("-");
             if !neochat::valid_project(&id) {
@@ -228,7 +223,7 @@ impl App {
                 self.onboarding.error = Some("Connect to your local board and finish any open draft before creating another board.".into());
                 return;
             }
-            Command::CreateBoard { id, name }
+            Command::CreateBoard { id }
         };
         self.onboarding.error = None;
         if self.commands.as_ref().is_some_and(|tx| tx.try_send(command).is_ok()) {
@@ -244,6 +239,7 @@ impl App {
         let switching = std::mem::take(&mut self.onboarding.switching);
         match result {
             Ok((id, mut snapshot, member, hosted)) => {
+                self.personal.reset_connection();
                 self.onboarding.clear_join_fields();
                 if hosted.is_some() || switching {
                     self.organization = Default::default();
@@ -322,8 +318,8 @@ mod tests {
         assert!(!serde_json::to_string(&rt.state.preferences()).unwrap().contains(SECRET.trim()));
         assert!(!crate::setup_guide::Guide::new(&rt.state).copy_text().contains(SECRET.trim()));
         click(&mut rt, "onboarding-submit");
-        assert!(matches!(rx.try_recv(), Ok(Command::JoinBoard { invite: connection::JoinSource::Password { endpoint, project, .. }, name })
-            if endpoint == "https://host/" && project == "dev" && name == "Sam Lee"));
+        assert!(matches!(rx.try_recv(), Ok(Command::JoinBoard { invite: connection::JoinSource::Password { endpoint, project, .. } })
+            if endpoint == "https://host/" && project == "dev"));
         assert!(rt.state.onboarding.busy && rt.state.onboarding.password.text.is_empty());
         rt.update(|a, _| a.finish_board_setup(Err("Join failed".into())));
         for _ in 0..60 { rt.frame(1./60.); }
@@ -393,11 +389,11 @@ mod tests {
         rt.update(|a, _| a.onboarding.board = edit("Design Team"));
         rt.frame(1. / 60.);
         click(&mut rt, "onboarding-submit");
-        let Command::CreateBoard { id, name } = requests.try_recv().unwrap() else { panic!("expected create board"); };
+        let Command::CreateBoard { id } = requests.try_recv().unwrap() else { panic!("expected create board"); };
         assert_eq!(id, "Design-Team");
-        assert_eq!(name, "Sam Lee");
+        assert_eq!(rt.state.device_label(), "Sam Lee");
         rt.update(|a, _| a.finish_board_setup(Ok((id, Snapshot { cursor: 1, channels: vec!["Design-Team/general".into()], messages: vec![] },
-            neochat::protocol::Member { actor: "local".into(), display_name: Some(name) }, None))));
+            neochat::protocol::Member { actor: "local".into(), display_name: None }, None))));
         for _ in 0..5 { rt.frame(1. / 60.); }
         click(&mut rt, "onboarding-copy");
         assert_eq!(rt.state.home_copied, Some("onboarding-copy"));

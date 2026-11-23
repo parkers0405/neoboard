@@ -28,6 +28,7 @@ impl Agent {
 }
 
 pub struct Guide {
+    agent: Agent,
     pub key: String,
     pub install: Option<Install>,
     pub intro: String,
@@ -170,7 +171,7 @@ impl Guide {
             }
             Agent::Neoism => {
                 if remote {
-                    return Self { key, install: None, intro, instruction: "Join this hosted board with a saved invite before adding it to Neoism.".into(), snippet: "A board registration requires a saved invite or local data directory.".into(), question: format!("Using neoboard, list the channels visible for board {project} without making changes.") };
+                    return Self { agent, key, install: None, intro, instruction: "Join this hosted board with a saved invite before adding it to Neoism.".into(), snippet: "A board registration requires a saved invite or local data directory.".into(), question: format!("Using neoboard, list the channels visible for board {project} without making changes.") };
                 }
                 if installable {
                     install = path.map(|path| Install { key: key.clone(), project: project.to_owned(), adapter: adapter.into(), path, joined, host_number: None });
@@ -178,7 +179,7 @@ impl Guide {
                 let registry = crate::profile::config_dir().filter(|d| d.is_absolute()).map(|d| d.join(catalog::BOARDS)).unwrap_or_else(|| PathBuf::from("<absolute boards file>"));
                 let server = catalog::server(adapter, &registry.to_string_lossy());
                 let question = format!("Using neoboard, list the channels visible for board {project} (board_id: {key}) without making changes.");
-                return Self { key, install, intro, instruction: "Add this board, then reconnect neoboard in Neoism. One global plugin serves all boards you add on this device.".into(), snippet: format!("{:#}", json!({"neoboard":server})), question };
+                return Self { agent, key, install, intro, instruction: "Add this board, then reconnect neoboard in Neoism. One global plugin serves all boards you add on this device.".into(), snippet: format!("{:#}", json!({"neoboard":server})), question };
             }
             Agent::ClaudeCode | Agent::ClaudeDesktop => {
                 let mut server = json!({"command":adapter, "args":args});
@@ -198,7 +199,7 @@ impl Guide {
             (true, _) => "Set NEOCHAT_URL and NEOCHAT_TOKEN to this board’s endpoint and agent-specific credential in a separate client launch environment.",
         }};
         Self {
-            intro, key: key.clone(), install,
+            agent, intro, key: key.clone(), install,
             instruction: format!("Add {key} to {location} without replacing any other entries. {auth} Restart {}.", agent.name()),
             snippet,
             question: format!("Using {key}, list the channels visible for board {project} without making changes."),
@@ -206,7 +207,14 @@ impl Guide {
     }
 
     pub fn copy_text(&self) -> String {
-        format!("1. {}\n\n2. {}\n\n{}\n\n3. Ask: {}", self.intro, self.instruction, self.snippet, self.question)
+        let runtime = match self.agent {
+            Agent::ClaudeDesktop => "Claude Desktop supports MCP but not automatic wake. Stop after the read-only check.",
+            Agent::Neoism => "Pair the exact Neoism session on its loopback runtime. Supply any required runtime credential privately on the agent machine.",
+            Agent::ClaudeCode => "Pair a dedicated Claude Code session. If the terminal cannot identify it, use its exact session ID, never the most recent chat.",
+            Agent::Codex => "Pair a dedicated Codex thread using its exact thread ID. If the OS blocks the CLI, stop; do not bypass the warning.",
+        };
+        let wake = if self.agent == Agent::ClaudeDesktop { runtime.to_string() } else { format!("If I want wake, guide me through Home → Setup → Set up wake. {runtime} Use the agent's own board identity. I choose Copy for agent and paste the pairing prompt into the exact conversation I want to wake, or choose Manual for a terminal command. Then I select Check connection. Do not ask me to paste private codes or tokens here. Pairing leaves wake off. I can choose Turn on to allow mentions and requested task updates to start turns, or Pause to stop future wakes. Do not enable wake or send a test on my behalf.") };
+        format!("1. Connect MCP for {}\n{} {}\n\n{}\n\n2. Verify access\n{}\n\n3. Automatic wake (optional)\n{}", self.agent.name(), self.intro, self.instruction, self.snippet, self.question, wake)
     }
 }
 
@@ -226,6 +234,8 @@ mod tests {
             assert!(guide.snippet.contains(marker));
             assert!(guide.install.is_none() && (agent == Agent::Neoism || guide.snippet.contains(&guide.key)));
             assert!(!text.contains("PRIVATE_SENTINEL") && !text.contains("--data-dir"));
+            assert!(text.contains("3. Automatic wake (optional)") && !text.contains("--code "));
+            assert_eq!(text.contains("Check connection"), agent != Agent::ClaudeDesktop);
         }
     }
 
@@ -307,6 +317,7 @@ mod tests {
         let mut rt = rune::Runtime::new(app, crate::view::root, (900., 720.), rune::Env::new(true, 1.));
         let offered = |rt: &mut rune::Runtime<crate::App>| {
             rt.frame(1. / 60.);
+            assert_eq!(rt.find("copy-mcp-config").is_some(), rt.state.setup_agent != Agent::Neoism || rt.state.options.endpoint.is_none() || rt.state.options.invite.is_some());
             rt.find("setup-add-neoism").is_some()
         };
         assert!(offered(&mut rt));

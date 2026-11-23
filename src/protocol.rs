@@ -313,9 +313,23 @@ pub struct Member {
     pub display_name: Option<String>,
 }
 
+/// `/me` also distinguishes a personal credential from a reusable join link.
+/// Older servers omit the flag; automatic device-wide writes must fail closed.
+#[derive(Serialize, Deserialize)]
+pub struct Membership {
+    #[serde(flatten)] pub member: Member,
+    #[serde(default)] pub personal: Option<bool>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DisplayNameRequest {
     /// Surrounding whitespace is trimmed; empty resets the name.
     pub name: String,
+}
+
+pub fn validate_display_name(name: &str) -> Result<(), &'static str> {
+    if name.len() > 256 || name.chars().any(|c| c.is_control() || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')) {
+        Err("display name must be at most 256 bytes without control or bidi override characters")
+    } else { Ok(()) }
 }

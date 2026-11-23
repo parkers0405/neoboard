@@ -5,6 +5,7 @@ mod connection;
 #[cfg(test)]
 mod live_organization_test;
 mod profile;
+mod personal;
 mod release_update;
 // The shared multiplayer generator's clock helper resolves this module name.
 use profile as cursor_style;
@@ -22,6 +23,7 @@ mod host_password;
 mod saved_boards;
 mod board_removal;
 mod setup_guide;
+mod agent_wake;
 
 use std::{collections::BTreeMap, sync::{OnceLock, mpsc}, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
 use neochat::protocol::{Action, Message, Snapshot, TaskState, EventKind, Reaction, ScheduledPost, Attachment};
@@ -100,6 +102,7 @@ struct App {
     removal: Option<board_removal::Confirmation>,
     connection_wake: Option<rune::Waker>,
     local_name: String,
+    personal: personal::Personal,
     me: Option<neochat::protocol::Member>,
     personal_name: TextEdit,
     member_list: Option<(String,Result<Vec<neochat::protocol::Member>,String>)>,
@@ -123,6 +126,7 @@ struct App {
     home_copied: Option<&'static str>,
     setup_open: bool,
     setup_session: setup_guide::Session,
+    agent_wake: Option<agent_wake::Panel>,
     setup_agent: setup_guide::Agent,
     setup_choices: bool,
     filter_choice_search: rune::TextEdit,
@@ -269,11 +273,13 @@ impl App {
         let mut app = Self {
             release: Default::default(),
             removal: None,
+            personal: Default::default(),
             local_name: OPTIONS.get().and_then(|o| o.profile.clone()).unwrap_or_else(|| profile::local_name(fixture || cfg!(test))),
             profiles: profile::Profiles::default(),
             zoom: zoom::Zoom::default(),
             snapshot: Snapshot { cursor: 0, channels: vec![], messages: vec![] }, board_cache:None,board_extra:Default::default(),page: Page::Home, project:String::new(), options: OPTIONS.get().cloned().unwrap_or_default(), onboarding: Default::default(), project_menu:false, home_copied: None, setup_open:false, setup_agent:Default::default(), setup_choices:false, splash: Default::default(),
             setup_session: Default::default(),
+            agent_wake: None,
             share:Default::default(), connection_wake:None, saved_boards:Default::default(), me:None, personal_name:edit(""), member_list:None, pick_assignee:false, details_picker:None, task_filters:Default::default(), aliases:BTreeMap::new(),
             filter: ALL_TASKS, query: edit(""), channel: edit(""), draft: edit(""), reply: edit(""),
             labels: edit(""), needs: edit(""), assignee: edit(""), new_channel: edit(""), creating_channel: None,
@@ -293,7 +299,7 @@ impl App {
         else if !cfg!(test) && let Some(prefs) = Preferences::path(&app.options).and_then(|p| Preferences::load(&p)) {
             app.restore_preferences(prefs);
         }
-        if !fixture && !cfg!(test) { app.zoom.load(); }
+        if !fixture && !cfg!(test) { app.zoom.load(); app.load_personal(); }
         if let Some(id) = &app.options.project { app.project = id.clone(); }
         app
     }
@@ -332,6 +338,7 @@ impl App {
         self.row_menu=None;self.hover_row=None;
         if self.dialog == Some(Dialog::Filters) { self.dialog = None; self.details_picker = None; }
         self.setup_open=false;
+        self.agent_wake=None;
         if page==Page::Home {self.thread=None;}
         if page == Page::Scheduled { self.show_schedule = true; }
         else if self.page == Page::Scheduled { self.show_schedule = false; }
@@ -359,7 +366,7 @@ impl App {
                 Page::Channel(c) => &m.channel == c && m.parent.is_none(),
                 Page::Tasks => m.parent.is_none() && self.organization.tasks.get(&m.id).is_none_or(|p|p.parent.is_none()) && m.task.as_ref().is_some_and(|t| matches_filter(&t.state, self.filter)),
             };
-            in_page && projects::contains(&self.project,&m.channel) && (self.page!=Page::Tasks || self.task_filters.matches(m,self.me.as_ref().map(|u|u.actor.as_str()))) && (query.is_empty() || format!("{} {} {} {:?}", m.id, m.author, m.text, m.labels).to_lowercase().contains(&query))
+            in_page && projects::contains(&self.project,&m.channel) && (self.page!=Page::Tasks || self.task_filters.matches(m,self.me.as_ref().map(|u|u.actor.as_str()))) && (query.is_empty() || format!("{} {} {} {} {:?}", m.id, m.author, self.sender_label(m), m.text, m.labels).to_lowercase().contains(&query))
         }).collect();
         messages.sort_by_key(|m| (m.created_at, m.id));
         if self.page == Page::Tasks || (self.page == Page::Activity && !self.oldest) { messages.reverse(); }
@@ -391,12 +398,21 @@ impl App {
     }
     fn actor_label<'a>(&'a self, author:&'a str)->&'a str {
         let actor=author.split('/').next().unwrap_or(author);
-        self.me.iter().chain(self.member_list.iter().flat_map(|(_,r)|r.as_ref().into_iter().flatten()))
-            .find(|m|m.actor==actor).and_then(|m|m.display_name.as_deref()).or_else(||self.aliases.get(actor).map(String::as_str)).unwrap_or_else(||{
+        let name = match self.me.as_ref().filter(|m| m.actor == actor) {
+            Some(me) => me.display_name.as_deref(),
+            None => self.aliases.get(actor).map(String::as_str),
+        };
+        name.unwrap_or_else(||{
                 if author!="local" {return profile::display_name(author);}
                 if self.me.as_ref().is_some_and(|m|m.actor=="local") || !self.remote() {return &self.local_name;}
-                self.snapshot.messages.iter().rev().find_map(|m|m.author.strip_prefix("local/")).unwrap_or("Board host")
+                "Board host"
             })
+    }
+    fn record_names(&mut self, list: &[neochat::protocol::Member]) {
+        for member in list {
+            if let Some(name) = &member.display_name { self.aliases.insert(member.actor.clone(),name.clone()); }
+            else { self.aliases.remove(&member.actor); }
+        }
     }
     fn show_assignees(&mut self){
         let channel = self.task_channel.clone();
@@ -632,6 +648,7 @@ fn setup(app: &mut App, wake: rune::Waker) {
 fn poll(app: &mut App, seconds: f64, tx: &mut Tx) -> bool {
     let started = Instant::now();
     let mut changed = app.setup_session.poll();
+    changed |= app.agent_wake.as_mut().is_some_and(agent_wake::Panel::poll);
     if app.share.busy && matches!(app.dialog, Some(Dialog::Share | Dialog::Connection)) {
         app.share.pulse = ((seconds * 2.4).cos() as f32 + 1.) * 0.5;
         tx.wake_after(Duration::from_millis(40));
@@ -658,6 +675,7 @@ fn poll(app: &mut App, seconds: f64, tx: &mut Tx) -> bool {
                 }
             }
             Update::Snapshot(mut snapshot) => {
+                app.personal.reset_connection();
                 // A reconnect can skip deletion events entirely.
                 let missing: Vec<_> = app.board_cache.as_ref().unwrap_or(&app.snapshot).channels.iter().filter(|c| !snapshot.channels.contains(c)).cloned().collect();
                 for c in missing { app.invalidate_channel(&c); }
@@ -702,6 +720,7 @@ fn poll(app: &mut App, seconds: f64, tx: &mut Tx) -> bool {
                 }
             }
             Update::Status(status) => {
+                if status != "live" { app.personal.reset_connection(); }
                 if status != "live" { app.share.request += 1; app.share.busy = false; app.share.confirm_stop = false; app.share.result = None; app.share.password = Default::default(); }
                 app.status = status;
                 if matches!(app.dialog, Some(Dialog::Share | Dialog::Connection)) && app.share.result.is_none() { app.host_request(connection::HostOp::Inspect); }
@@ -710,9 +729,16 @@ fn poll(app: &mut App, seconds: f64, tx: &mut Tx) -> bool {
                 Ok(extra) => {app.board_extra=extra;app.refresh_extra();}
                 Err(e) => app.error = Some(format!("Could not refresh reactions/scheduled posts: {e}")),
             },
-            Update::Members(channel,result)=>{if projects::contains(&app.project,&channel){app.member_list=Some((channel,result));}}
-            Update::Names(channel,list)=>if projects::contains(&app.project,&channel){for m in list {if let Some(name)=m.display_name{app.aliases.insert(m.actor,name);}else{app.aliases.remove(&m.actor);}}},
-            Update::Personal(result)=>match result {Ok(member)=>{app.aliases.remove(&member.actor);app.me=Some(member);},Err(e)=>app.error=Some(e)},
+            Update::Members(channel,result)=>{if projects::contains(&app.project,&channel){if let Ok(list)=&result {app.record_names(list);}app.member_list=Some((channel,result));}}
+            Update::Names(channel,list)=>if projects::contains(&app.project,&channel){app.record_names(&list);if app.member_list.as_ref().is_some_and(|(ch,_)|ch==&channel){app.member_list=Some((channel,Ok(list)));}},
+            Update::Membership(session, result) => {
+                app.personal.session = Some(session);
+                match result {
+                    Ok(member) => { app.me = Some(member); app.sync_name(); }
+                    Err(e) => { app.me = None; app.name_result(session, app.personal.revision, Err(e)); }
+                }
+            }
+            Update::Personal(session, revision, result) => app.name_result(session, revision, result),
             Update::Attachments(id, result) => if app.positions.contains_key(&id){match result {
                 Ok(files) => { app.attachments.insert(id, files); }
                 Err(e) => app.error = Some(format!("Attachments: {e}")),
@@ -780,6 +806,17 @@ fn poll(app: &mut App, seconds: f64, tx: &mut Tx) -> bool {
     app.splash.tick(seconds,app.page==Page::Home && app.dialog.is_none() && !app.setup_open,tx) || changed
 }
 fn main() {
+    #[cfg(windows)]
+    if std::env::args_os().skip(1).eq([std::ffi::OsString::from("--wake-login")]) {
+        // HKCU Run entry: use the GUI subsystem before attaching a console or
+        // initializing any UI. Only the installed sibling can be the worker.
+        use std::process::Stdio;
+        let started = std::env::current_exe().and_then(|exe| {
+            background_process::command(exe.with_file_name("neoboard.exe"))
+                .args(["wake", "run"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()
+        });
+        std::process::exit(if started.is_ok() { 0 } else { 1 });
+    }
     let args: Vec<_> = std::env::args().skip(1).collect();
     #[cfg(windows)]
     if !args.is_empty() {
@@ -823,7 +860,7 @@ fn main() {
                 if app.project_menu {app.project_menu=false;return true;}
                 if app.channel_actions.menu.take().is_some(){return true;}
                 if app.row_menu.take().is_some(){return true;}
-                if app.setup_open {app.setup_open=false;return true;}
+                if app.setup_open {app.setup_open=false;app.agent_wake=None;return true;}
                 if app.dialog.is_some() { app.close_dialog(); return true; }
                 else if app.attachment_message.is_some() { app.attachment_message = None; }
                 else { app.thread = None; }
@@ -836,7 +873,7 @@ fn main() {
             ("update-offer", |a| {fixture::load(a,true); a.release.stage=release_update::Stage::Offer(semver::Version::new(1,2,0), release_update::Update::Portable);}),
             ("update-msi", |a| {fixture::load(a,true); a.dialog=Some(Dialog::Settings); a.release.stage=release_update::Stage::Offer(semver::Version::new(1,2,0), release_update::Update::Managed(release_update::Installer::Msi));}),
             ("update-running", |a| {fixture::load(a,true); a.release.stage=release_update::Stage::Running;}),
-            ("personal", |a| {fixture::load(a,true);a.dialog=Some(Dialog::Personal);}),
+            ("personal", |a| {fixture::load(a,true);a.personal.desired=Some("Sam Lee".into());a.open_personal();a.dialog=Some(Dialog::Personal);}),
             ("task-filters", |a| {fixture::load(a,true);a.dialog=Some(Dialog::Filters);}),
             ("task-status-menu", |a| { fixture::load(a,true); a.dialog = Some(Dialog::Filters); a.details_picker = Some("filter-status"); }),
             ("task-dependencies", |a| {fixture::load(a,true);a.task_channel=a.channel.text.clone();a.dialog=Some(Dialog::NewTask);a.details_picker=Some("pick-needs");}),
@@ -859,6 +896,12 @@ fn main() {
                 a.onboarding.password.replace_text("fixture-only");
             }),
             ("home-setup", |a| {fixture::load(a,true);a.navigate(Page::Home);a.setup_open=true;}),
+            ("wake-agent-pair", |a| {fixture::load(a,true);a.navigate(Page::Home);a.setup_open=true;agent_wake::open(a);a.agent_wake.as_mut().unwrap().command=Some("neoboard wake pair --code EXAMPLE".into());}),
+            ("wake-manual-pair", |a| {fixture::load(a,true);a.navigate(Page::Home);a.setup_open=true;agent_wake::open(a);let p=a.agent_wake.as_mut().unwrap();p.command=Some("neoboard wake pair --code EXAMPLE".into());p.manual=true;}),
+            ("agent-wake", |a| {fixture::load(a,true);a.navigate(Page::Home);a.options.data_dir=Some(std::env::temp_dir().join("fixture-board"));a.setup_open=true;agent_wake::open(a);}),
+            ("agent-wake-create", |a| {fixture::load(a,true);a.navigate(Page::Home);a.options.data_dir=Some(std::env::temp_dir().join("fixture-board"));a.setup_open=true;agent_wake::open(a);a.agent_wake.as_mut().unwrap().confirming=Some(agent_wake::Action::Create);}),
+            ("agent-wake-dedicated", |a| {fixture::load(a,true);a.navigate(Page::Home);a.options.invite=Some(std::env::temp_dir().join("fixture-membership.neochat"));a.setup_open=true;agent_wake::open(a);agent_wake::select(a,agent_wake::Harness::Codex);a.agent_wake.as_mut().unwrap().dedicated=true;}),
+            ("agent-wake-review", |a| {fixture::load(a,true);a.navigate(Page::Home);a.options.invite=Some("/fixture/scoped.neochat".into());a.setup_open=true;agent_wake::open(a);let p=a.agent_wake.as_mut().unwrap();p.status=Some("Off | @reviewer | fixture-session".into());}),
             ("share-board", |a| { fixture::load(a, false); a.navigate(Page::Home); a.open_share(); a.status="live".into(); a.share.result=Some(Ok(connection::HostState { route: neochat::sharing::RouteState::Stopped, link:None, endpoint:None })); }),
             ("share-loading", |a| { fixture::load(a, false); a.navigate(Page::Home); a.open_share(); a.share.busy=true; }),
             ("share-password", |a| {

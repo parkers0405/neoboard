@@ -143,6 +143,7 @@ impl App {
 
     /// Drop fetched content, not the user's draft buffers or saved connection.
     fn clear_live_board(&mut self) {
+        self.personal.reset_connection();
         self.board_cache = None;
         self.snapshot = Snapshot { cursor: 0, channels: vec![], messages: vec![] };
         self.board_extra = Default::default(); self.positions.clear(); self.seen.clear();

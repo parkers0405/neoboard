@@ -1,4 +1,6 @@
 use super::*;
+#[path = "view/agent_wake.rs"]
+mod wake_view;
 #[path = "task_form.rs"]
 mod task_form;
 #[path = "sprints.rs"]
@@ -110,7 +112,7 @@ fn sidebar(app: &App, width:f32) -> El {
     side.child(col().grow(1.0).w_full().scroll(ScrollSpec { stick_bottom: false }).child(channels))
         .child(row().key("local-profile").w_full().h(40.).px(16.).gap(8.).items_center()
             .child(app.profiles.view(&app.local_name, 24., app.fixture))
-            .child(label(app.me.as_ref().and_then(|m|m.display_name.as_deref()).unwrap_or(&app.local_name)).grow(1.).w(0.).truncate())
+            .child(label(app.device_label()).grow(1.).w(0.).truncate())
             .child(button("⚙", |a| a.dialog = Some(Dialog::Settings)).key("profile-settings").size(30.,30.).center().radius(7.).hover(gray(40))))
 }
 thread_local! { static NATIVE_TITLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
@@ -118,7 +120,7 @@ thread_local! { static NATIVE_TITLE: std::cell::Cell<bool> = const { std::cell::
 fn help_button() -> El {
     static HELP: rune::Icon = rune::Icon { name: "Setup guide", view: 24., body: r#"<g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9.5"/><path d="M9.3 9.2a2.8 2.8 0 0 1 5.4 1c0 1.9-2.7 2.3-2.7 4"/><path d="M12 17.3v.1"/></g>"# };
     el().key("home-setup").size(24., 24.).center().radius(7.).hover(gray(44)).child(rune::icon(&HELP, 15.).color(gray(170)))
-        .on_press(|a: &mut App| { a.setup_open = !a.setup_open; a.home_copied = None; })
+        .on_press(|a: &mut App| { a.setup_open = !a.setup_open; a.agent_wake = None; a.home_copied = None; })
 }
 fn header(app: &App) -> El {
     let title = match &app.page { Page::Home => "Home".into(), Page::Activity => "Activity".into(), Page::Tasks => "Tasks".into(), Page::Scheduled => "scheduled".into(), Page::Channel(c) => format!("#{c}") };
@@ -372,7 +374,7 @@ fn dialog(app:&App, page:Dialog, viewport: [f32; 2], filter_anchor: Option<[f32;
     }
     let title=match page {RemoveBoard=>return removal_dialog(app,viewport),NewSprint=>return sprints::create_dialog(app,viewport),Settings=>"Settings",Personal=>"Personal",BoardView=>"Board View",Connection|Share=>"Board connection",Tags=>"Message details",NewTask if app.editing_task.is_some()=>"Edit task",NewTask if app.task_global=>"New global task",NewTask if app.task_parent.is_some()=>"New subtask",NewTask=>"New task",ReplyTags(_)=>"Reply labels",Filters=>"Filters",Schedule=>"Schedule delivery",NewChannel=>"New channel",DeleteThread(_)=>"Delete thread?",DeleteChannel=>"Delete channel?"};
     let nav=|name:&str, detail:&str, dest:Dialog| row().w_full().h(58.).px(14.).items_center().radius(10.).fill(gray(0)).border(1.,gray(55)).hover(gray(48))
-        .child(col().gap(3.).child(label(name)).child(muted(detail).font(TextStyle::new(10.,400.)))).child(spacer()).child(muted("›")).on_press(move |a:&mut App| {if dest==Personal{a.personal_name=edit(a.me.as_ref().and_then(|m|m.display_name.as_deref()).unwrap_or(""));a.error=None;}if dest==Connection {a.open_share();}a.dialog=Some(dest);});
+        .child(col().gap(3.).child(label(name)).child(muted(detail).font(TextStyle::new(10.,400.)))).child(spacer()).child(muted("›")).on_press(move |a:&mut App| {if dest==Personal{a.open_personal();}if dest==Connection {a.open_share();}a.dialog=Some(dest);});
     let back = matches!(page, BoardView|Connection|Personal).then(|| button("‹ Back",|a|{ a.close_dialog(); a.dialog=Some(Settings); }).radius(7.).hover(gray(52)));
     let top=row().w_full().px(12.).h(40.).gap(8.).items_center().border_sides([0.,0.,1.,0.],gray(35)).children(back).child(label(title).font(TextStyle::new(15.,600.)).truncate().shrink()).child(spacer())
         .child(el().w(62.).h(30.).center().child(dialog_action(button(if page==Share{"Close"}else if matches!(page,NewChannel|NewTask|DeleteThread(_)|DeleteChannel){"Cancel"}else{"Done"},App::close_dialog).key("dialog-close"))));
@@ -449,11 +451,12 @@ fn dialog(app:&App, page:Dialog, viewport: [f32; 2], filter_anchor: Option<[f32;
             if let Some(error)=&app.error {p=p.child(muted(error).wrap());}
             p.child(row().w_full().child(spacer()).child(button(if app.creating_channel.is_some(){"Creating…"}else{"Create channel"},App::create_channel).key("create-channel").radius(7.).fill(gray(0)).border(1.,gray(55))))
         },
-        Settings=>panel.child(nav("Personal","Your display name on this board",Personal)).child(nav("Board View","Task density, sort order and sidebar",BoardView)).child(dialog_action(button("Check for updates",|a|a.release.manual()).key("check-updates"))),
+        Settings=>panel.child(nav("Personal","Your display name across boards on this device",Personal)).child(nav("Board View","Task density, sort order and sidebar",BoardView)).child(dialog_action(button("Check for updates",|a|a.release.manual()).key("check-updates"))),
         Personal=>{let mut p=panel.child(muted("Display name")).child(form_input(&app.personal_name,"personal-name",&app.local_name).on_edit(|a:&mut App|&mut a.personal_name))
-            .child(muted(format!("System name: {}. Leave blank to use it again.",app.local_name)).wrap());
+            .child(muted("Members see this name on boards that allow it. Other boards update when you open them. Leave blank to clear your custom name.").wrap())
+            .child(muted(app.name_field_status()).wrap());
             if let Some(e)=&app.error{p=p.child(muted(e).wrap());}
-            p.child(row().child(spacer()).child(button("Save name",|a|{a.error=None;a.queue_file(Command::Personal(a.personal_name.text.trim().into()),false);})))},
+            p.child(row().child(spacer()).child(button("Save name",|a|{a.error=a.save_name(&a.personal_name.text.clone()).err();}).key("save-personal-name")))},
         BoardView=>panel.child(col().w_full().fill(gray(0)).border(1.,gray(55)).radius(10.)
             .child(pref("Task spacing",if app.compact{"Compact"}else{"Comfortable"},|a|a.compact=!a.compact)).child(line())
             .child(pref("Activity and scheduled order",if app.oldest{"Oldest first"}else{"Newest first"},|a|a.oldest=!a.oldest)).child(line())
@@ -746,6 +749,7 @@ fn agent_picker(app:&App)->El {
         let mut choices = col().w_full();
         for agent in setup_guide::Agent::ALL {
             choices = choices.child(choice_row(agent.name().into(),app.setup_agent==agent,move |a:&mut App| {
+                if a.setup_agent != agent { a.agent_wake = None; }
                 a.setup_agent = agent; a.setup_choices = false; a.home_copied = None;
             }).key(format!("setup-agent-{}",agent.name())));
         }
@@ -768,6 +772,7 @@ fn setup_drawer(app:&App, width: f32)->El {
         .child(el().w_full().scroll_x().child(label(contents).font(code(11.))));
     let p=app.project.as_str();
     let guide = setup_guide::Guide::new(app);
+    let wake_key = guide.key.clone();
     let mut picker = agent_picker(app);
     if guide.install.is_some() {
         let shown_key = guide.key.clone();
@@ -779,18 +784,30 @@ fn setup_drawer(app:&App, width: f32)->El {
             picker = picker.child(dialog_action(button("Replace existing neoboard binding", move |a| setup_guide::confirm(a, &key, &ticket))).key("setup-replace-neoism"));
         }
     }
-    let mut cards=col().w_full().padding(16.).gap(12.)
-        .child(row().w_full().gap(5.).items_center().child(muted("Three steps to put an agent on this board.").wrap().w(0.).grow(1.))
-            .child(copy("copy-setup","Copy for agent",guide.copy_text())))
-        .child(step("1","Connect to this board",&guide.intro,el()))
-        .child(step("2","Connect MCP","Choose your agent to see its configuration.",picker.child(muted(&guide.instruction).wrap()).child(block("copy-mcp-config","Copy",guide.snippet))))
-        .child(step("3","See available channels",&guide.question, el()));
-    cards = cards.child(row().gap(8.).flex_wrap().children((!app.remote()).then(|| dialog_action(button("Share this board", |a| { a.setup_open = false; a.open_share(); }))))
-        .child(dialog_action(button("Join another board", |a| { a.setup_open = false; a.begin_add_board(); a.onboarding.joining = true; }))));
+    let prompt = guide.copy_text();
+    let config_hint = match app.setup_agent {
+        setup_guide::Agent::Neoism if app.options.endpoint.is_some() && app.options.invite.is_none() => "Join this board first; there is no configuration to paste yet.",
+        setup_guide::Agent::Neoism => "Manual setup: merge this entry into Neoism's mcp.json. Add board to Neoism handles registration without pasting.",
+        setup_guide::Agent::ClaudeCode => "Manual setup: merge this entry into your project's .mcp.json.",
+        setup_guide::Agent::Codex => "Manual setup: add this entry to ~/.codex/config.toml.",
+        setup_guide::Agent::ClaudeDesktop => "Manual setup: paste the entry in Settings → Developer → Edit Config in Claude Desktop.",
+    };
+    picker = picker.child(muted(&guide.instruction).wrap()).child(muted(config_hint).wrap());
+    if app.setup_agent != setup_guide::Agent::Neoism || app.options.endpoint.is_none() || app.options.invite.is_some() { picker=picker.child(block("copy-mcp-config","Copy MCP config",guide.snippet)); } else { picker=picker.child(muted(guide.snippet).wrap()); }
+    let supported = app.setup_agent != setup_guide::Agent::ClaudeDesktop;
+    let wake = if !supported { el() } else if let Some(panel) = app.agent_wake.as_ref().filter(|p| p.matches_board(&wake_key)) { wake_view::body(app,&wake_key,panel) } else { row().child(dialog_action(button("Set up wake",agent_wake::open)).key("setup-wake")) };
+    let cards=col().w_full().padding(16.).gap(12.)
+        .child(muted(format!("Connect {} to this board. For guided setup, paste the setup prompt into a {} chat. Use the config below only for manual setup.", app.setup_agent.name(), app.setup_agent.name())).wrap())
+        .child(step("1","Connect MCP",&guide.intro,picker))
+        .child(step("2","Verify access",&guide.question,el()))
+        .child(step("3","Automatic wake (optional)",if supported {"When someone @mentions your agent, or finishes a task your agent asked to hear back about, NeoBoard can start a new turn in the same chat. With wake off, the update waits in the agent’s inbox."} else {"Claude Desktop supports MCP, but not automatic wake."},wake));
+    let close = |a: &mut App| { a.setup_open = false; a.agent_wake = None; };
     let panel=col().key("setup-drawer").w(width.min(490.)).h_full().fill(gray(5)).border_sides([0.,0.,0.,1.],gray(44))
-        .child(row().w_full().h(56.).px(16.).items_center().gap(8.).child(label("Setup").font(TextStyle::new(17.,650.)).color(gray(240))).child(chip(p.to_owned())).child(spacer()).child(dialog_action(button("Close",|a|a.setup_open=false))))
-        .child(line()).child(col().w_full().grow(1.).h(0.).scroll(ScrollSpec{stick_bottom:false}).child(cards));
-    el().absolute(0.,0.).w_full().h_full().fill(rune::Color{r:0.,g:0.,b:0.,a:0.64}).child(panel.pin(None,Some(0.),Some(0.),Some(0.)).modal(true,|a:&mut App|a.setup_open=false))
+        .child(row().w_full().h(56.).px(16.).items_center().gap(8.).child(label("Setup").font(TextStyle::new(17.,650.)).color(gray(240))).child(chip(p.to_owned()).shrink()).child(spacer())
+            .child(copy("copy-setup","Copy setup prompt",prompt))
+            .child(dialog_action(button("Close",close))))
+        .child(line()).child(col().key("setup-scroll").w_full().grow(1.).h(0.).scroll(ScrollSpec{stick_bottom:false}).child(cards));
+    el().absolute(0.,0.).w_full().h_full().fill(rune::Color{r:0.,g:0.,b:0.,a:0.64}).child(panel.pin(None,Some(0.),Some(0.),Some(0.)).modal(true,close))
 }
 fn home(app:&App, [width,height]:[f32;2])->El {
     if app.remote() && app.status == "access denied" {
@@ -823,7 +840,7 @@ fn home(app:&App, [width,height]:[f32;2])->El {
     let (open_n,doing,stuck_n,done)=(tasks.iter().filter(|m|matches_filter(&state(m),OPEN_TASKS)).count(),count(&[TaskState::InProgress,TaskState::Claimed]),count(&[TaskState::Blocked,TaskState::Waiting,TaskState::Failed]),count(&[TaskState::Completed]));
     // Greeting and the two things people come here to do.
     let hello=row().w_full().items_center().gap(10.)
-        .child(col().w(0.).grow(1.).gap(2.).child(label(format!("Welcome back, {}",app.local_name)).font(TextStyle::new(20.,650.)).color(gray(245)).truncate())
+        .child(col().w(0.).grow(1.).gap(2.).child(label(format!("Welcome back, {}",app.device_label())).font(TextStyle::new(20.,650.)).color(gray(245)).truncate())
             .child(muted(if tasks.is_empty(){"No tasks on this board yet.".to_owned()}else{format!("{open_n} open  ·  {doing} in progress  ·  {stuck_n} need attention")})));
     // The board in one strip: four numbers over a bar split the same way.
     let stat=|key:&str,name:&str,value:usize,ink:Color,filter:&'static str| col().key(key).w(0.).grow(1.).px(18.).py(14.).gap(2.).hover(gray(16))
@@ -887,7 +904,7 @@ fn onboarding_panel(app: &App) -> El {
     let o = &app.onboarding;
     if o.switching { return el().padding(22.).radius(12.).fill(gray(20)).child(label("Opening board…")); }
     let (step, title, detail) = match o.step {
-        Step::Name => ("01 / PROFILE", "Welcome to NeoBoard", "Choose the name teammates will see on the board."),
+        Step::Name => ("01 / PROFILE", "Welcome to NeoBoard", "Choose a name for this device. Teammates see it on boards that allow name changes."),
         Step::Board => ("02 / BOARD", if o.adding { "Add a board" } else { "Join or create a board" }, "Create a local board or join your host’s board."),
         Step::Connect => ("03 / AGENT SETUP", "Connect your agent", "Choose your agent and copy its setup guide. You can also do this later from Home."),
     };
@@ -899,6 +916,7 @@ fn onboarding_panel(app: &App) -> El {
             panel = panel.child(form_input(&o.name, "onboarding-name", "Your display name").on_edit(|a: &mut App| &mut a.onboarding.name))
                 .child(solid(filled("Continue", |_| {})).key("onboarding-next").on_press_tx(|a: &mut App, tx| {
                     if a.onboarding.name.text.trim().is_empty() { a.onboarding.error = Some("Enter your display name first.".into()); }
+                    else if let Err(e) = a.save_name(&a.onboarding.name.text.clone()) { a.onboarding.error = Some(e); }
                     else {
                         a.onboarding.step = Step::Board; a.onboarding.error = None;
                         a.onboarding.joining = a.remote();
@@ -1051,7 +1069,7 @@ pub fn root(app: &App, cx: &mut Cx<App>) -> El {
     if app.page == Page::Scheduled {
         list = list.child(muted("Your pending scheduled posts · UTC (not local time)").wrap().padding(20.0));
         let query = app.query.text.to_lowercase();
-        let mut scheduled: Vec<_> = app.schedules.iter().filter(|s| projects::contains(&app.project,&s.channel) && (query.is_empty() || format!("{} {} {} {} {:?}",s.id,s.channel,s.author,s.text,s.labels).to_lowercase().contains(&query))).collect();
+        let mut scheduled: Vec<_> = app.schedules.iter().filter(|s| projects::contains(&app.project,&s.channel) && (query.is_empty() || format!("{} {} {} {} {} {:?}",s.id,s.channel,s.author,app.actor_label(&s.author),s.text,s.labels).to_lowercase().contains(&query))).collect();
         scheduled.sort_by_key(|s| (s.publish_at,s.id));
         if !app.oldest { scheduled.reverse(); }
         if scheduled.is_empty() { list = list.child(muted("No pending scheduled posts match this view").padding(20.0)); }

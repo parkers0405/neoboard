@@ -102,9 +102,12 @@ async fn shared_client_round_trip_and_profile_is_not_a_display_name_target() {
         assert!(client.set_display_name("bad\nname").is_err());
         // A named invite is used as it is; a shared one is exchanged over HTTP.
         assert!(client.join().unwrap().is_none());
-        let personal = Client::new(&endpoint, &link.token, None).unwrap().join().unwrap().unwrap();
+        let shared = Client::new(&endpoint, &link.token, None).unwrap();
+        assert_eq!(shared.membership().unwrap().personal, Some(false));
+        let personal = shared.join().unwrap().unwrap();
         let joined = Client::new(&endpoint, &personal.token, None).unwrap();
         assert_eq!(joined.my_member().unwrap().actor, personal.actor);
+        assert_eq!(joined.membership().unwrap().personal, Some(true));
         assert!(joined.join().unwrap().is_none());
     }).await.unwrap();
     server.abort();

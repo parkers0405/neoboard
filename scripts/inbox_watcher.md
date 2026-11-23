@@ -43,3 +43,13 @@ NEOBOARD_TEST_BIN_DIR="$PWD/target/debug" python -B -m unittest discover -s test
 ```
 
 The optional binary test uses a temporary board data directory and ephemeral loopback port, issues restricted credentials, registers a reply filter, posts a mention and verifies the correct actor alone admits both turns without mutating unread state. Runtime admission is a fixture; no installed daemon, real session or model is contacted.
+
+To test the real session and MCP path, use the same watcher Python environment and explicitly select binaries, for example on macOS:
+
+```sh
+python -B tests/inbox_wake_drill.py --board-bin-dir /Applications/NeoBoard.app/Contents/MacOS --neoism-agent /Applications/Neoism.app/Contents/MacOS/neoism-agent
+```
+
+This runs two cases with separate disposable loopback services and deterministic offline providers. Use `--case mention` or `--case completed` to select one. In the mention case, a scripted MCP writer mentions the recipient; the real bound session lists, reads and acknowledges its delivery. In the completion case, one operator turn authorizes the bound reviewer session to delegate to `writer`, register a `completed` callback and review the result. The writer claims, starts and completes through its own MCP credential. The watcher, not the harness, admits the second reviewer turn. Its provider checks the completed task and writer's square calculation from the MCP thread read before posting one review reply and acknowledging the delivery.
+
+The completion case also cancels and re-registers the callback from the original creation cursor to replay the historical transition. Both cases re-expose the original delivery as unread and start two fresh watcher processes on the same DB. The drill requires unchanged board events and session histories and an empty decoy transcript. This tests the opted-in checkout watcher and a clean watcher restart, not automatic desktop wake, model reasoning or crash recovery.

@@ -134,6 +134,9 @@ impl Client {
         self.request(self.http.get(self.url("v1/members")).query(&[("channel", channel)]))
     }
     pub fn my_member(&self)->Result<Member,ClientError>{self.request(self.http.get(self.url("v1/me")))}
+    pub fn membership(&self) -> Result<crate::protocol::Membership, ClientError> {
+        self.request(self.http.get(self.url("v1/me")))
+    }
 
     /// Exchange a shared invite for a personal credential. `None` means this credential
     /// is used as it is: the host predates the exchange, or it already identifies one actor.

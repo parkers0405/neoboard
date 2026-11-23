@@ -57,13 +57,13 @@ impl Options {
 
 pub enum Command {
     DeleteBoard(String),
-    CreateBoard { id: String, name: String },
-    JoinBoard { invite: JoinSource, name: String },
+    CreateBoard { id: String },
+    JoinBoard { invite: JoinSource },
     Host { id: String, request: u64, operation: HostOp },
     BoardPassword { id: String, request: u64, password: Option<JoinPassword> },
     SwitchBoard { id: String, path: Option<PathBuf> },
     Members(String),
-    Personal(String),
+    Personal { session: u64, revision: u64, name: String },
     PostWithFile { action:Action, draft:Option<(Option<u64>,String)>, path:PathBuf },
     Action { action: Action, draft: Option<(Option<u64>, String)> },
     Attachments(u64),
@@ -146,7 +146,8 @@ pub enum Update {
     BoardPassword(u64, bool),
     Members(String,Result<Vec<neochat::protocol::Member>,String>),
     Names(String,Vec<neochat::protocol::Member>),
-    Personal(Result<neochat::protocol::Member,String>),
+    Membership(u64, Result<neochat::protocol::Member,String>),
+    Personal(u64, u64, Result<neochat::protocol::Member,String>),
     SentFile(PathBuf,String),
     Snapshot(Snapshot),
     Event(Event),
@@ -203,7 +204,7 @@ fn kept_invite(path: Option<&Path>, stored: Option<&Path>) -> bool {
     path.and_then(Path::parent).is_some_and(|dir| Some(dir) == stored)
 }
 
-fn join_board(source: JoinSource, name: Option<&str>, expected: Option<&str>, profile: Option<&str>) -> Result<BoardSetup, String> {
+fn join_board(source: JoinSource, expected: Option<&str>, profile: Option<&str>) -> Result<BoardSetup, String> {
     let (mut invite, mut path, personal) = match source {
         JoinSource::File(path) => (neochat::invite_file::InviteFile::read(&path)?, Some(path), false),
         JoinSource::Link(invite) => (invite, None, false),
@@ -224,10 +225,10 @@ fn join_board(source: JoinSource, name: Option<&str>, expected: Option<&str>, pr
         path = Some(at);
     }
     let client = Client::new(&invite.endpoint, &invite.token, profile).map_err(|e| e.to_string())?.with_sender("desktop");
-    finish_join(JoinCredential { invite, path, personal }, client, name, expected, profile, stored.as_deref())
+    finish_join(JoinCredential { invite, path, personal }, client, expected, profile, stored.as_deref())
 }
 
-fn finish_join(credential: JoinCredential, mut client: Client, name: Option<&str>, expected: Option<&str>, profile: Option<&str>, stored: Option<&Path>) -> Result<BoardSetup, String> {
+fn finish_join(credential: JoinCredential, mut client: Client, expected: Option<&str>, profile: Option<&str>, stored: Option<&Path>) -> Result<BoardSetup, String> {
     let JoinCredential { mut invite, mut path, personal } = credential;
     // A remote error body is arbitrary text. Never display it after a password exchange.
     let remote_error = |e: neochat::client::ClientError| if personal { "Could not verify the new board membership.".to_owned() } else { e.to_string() };
@@ -251,13 +252,31 @@ fn finish_join(credential: JoinCredential, mut client: Client, name: Option<&str
         if kept_invite(path.as_deref(), stored) { invite.replace(path.as_ref().unwrap())?; } else { path = None; }
         client = Client::new(&invite.endpoint, &invite.token, profile).map_err(|e| e.to_string())?.with_sender("desktop");
     }
-    if let Some(name) = name { client.set_display_name(name).map_err(remote_error)?; }
     let member = client.my_member().map_err(remote_error)?;
     let path = match path {
         Some(path) => path,
         None => invite.store(stored.ok_or("No settings directory available.")?)?,
     };
     Ok((id, snapshot, member, Some(HostedBoard { path, endpoint: invite.endpoint })))
+}
+
+fn reconcile_name(client: &Client, name: &str) -> Result<neochat::protocol::Member, String> {
+    let read = || {
+        let membership = client.membership().map_err(|_| "Could not verify your board membership.")?;
+        match membership.personal {
+            Some(true) => Ok(membership.member),
+            Some(false) => Err("Join this board as a member before sharing a personal name."),
+            None => Err("This server cannot verify a personal credential. Update the board server to sync."),
+        }
+    };
+    let member = read()?;
+    if member.display_name.as_deref().unwrap_or("") == name { return Ok(member); }
+    client.set_display_name(name).map_err(|_| "Check your connection and display-name permission, then save again.")?;
+    let after = read()?;
+    if after.actor != member.actor || after.display_name.as_deref().unwrap_or("") != name {
+        return Err("Board read-back did not match. Save again to retry.".into());
+    }
+    Ok(after)
 }
 
 pub fn start(mut opts: Options, wake: rune::Waker) -> (mpsc::SyncSender<Command>, mpsc::Receiver<Update>) {
@@ -283,9 +302,9 @@ pub fn start(mut opts: Options, wake: rune::Waker) -> (mpsc::SyncSender<Command>
             wake();
             true
         };
-        let change_board = |opts: &mut Options, source, name: Option<&str>, expected: Option<String>| {
+        let change_board = |opts: &mut Options, source, expected: Option<String>| {
             let result = if let Some(source) = source {
-                join_board(source, name, expected.as_deref(), opts.profile.as_deref())
+                join_board(source, expected.as_deref(), opts.profile.as_deref())
             } else {
                 (|| {
                     let id = expected.ok_or("Missing board id")?;
@@ -304,14 +323,16 @@ pub fn start(mut opts: Options, wake: rune::Waker) -> (mpsc::SyncSender<Command>
             }
             (send(Update::BoardSetup(result)), success)
         };
+        let mut session = 0;
         'connection: loop {
+            session += 1;
             let client = match opts.connect() {
                 Ok(c) => c,
                 Err(e) => {
                     if !send(Update::Status(format!("offline · {e}"))) { break; }
                     match rx.recv_timeout(Duration::from_secs(2)) {
-                        Ok(Command::JoinBoard { invite, name }) => if !change_board(&mut opts, Some(invite), Some(&name), None).0 { break; },
-                        Ok(Command::SwitchBoard { id, path }) => if !change_board(&mut opts, path.map(JoinSource::File), None, Some(id)).0 { break; },
+                        Ok(Command::JoinBoard { invite }) => if !change_board(&mut opts, Some(invite), None).0 { break; },
+                        Ok(Command::SwitchBoard { id, path }) => if !change_board(&mut opts, path.map(JoinSource::File), Some(id)).0 { break; },
                         Ok(Command::Host { request, .. }) => if !send(Update::Host(request, Err("The local board is offline.".into()))) { break; },
                         Ok(Command::BoardPassword { request, .. }) => if !send(Update::BoardPassword(request, false)) { break; },
                         Ok(Command::DeleteBoard(id)) => if !send(Update::BoardDeleted(id, false)) { break; },
@@ -339,8 +360,8 @@ pub fn start(mut opts: Options, wake: rune::Waker) -> (mpsc::SyncSender<Command>
                 Err(update) => {
                     if !send(update) { break; }
                     match rx.recv_timeout(Duration::from_secs(2)) {
-                        Ok(Command::JoinBoard { invite, name }) => if !change_board(&mut opts, Some(invite), Some(&name), None).0 { break; },
-                        Ok(Command::SwitchBoard { id, path }) => if !change_board(&mut opts, path.map(JoinSource::File), None, Some(id)).0 { break; },
+                        Ok(Command::JoinBoard { invite }) => if !change_board(&mut opts, Some(invite), None).0 { break; },
+                        Ok(Command::SwitchBoard { id, path }) => if !change_board(&mut opts, path.map(JoinSource::File), Some(id)).0 { break; },
                         Ok(Command::Host { request, .. }) => if !send(Update::Host(request, Err("The local board is offline.".into()))) { break; },
                         Ok(Command::BoardPassword { request, .. }) => if !send(Update::BoardPassword(request, false)) { break; },
                         Ok(Command::DeleteBoard(id)) => if !send(Update::BoardDeleted(id, false)) { break; },
@@ -352,20 +373,20 @@ pub fn start(mut opts: Options, wake: rune::Waker) -> (mpsc::SyncSender<Command>
                 }
             };
             if !send(Update::Status("live".into())) { break; }
-            if !send(Update::Personal(client.my_member().map_err(|e|e.to_string()))) {return;}
+            if !send(Update::Membership(session, client.my_member().map_err(|_|"Could not verify your board membership.".into()))) {return;}
             if !send(Update::Extra(client.reactions().and_then(|r| client.schedules().map(|s| (r,s))).map_err(|e| e.to_string()))) { return; }
             if let Ok(organization) = client.organization() { if !send(Update::Organization(organization)) { return; } }
             loop {
                 match rx.try_recv() {
                     Ok(command) => {
                         match command {
-                            Command::JoinBoard { invite, name } => {
-                                let (sent, success) = change_board(&mut opts, Some(invite), Some(&name), None);
+                            Command::JoinBoard { invite } => {
+                                let (sent, success) = change_board(&mut opts, Some(invite), None);
                                 if !sent { return; }
                                 if success { continue 'connection; }
                             }
                             Command::SwitchBoard { id, path } => {
-                                let (sent, success) = change_board(&mut opts, path.map(JoinSource::File), None, Some(id));
+                                let (sent, success) = change_board(&mut opts, path.map(JoinSource::File), Some(id));
                                 if !sent { return; }
                                 if success { continue 'connection; }
                             }
@@ -387,23 +408,26 @@ pub fn start(mut opts: Options, wake: rune::Waker) -> (mpsc::SyncSender<Command>
                                 // Rehydrate from the authoritative snapshot, even on a lost response.
                                 continue 'connection;
                             }
-                            Command::CreateBoard { id, name } => {
+                            Command::CreateBoard { id } => {
                                 let result = (|| -> Result<_, String> {
                                     let before = client.snapshot().map_err(|e| e.to_string())?;
                                     if crate::projects::available(&before, false).contains(id.as_str()) {
                                         return Err("A board with that id already exists.".into());
                                     }
-                                    client.set_display_name(&name).map_err(|e| e.to_string())?;
                                     let channel = crate::projects::channel(&id, "general");
                                     client.action(&Action::CreateChannel { channel }).map_err(|e| e.to_string())?;
                                     let snapshot = client.snapshot().map_err(|e| e.to_string())?;
                                     let member = client.my_member().map_err(|e| e.to_string())?;
                                     Ok((id, snapshot, member, None))
                                 })();
+                                let created = result.is_ok();
                                 if !send(Update::BoardSetup(result)) { return; }
+                                if created { continue 'connection; }
                             }
                             Command::Members(channel)=>{let result=client.members(&channel).map_err(|e|e.to_string());if !send(Update::Members(channel,result)){return;}}
-                            Command::Personal(name)=>{let result=client.set_display_name(&name).and_then(|_|client.my_member()).map_err(|e|e.to_string());if !send(Update::Personal(result)){return;}}
+                            Command::Personal { session: target, revision, name } => {
+                                if target == session && !send(Update::Personal(session, revision, reconcile_name(&client, &name))) { return; }
+                            }
                             Command::PostWithFile { action, draft, path } => {
                                 let result = upload_bytes(&path).and_then(|(name,bytes)| {
                                     let post=client.action(&action).map_err(|e| e.to_string())?;
@@ -568,7 +592,7 @@ mod tests {
     #[test]
     fn exchanged_credential_is_verified_before_saving_and_never_redeemed_again() {
         use neochat::invite_file::InviteFile;
-        use std::io::{BufRead, BufReader, Read, Write};
+        use std::io::{BufRead, BufReader, Write};
         use std::net::TcpListener;
 
         for valid in [false, true] {
@@ -579,36 +603,52 @@ mod tests {
                 let snapshot = if valid { r#"{"cursor":0,"channels":["dev/general"],"messages":[]}"# }
                     else { r#"{"cursor":0,"channels":["other/general"],"messages":[]}"# };
                 let mut calls = vec![("GET /v1/snapshot", snapshot)];
-                if valid { calls.extend([("POST /v1/display-name", "{}"), ("GET /v1/me", r#"{"actor":"sam","display_name":"Sam Lee"}"#)]); }
+                if valid { calls.push(("GET /v1/me", r#"{"actor":"sam","display_name":null}"#)); }
                 for (expected, reply) in calls {
                     let (mut stream, _) = listener.accept().unwrap();
                     let mut req = BufReader::new(&stream);
                     let mut line = String::new(); req.read_line(&mut line).unwrap();
                     assert!(line.starts_with(expected));
-                    let mut length = 0; let mut authorized = false;
+                    let mut authorized = false;
                     loop {
                         line.clear(); req.read_line(&mut line).unwrap(); if line.trim().is_empty() { break; }
                         let (k,v) = line.split_once(':').unwrap();
-                        if k.eq_ignore_ascii_case("content-length") { length = v.trim().parse().unwrap(); }
                         if k.eq_ignore_ascii_case("authorization") { authorized = v.trim() == "Bearer personal-fixture"; }
                     }
                     assert!(authorized);
-                    if expected.starts_with("POST") {
-                        let mut body = vec![0; length]; req.read_exact(&mut body).unwrap();
-                        assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap(), serde_json::json!({"name":"Sam Lee"}));
-                    }
                     write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).unwrap();
                 }
             });
             let invite = InviteFile { project: Some("dev".into()), version: 1, endpoint: "https://board.example/".into(), token: "personal-fixture".into(), expires_at: i64::MAX as u64 };
-            let result = finish_join(JoinCredential { invite, path: None, personal: true }, client, Some("Sam Lee"), None, None, Some(dir.path()));
+            let result = finish_join(JoinCredential { invite, path: None, personal: true }, client, None, None, Some(dir.path()));
             if valid {
                 let (id, _, member, hosted) = result.unwrap();
-                assert_eq!(id, "dev"); assert_eq!(member.display_name.as_deref(), Some("Sam Lee"));
+                assert_eq!(id, "dev"); assert!(member.display_name.is_none());
                 let path = hosted.unwrap().path;
                 assert_eq!(InviteFile::read(&path).unwrap().token, "personal-fixture");
                 #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; assert_eq!(path.metadata().unwrap().permissions().mode() & 0o777, 0o600); }
             } else { assert!(result.is_err() && dir.path().read_dir().unwrap().next().is_none()); }
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn shared_and_unverified_legacy_credentials_are_never_renamed() {
+        use std::io::{BufRead, BufReader, Write};
+        for (flag, reason) in [("", "Update the board server"), (",\"personal\":false", "Join this board")] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let client = Client::new(&format!("http://{}", listener.local_addr().unwrap()), "disposable", None).unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                drop(listener); // no other request can succeed
+                let req = BufReader::new(&socket);
+                let mut lines = req.lines().map(Result::unwrap);
+                assert!(lines.next().unwrap().starts_with("GET /v1/me "));
+                for line in lines { if line.is_empty() { break; } }
+                let reply = format!(r#"{{"actor":"guest","display_name":null{flag}}}"#);
+                write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",reply.len()).unwrap();
+            });
+            assert!(reconcile_name(&client, "New name").unwrap_err().contains(reason));
             server.join().unwrap();
         }
     }
@@ -667,9 +707,9 @@ mod tests {
             }
         }
         until(&updates,|u| matches!(u,Update::Extra(Ok(_))));
-        commands.send(Command::CreateBoard { id: "launch-team".into(), name: "Sam Lee".into() }).unwrap();
+        commands.send(Command::CreateBoard { id: "launch-team".into() }).unwrap();
         until(&updates, |u| matches!(u, Update::BoardSetup(Ok((id, board, member, None)))
-            if id == "launch-team" && board.channels.iter().any(|c| c == "launch-team/general") && member.display_name.as_deref() == Some("Sam Lee")));
+            if id == "launch-team" && board.channels.iter().any(|c| c == "launch-team/general") && member.display_name.is_none()));
         assert!(client.snapshot().unwrap().channels.contains(&"launch-team/general".into()));
         let action = |action| {
             commands.send(Command::Action { action,draft:None }).unwrap();

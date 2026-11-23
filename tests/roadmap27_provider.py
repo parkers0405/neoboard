@@ -52,13 +52,13 @@ def completion(body):
 
 
 @contextmanager
-def provider():
+def provider(respond=completion):
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
             if self.path != '/v1/chat/completions':
                 return self.send_error(404)
             try:
-                delta = completion(json.loads(self.rfile.read(int(self.headers['Content-Length']))))
+                delta = respond(json.loads(self.rfile.read(int(self.headers['Content-Length']))))
             except Exception as exc:
                 self.server.errors.append(repr(exc))
                 return self.send_error(400, 'unexpected provider request')

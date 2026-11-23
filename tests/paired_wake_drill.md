@@ -16,6 +16,8 @@ The assertions cover single-use pairing; default-off; a diagnostic that reaches 
 
 ## Runtime evidence and session IDs
 
+This wake-delivery drill supplies the session ID. It cannot verify the Desktop **Copy for agent** flow on its own. The [Claude Code chat-pairing check](claude_pair.md) runs the command through the real chat's Bash tool without supplying an ID. The [Codex chat-pairing check](codex_pair.md) separates the tested NeoBoard fixture from the opt-in real-runtime check; a fixture pass does not verify a real Codex chat.
+
 | Harness | Offline isolation and evidence | Session ID hint |
 | --- | --- | --- |
 | Neoism | The installed `neoism-agent` 0.7.164 served a private authenticated loopback origin. A disposable `agent.json` selects only the loopback Chat Completions provider; both session histories are read via the private API. | Use the `id` returned by `POST /v2/sessions` for the intended conversation. No `NEOISM_SESSION_ID` was present in the invoking shell, and the standalone binary did not contain that literal. Do not assume it is exported. Pass `--session` and `--origin` explicitly when necessary; supply `NEOISM_WAKE_TOKEN` privately. |

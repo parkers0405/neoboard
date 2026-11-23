@@ -161,6 +161,8 @@ def verify(root, stack, bins, h, installed):
     else:
         wake(*pair, *rt.pair_args, success=False)  # missing runtime bearer
     extra = dict(NEOISM_WAKE_TOKEN=rt.token) if h == 'neoism' else {}
+    reported_id = {'neoism':'NEOISM_SESSION_ID','claude':'CLAUDE_CODE_SESSION_ID','codex':'CODEX_THREAD_ID'}[h]
+    wake(*pair, *rt.pair_args, extra={**extra, reported_id: rt.decoy}, success=False)
     wake(*pair, *rt.pair_args, extra=extra)
     wake('pair', '--code', code, '--session', rt.decoy, *rt.pair_args, extra=extra, success=False)
     status = control('status')

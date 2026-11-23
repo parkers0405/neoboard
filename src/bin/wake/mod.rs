@@ -4,6 +4,7 @@ mod runtime;
 mod service;
 mod worker;
 mod provision;
+mod neoism_pair;
 
 use clap::{Args, Subcommand};
 use rand::RngCore;
@@ -57,7 +58,12 @@ fn executable(name:&str)->Option<PathBuf>{
 }
 fn target(h:&str,session:Option<String>,workspace:Option<PathBuf>,bin:Option<PathBuf>,origin:Option<String>)->Result<runtime::Target,String>{
     let keys:&[&str]=match h {"neoism"=>&["NEOISM_SESSION_ID"],"codex"=>&["CODEX_THREAD_ID"],"claude"=>&["CLAUDE_CODE_SESSION_ID","CLAUDE_SESSION_ID"],_=>return Err("Unknown harness".into())};
-    let session=session.or_else(||keys.iter().find_map(|k|env::var(k).ok().filter(|s|!s.is_empty()))).ok_or("This shell does not expose its conversation ID. Run the pairing command inside the dedicated conversation with --session <its exact ID>. No latest-session lookup is used.")?;
+    let mut session=session;
+    for reported in keys.iter().filter_map(|k|env::var(k).ok().filter(|s|!s.is_empty())) {
+        if session.as_ref().is_some_and(|id|id!=&reported){return Err("Conversation IDs disagree; nothing was paired.".into());}
+        session=Some(reported);
+    }
+    let session=session.ok_or("This shell does not expose its conversation ID. Run the pairing command inside the dedicated conversation with --session <its exact ID>. No latest-session lookup is used.")?;
     let workspace=workspace.or_else(||env::current_dir().ok()).ok_or("Cannot locate workspace")?;
     let (bin,origin)=if h=="neoism" {(None,origin.or_else(||env::var("NEOISM_AGENT_SERVER").ok()))} else {(Some(bin.or_else(||executable(h)).ok_or("Runtime executable not found; use --executable with its absolute path")?),None)};
     let t=runtime::Target {harness:h.into(),session,workspace,executable:bin,origin};runtime::validate(&t)?;Ok(t)
@@ -65,8 +71,7 @@ fn target(h:&str,session:Option<String>,workspace:Option<PathBuf>,bin:Option<Pat
 fn duplicate(a:&Source,b:&Source)->bool {a.origin==b.origin && a.project==b.project && a.actor==b.actor}
 fn pair(dir:&Path,code:String,session:Option<String>,bin:Option<PathBuf>,workspace:Option<PathBuf>,origin:Option<String>)->Result<(),String>{
     let source=transaction(dir,|s|s.pending.get(&code).filter(|p|p.expires>now()).map(|p|p.source.clone()).ok_or("Pairing code expired or already used".into()))?;
-    let t=target(&source.harness,session,workspace,bin,origin)?;
-    let bearer=if source.harness=="neoism"{Some(env::var("NEOISM_WAKE_TOKEN").map_err(|_|"Supply the loopback runtime credential in NEOISM_WAKE_TOKEN privately")?)}else{None};
+    let (t,bearer)=if source.harness=="neoism" {neoism_pair::resolve(session,workspace,bin,origin)?} else {(target(&source.harness,session,workspace,bin,origin)?,None)};
     runtime::probe(&t,bearer.as_deref())?;inbox::poll(&source,0)?;
     transaction(dir,|s|{let p=s.pending.remove(&code).ok_or("Pairing code is no longer valid")?;
         if p.expires<=now(){return Err("Pairing code expired".into());}

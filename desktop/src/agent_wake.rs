@@ -239,7 +239,8 @@ pub fn pairing_text(command: &str, h: Harness, manual: bool) -> Option<String> {
     };
     if manual {return Some(format!("{prefix}{command}"));}
     let request=format!("{:x}",Sha256::digest(code.as_bytes()));
-    Some(format!("Pair this exact {} conversation with my pending NeoBoard wake request on this device. Use your local shell tool to run the command below. If necessary, pass --session only with this conversation’s exact ID from trusted runtime context. Never guess or choose the latest chat. If local execution, session identity, or required private runtime configuration is unavailable, stop and explain what is missing. Never request or print credentials, start another chat, send a test, or turn wake on. Report the result so I can check the connection in NeoBoard.\n\n{prefix}{exe} wake pair --request {request}",h.name()))
+    let tool=match h { Harness::Claude=>"this conversation’s local Bash tool", _=>"this conversation’s local shell tool" };
+    Some(format!("Pair this exact {} conversation with my pending NeoBoard wake request on this device. Run the command below in {tool}, without supplying a session ID. Never guess or choose the latest chat. If local execution, session identity, or required private runtime configuration is unavailable, stop and explain what is missing. Never request or print credentials, start another chat, send a test, or turn wake on. Report the result so I can check the connection in NeoBoard.\n\n{prefix}{exe} wake pair --request {request}",h.name()))
 }
 
 #[cfg(test)]

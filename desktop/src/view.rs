@@ -120,7 +120,7 @@ thread_local! { static NATIVE_TITLE: std::cell::Cell<bool> = const { std::cell::
 fn help_button() -> El {
     static HELP: rune::Icon = rune::Icon { name: "Setup guide", view: 24., body: r#"<g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9.5"/><path d="M9.3 9.2a2.8 2.8 0 0 1 5.4 1c0 1.9-2.7 2.3-2.7 4"/><path d="M12 17.3v.1"/></g>"# };
     el().key("home-setup").size(24., 24.).center().radius(7.).hover(gray(44)).child(rune::icon(&HELP, 15.).color(gray(170)))
-        .on_press(|a: &mut App| { a.setup_open = !a.setup_open; a.agent_wake = None; a.home_copied = None; })
+        .on_press(setup_guide::open)
 }
 fn header(app: &App) -> El {
     let title = match &app.page { Page::Home => "Home".into(), Page::Activity => "Activity".into(), Page::Tasks => "Tasks".into(), Page::Scheduled => "scheduled".into(), Page::Channel(c) => format!("#{c}") };
@@ -743,8 +743,8 @@ fn select_trigger(value:String,open:bool,action:impl Fn(&mut App)+'static)->El {
 }
 
 fn agent_picker(app:&App)->El {
-    let mut picker = col().w_full().gap(4.)
-        .child(select_trigger(app.setup_agent.name().into(),app.setup_choices,|a| a.setup_choices = !a.setup_choices).w_full().key("setup-agent"));
+    let picker = col().w_full().gap(4.)
+        .child(select_trigger(app.setup_agent.name().into(),app.setup_choices,|a| { a.setup_board_menu = false; a.setup_choices = !a.setup_choices; }).w_full().key("setup-agent"));
     if app.setup_choices {
         let mut choices = col().w_full();
         for agent in setup_guide::Agent::ALL {
@@ -765,14 +765,29 @@ fn setup_drawer(app:&App, width: f32)->El {
             .child(el().size(22.,22.).center().radius(11.).fill(gray(235)).child(label(index).font(TextStyle::new(12.,650.)).color(gray(8))))
             .child(label(title).font(TextStyle::new(14.,600.)).color(gray(240)).wrap().w(0.).grow(1.)))
         .child(muted(description).wrap()).child(body);
-    let copy=|key:&'static str,title:&'static str,contents:String|dialog_action(button(if app.home_copied==Some(key){"Copied!"}else{title}, |_| {})).key(key)
-        .on_press_tx(move |a:&mut App,tx|{tx.copy(contents.clone());a.home_copied=Some(key);});
+    let guide = setup_guide::Guide::new(app);
+    let target = setup_guide::target(app);
+    let agent = app.setup_agent;
+    let copy=|key:&'static str,title:&'static str,contents:String| {
+        let shown = target.clone();
+        dialog_action(button(if app.home_copied==Some(key){"Copied!"}else{title}, |_| {})).key(key)
+        .on_press_tx(move |a:&mut App,tx|{if a.setup_open && agent == a.setup_agent && setup_guide::copy_allowed(a, shown.as_ref()) {tx.copy(contents.clone());a.home_copied=Some(key);} else {a.home_copied=Some("setup-unavailable");}})
+    };
     let block = |key,title,contents:String| col().w_full().padding(10.).gap(4.).radius(10.).fill(gray(3)).border(1.,gray(40))
         .child(row().child(spacer()).child(copy(key,title,contents.clone())))
         .child(el().w_full().scroll_x().child(label(contents).font(code(11.))));
-    let p=app.project.as_str();
-    let guide = setup_guide::Guide::new(app);
     let wake_key = guide.key.clone();
+    let chosen = app.setup_target.as_ref().or(target.as_ref());
+    let mut board_picker = col().w_full().gap(4.).child(label("Board for setup"))
+        .child(select_trigger(chosen.map_or_else(|| "Choose a board".into(), |t| t.label(app)), app.setup_board_menu, |a| { a.setup_choices=false; a.setup_board_menu=!a.setup_board_menu; }).key("setup-board").w_full());
+    if app.setup_board_menu {
+        let mut rows = col().w_full().max_h(210.).scroll(ScrollSpec{stick_bottom:false});
+        for (i,t) in setup_guide::choices(app).into_iter().enumerate() {
+            rows = rows.child(choice_row(t.label(app), chosen == Some(&t), move |a| setup_guide::choose(a,t.clone())).key(format!("setup-board-{i}")));
+        }
+        float_menu(app,"setup-board",rows);
+    }
+    board_picker = board_picker.child(muted("Choosing a board here does not switch Desktop or your agent session.").wrap());
     let mut picker = agent_picker(app);
     if guide.install.is_some() {
         let shown_key = guide.key.clone();
@@ -786,25 +801,25 @@ fn setup_drawer(app:&App, width: f32)->El {
     }
     let prompt = guide.copy_text();
     let config_hint = match app.setup_agent {
-        setup_guide::Agent::Neoism if app.options.endpoint.is_some() && app.options.invite.is_none() => "Join this board first; there is no configuration to paste yet.",
+        _ if target.is_none() => "Choose an available local board or saved membership first.",
         setup_guide::Agent::Neoism => "Manual setup: merge this entry into Neoism's mcp.json. Add board to Neoism handles registration without pasting.",
         setup_guide::Agent::ClaudeCode => "Manual setup: merge this entry into your project's .mcp.json.",
         setup_guide::Agent::Codex => "Manual setup: add this entry to ~/.codex/config.toml.",
         setup_guide::Agent::ClaudeDesktop => "Manual setup: paste the entry in Settings → Developer → Edit Config in Claude Desktop.",
     };
     picker = picker.child(muted(&guide.instruction).wrap()).child(muted(config_hint).wrap());
-    if app.setup_agent != setup_guide::Agent::Neoism || app.options.endpoint.is_none() || app.options.invite.is_some() { picker=picker.child(block("copy-mcp-config","Copy MCP config",guide.snippet)); } else { picker=picker.child(muted(guide.snippet).wrap()); }
+    if target.is_some() { picker=picker.child(block("copy-mcp-config","Copy MCP config",guide.snippet)); }
     let supported = app.setup_agent != setup_guide::Agent::ClaudeDesktop;
-    let wake = if !supported { el() } else if let Some(panel) = app.agent_wake.as_ref().filter(|p| p.matches_board(&wake_key)) { wake_view::body(app,&wake_key,panel) } else { row().child(dialog_action(button("Set up wake",agent_wake::open)).key("setup-wake")) };
+    let wake = if !supported || target.is_none() { el() } else if let Some(panel) = app.agent_wake.as_ref().filter(|p| p.matches_board(&wake_key)) { wake_view::body(app,&wake_key,panel) } else { let key=wake_key.clone(); row().child(dialog_action(button("Set up wake",move |a| if a.setup_open && a.setup_agent == agent && setup_guide::Guide::new(a).key == key { agent_wake::open(a); })).key("setup-wake")) };
     let cards=col().w_full().padding(16.).gap(12.)
-        .child(muted(format!("Connect {} to this board. For guided setup, paste the setup prompt into a {} chat. Use the config below only for manual setup.", app.setup_agent.name(), app.setup_agent.name())).wrap())
+        .child(board_picker).children((app.home_copied==Some("setup-unavailable")).then(|| muted("Not copied. Check the selected connection and its saved grant.").wrap()))
         .child(step("1","Connect MCP",&guide.intro,picker))
         .child(step("2","Verify access",&guide.question,el()))
         .child(step("3","Automatic wake (optional)",if supported {"When someone @mentions your agent, or finishes a task your agent asked to hear back about, NeoBoard can start a new turn in the same chat. With wake off, the update waits in the agent’s inbox."} else {"Claude Desktop supports MCP, but not automatic wake."},wake));
     let close = |a: &mut App| { a.setup_open = false; a.agent_wake = None; };
     let panel=col().key("setup-drawer").w(width.min(490.)).h_full().fill(gray(5)).border_sides([0.,0.,0.,1.],gray(44))
-        .child(row().w_full().h(56.).px(16.).items_center().gap(8.).child(label("Setup").font(TextStyle::new(17.,650.)).color(gray(240))).child(chip(p.to_owned()).shrink()).child(spacer())
-            .child(copy("copy-setup","Copy setup prompt",prompt))
+        .child(row().w_full().h(56.).px(16.).items_center().gap(8.).child(label("Setup").font(TextStyle::new(17.,650.)).color(gray(240))).child(spacer())
+            .children(target.is_some().then(|| copy("copy-setup","Copy setup prompt",prompt)))
             .child(dialog_action(button("Close",close))))
         .child(line()).child(col().key("setup-scroll").w_full().grow(1.).h(0.).scroll(ScrollSpec{stick_bottom:false}).child(cards));
     el().absolute(0.,0.).w_full().h_full().fill(rune::Color{r:0.,g:0.,b:0.,a:0.64}).child(panel.pin(None,Some(0.),Some(0.),Some(0.)).modal(true,close))
@@ -973,10 +988,12 @@ fn onboarding_panel(app: &App) -> El {
             );
         }
         Step::Connect => {
+            let shown = setup_guide::target(app);
+            let agent = app.setup_agent;
             let prompt = setup_guide::Guide::new(app).copy_text();
             panel = panel.child(chip(app.project.clone())).child(agent_picker(app)).child(row().gap(8.)
                 .child(button(if app.home_copied == Some("onboarding-copy") { "Copied!" } else { "Copy for agent" }, |_| {})
-                    .key("onboarding-copy").on_press_tx(move |a: &mut App, tx| { tx.copy(prompt.clone()); a.home_copied = Some("onboarding-copy"); }))
+                    .key("onboarding-copy").on_press_tx(move |a: &mut App, tx| { if agent == a.setup_agent && setup_guide::copy_allowed(a, shown.as_ref()) { tx.copy(prompt.clone()); a.home_copied = Some("onboarding-copy"); } }))
                 .child(button("Open board", |a| a.onboarding = Default::default()).key("onboarding-open")));
         }
     }
@@ -1163,21 +1180,16 @@ fn board_menu(app: &App, x: f32, y: f32, viewport: [f32; 2], chrome: f32) -> El 
         let list_height = (viewport[1] - y - 84.).clamp(0.,210.);
         let mut entries = col().w_full().gap(2.);
         let live = app.projects();
-        let profiles = app.saved_boards.entries();
-        let on_server = |p: &saved_boards::BoardProfile| app.options.endpoint.is_none() && app.options.invite == p.invite;
-        let discovered = live.iter().copied().filter(|id| !profiles.iter().any(|p| on_server(p) && p.project == *id));
-        let rows = profiles.iter().enumerate().map(|(i,p)| (p.project.as_str(), Some((i,p)), on_server(p)))
-            .chain(discovered.map(|id| (id, None, true)));
-        for (id, saved, current_server) in rows {
+        for (id, saved, current_server) in app.board_rows() {
             let active = current_server && id == app.project;
             let share = (current_server && live.contains(id) && (!app.remote() || active)).then(|| {
                 let id = id.to_owned();
                 el().key(format!("share-board-{id}")).size(26.,26.).center().radius(5.).hover(gray(56))
                     .child(rune::icon(&SHARE, 15.).color(splash::wordmark_ink())).on_press(move |a: &mut App| a.open_board_share(&id))
             });
-            let remote = saved.map_or_else(|| app.remote(), |(_,p)| p.invite.is_some());
+            let remote = saved.map_or_else(|| app.remote(), |(_,p)| p.invite.is_some() || p.endpoint.is_some());
             let location = match saved {
-                Some((i, p)) if remote => format!("Host {} · {}", i+1, p.endpoint.as_deref().map(|s| s.trim_start_matches("https://").trim_end_matches('/')).unwrap_or("Saved invite")),
+                Some((i, p)) => p.location(i),
                 _ if remote => "Current server".into(),
                 _ => "Local".into(),
             };

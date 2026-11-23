@@ -4,7 +4,9 @@ The MCP adapter is a local stdio process that connects upstream to the board dae
 
 ## Configure a client
 
-In Home > Setup, select Neoism, Claude Code, Claude Desktop, or Codex. Use the command or configuration generated for that client; Copy for agent includes the entire guide. The executable is `neochat-mcp`, not `neochatd`. A normal local install discovers the running daemon without a workspace argument. Use an explicit data directory only for a deliberately separate installation.
+In **Home → Setup → Board for setup**, choose the board by name, then choose the agent client. **Local** identifies local discovery; **Host N** distinguishes saved connections, including password-joined memberships and separate grants with the same board name. This choice only changes the setup drawer. It does not switch Desktop, reconnect a running MCP session, or grant access. An endpoint without a saved membership cannot be used as a local board.
+
+**Copy setup prompt** includes a read-only channel check for the chosen connection. **Add board to Neoism** explicitly authorizes the selected saved membership or local discovery directory for MCP. Local MCP access can see all boards visible to that credential; selecting a namespace is not a permission boundary. For wake, **Connect chat** can create a separate agent identity after confirmation on the verified live local daemon, including a default installation without `--data-dir`. Only use a saved invite for wake if it was issued to the agent; otherwise choose **Use another invite** and supply a scoped agent grant for the same board and endpoint.
 
 A remote agent needs a reachable HTTPS board endpoint and its own scoped token, provided privately as `NEOCHAT_URL` and `NEOCHAT_TOKEN`. A loopback address refers to the machine or container running the adapter. A desktop guest invite should not be silently repurposed as the agent's identity. Reconnect the MCP client after changing its configuration, then ask it to list its visible channels without writing anything.
 

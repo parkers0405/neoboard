@@ -149,7 +149,7 @@ pub enum Update {
     Membership(u64, Result<neochat::protocol::Member,String>),
     Personal(u64, u64, Result<neochat::protocol::Member,String>),
     SentFile(PathBuf,String),
-    Snapshot(Snapshot),
+    Snapshot(Snapshot, Option<(PathBuf, String)>),
     Event(Event),
     Status(String),
     Done(Option<(Option<u64>, String)>, Result<(), String>),
@@ -280,6 +280,8 @@ fn reconcile_name(client: &Client, name: &str) -> Result<neochat::protocol::Memb
 }
 
 pub fn start(mut opts: Options, wake: rune::Waker) -> (mpsc::SyncSender<Command>, mpsc::Receiver<Update>) {
+    // Freeze discovery once for this worker, including its default data directory.
+    opts.data_dir = neochat::client::local_data_dir(opts.data_dir.as_deref()).ok().and_then(|p| std::path::absolute(p).ok());
     let local_opts = Options { invite: None, endpoint: None, project: None, ..opts.clone() };
     let (commands, rx) = mpsc::sync_channel::<Command>(16);
     let (tx, updates) = mpsc::sync_channel(8);
@@ -354,7 +356,8 @@ pub fn start(mut opts: Options, wake: rune::Waker) -> (mpsc::SyncSender<Command>
                 Ok(snapshot) => {
                     let cursor = snapshot.cursor;
                     for m in &snapshot.messages {directories.insert(m.channel.clone(),None::<std::time::Instant>);}
-                    if !send(Update::Snapshot(snapshot)) { break; }
+                    let discovery = opts.data_dir.clone().filter(|_| opts.invite.is_none() && opts.endpoint.is_none()).map(|dir| (dir, client.endpoint().to_owned()));
+                    if !send(Update::Snapshot(snapshot, discovery)) { break; }
                     cursor
                 }
                 Err(update) => {

@@ -150,8 +150,12 @@ impl App {
     pub fn switch_saved_board(&mut self, profile: &saved_boards::BoardProfile) {
         self.project_menu = false;
         if self.onboarding.busy { return; }
-        if self.options.endpoint.is_none() && profile.invite == self.options.invite && self.projects().contains(profile.project.as_str()) {
+        if profile.on_server(&self.options) && self.projects().contains(profile.project.as_str()) {
             self.select_project(&profile.project);
+            return;
+        }
+        if profile.invite.is_none() && profile.endpoint.is_some() {
+            self.error = Some("This hosted connection requires a saved membership.".into());
             return;
         }
         if self.has_unsent_work() {
@@ -242,6 +246,7 @@ impl App {
                 self.personal.reset_connection();
                 self.onboarding.clear_join_fields();
                 if hosted.is_some() || switching {
+                    self.local_discovery = None;
                     self.organization = Default::default();
                     if self.options.endpoint.is_none() {
                         for id in self.projects().into_iter().map(str::to_owned).collect::<Vec<_>>() {

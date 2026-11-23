@@ -26,7 +26,7 @@ impl Scope {
 #[derive(Subcommand)]
 enum Command {
     /// Create a ten-minute, single-use pairing code. Does not enable wakes.
-    Prepare { #[command(flatten)] scope:Scope, #[arg(long)] project:String, #[arg(long,required_unless_present="create_agent",conflicts_with="create_agent")] invite:Option<PathBuf>, #[arg(long,requires="create_agent")] local_data_dir:Option<PathBuf>, #[arg(long,requires="local_data_dir")] create_agent:bool },
+    Prepare { #[command(flatten)] scope:Scope, #[arg(long)] project:String, #[arg(long,required_unless_present="create_agent",conflicts_with="create_agent")] invite:Option<PathBuf>, #[arg(long,requires="create_agent")] local_data_dir:Option<PathBuf>, #[arg(long,requires="create_agent")] local_endpoint:Option<String>, #[arg(long,requires="local_data_dir")] create_agent:bool },
     /// Run in the dedicated agent conversation's trusted workspace. Never selects the latest chat.
     Pair { #[arg(long,required_unless_present="request",conflicts_with="request")] code:Option<String>, #[arg(long)] request:Option<String>, #[arg(long)] session:Option<String>, #[arg(long)] executable:Option<PathBuf>, #[arg(long)] workspace:Option<PathBuf>, #[arg(long)] origin:Option<String> },
     /// Enable inbox turns for the paired conversation (may use model credits and tools).
@@ -88,11 +88,11 @@ fn toggle(dir:&Path,key:&str,on:bool)->Result<(),String>{
 pub fn run(options:Options)->Result<(),String>{
     let dir=store::home()?;
     match options.command {
-        Command::Prepare{scope,project,invite,local_data_dir,create_agent}=>{
+        Command::Prepare{scope,project,invite,local_data_dir,local_endpoint,create_agent}=>{
             let key=scope.key()?;if !neochat::valid_project(&project){return Err("Invalid project".into());}
             let _guard=store::lock(&dir,"control.lock",true)?;
             if transaction(&dir,|s|Ok(s.bindings.contains_key(&key)))?{return Err("Already paired; use On or Off".into());}
-            let invite=if create_agent{provision::local(&dir,local_data_dir.as_deref().ok_or("Missing local data directory")?,&key,&project,&scope.harness)?}else{invite.ok_or("Missing scoped invite")?};
+            let invite=if create_agent{provision::local(&dir,local_data_dir.as_deref().ok_or("Missing local data directory")?,local_endpoint.as_deref(),&key,&project,&scope.harness)?}else{invite.ok_or("Missing scoped invite")?};
             let (origin,actor)=inbox::identify(&invite,&project)?;
             let source=Source{board:scope.board_id,project,invite,origin,actor,harness:scope.harness};let code=nonce();
             transaction(&dir,|s|{if s.bindings.contains_key(&key)||s.bindings.values().any(|b|duplicate(&b.source,&source)){return Err("Already paired for this board actor; use On or Off".into());}

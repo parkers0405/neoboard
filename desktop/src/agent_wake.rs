@@ -97,34 +97,39 @@ pub fn select(app: &mut App, harness: Harness) {
 }
 
 pub fn selected(app: &App, key: &str, harness: Harness) -> bool {
-    app.setup_open && !app.onboarding.switching && app.status != "access denied" && neochat::valid_project(&app.project)
+    app.setup_open && !key.is_empty()
         && app.agent_wake.as_ref().is_some_and(|p| p.key == key && p.harness == harness && !p.busy()) && Guide::new(app).key == key
 }
 
-/// Only the selected live local connection with an explicit directory may provision. Never
-/// discover from env/defaults, including when a remote identity check fails.
-pub fn local_dir(app: &App) -> Option<&Path> {
-    if !(app.fixture || app.status == "live") || !app.can_share_board(&app.project) { return None; }
-    app.options.data_dir.as_deref().filter(|p| p.is_absolute())
+/// Provision only on the same local discovery route that supplied the live board list.
+/// The CLI rechecks the pinned directory and loopback endpoint before using admin access.
+pub fn local_dir(app: &App) -> Option<PathBuf> {
+    let target = crate::setup_guide::target(app)?;
+    if !(app.fixture || app.status == "live") || !app.can_share_board(&target.profile.project) { return None; }
+    target.local.filter(|dir| app.fixture || app.local_discovery.as_ref().is_some_and(|(verified, _)| verified == dir))
 }
 
 enum Source {
     Invite { path: PathBuf, membership: Option<PathBuf>, endpoint: Option<String> },
-    Local(PathBuf),
+    Local { dir: PathBuf, endpoint: String },
 }
 
 fn source(app: &App, action: Action) -> Result<Option<Source>, &'static str> {
+    let target = crate::setup_guide::target(app).ok_or("Choose an available board connection.")?;
     if action == Action::Create {
-        return local_dir(app).map(|d| Some(Source::Local(d.into()))).ok_or("Creating an identity requires the selected local board’s explicit data directory.");
+        return local_dir(app).zip(app.local_discovery.as_ref()).map(|(dir, (_, endpoint))| Some(Source::Local { dir, endpoint: endpoint.clone() })).ok_or("Creating an identity requires the selected board on the live local connection.");
     }
-    if action != Action::Prepare { return Ok(None); }
+    if action != Action::Prepare {
+        if !crate::setup_guide::copy_allowed(app, Some(&target)) { return Err("The selected connection is no longer available."); }
+        return Ok(None);
+    }
     let panel = app.agent_wake.as_ref().ok_or("Open Agent wake first.")?;
-    let membership = app.options.invite.clone();
+    let membership = target.profile.invite;
     let path = membership.clone().filter(|_| !panel.dedicated).unwrap_or_else(|| PathBuf::from(&panel.invite.text));
     if !path.is_absolute() { return Err("Choose a scoped invite file by its full path first."); }
-    let endpoint = membership.as_ref().and_then(|_| app.saved_boards.entries().iter()
-        .find(|p| p.project == app.project && p.invite == membership).and_then(|p| p.endpoint.clone()))
-        .or_else(|| app.options.endpoint.clone());
+    let endpoint = if let Some(dir) = target.local {
+        Some(app.local_discovery.as_ref().filter(|(verified, _)| verified == &dir && !app.remote() && app.status == "live").ok_or("Could not verify the selected local endpoint.")?.1.clone())
+    } else { target.profile.endpoint };
     Ok(Some(Source::Invite { path, membership, endpoint }))
 }
 
@@ -148,7 +153,7 @@ impl Source {
     fn args(&self, cmd: &mut std::process::Command, project: &str) -> Result<(), &'static str> {
         cmd.args(["--project", project]);
         match self {
-            Self::Local(dir) => { cmd.arg("--local-data-dir").arg(dir).arg("--create-agent"); }
+            Self::Local { dir, endpoint } => { cmd.arg("--local-data-dir").arg(dir).arg("--local-endpoint").arg(endpoint).arg("--create-agent"); }
             Self::Invite { path, membership, endpoint } => {
                 if membership.is_some() || endpoint.is_some() {
                     const MISMATCH: &str = "Choose an invite for this board on the same saved endpoint.";
@@ -165,13 +170,14 @@ impl Source {
 
 pub fn start(app: &mut App, key: &str, harness: Harness, action: Action) {
     if !selected(app, key, harness) || app.fixture { return; }
+    let Some(target) = crate::setup_guide::target(app) else { return };
     let Some(wake) = app.connection_wake.clone() else { return };
     let source = source(app, action);
     let panel = app.agent_wake.as_mut().unwrap();
     let source = match source { Ok(s) => s, Err(msg) => { panel.command = None; panel.confirming = None; panel.notice = Some(msg.into()); return; } };
     if matches!(action, Action::Create | Action::On) && panel.confirming != Some(action) { panel.confirming = Some(action); panel.notice = None; return; }
     panel.confirming = None;
-    let project = app.project.clone();
+    let project = target.profile.project;
     let key = key.to_owned();
     if source.is_some() {
         panel.command = None;
@@ -270,6 +276,7 @@ mod tests {
         let mut app = App::new();
         app.project = "Team".into();
         app.options.data_dir = Some(dir.path().to_owned());
+        app.local_discovery = Some((dir.path().into(), "http://127.0.0.1:23456/".into()));
         app.snapshot.channels = vec![crate::projects::channel("Team", "general")];
         app.status = "live".into();
         app.setup_open = true;
@@ -319,13 +326,18 @@ mod tests {
     }
 
     #[test]
-    fn provision_only_from_the_selected_explicit_local_directory() {
+    fn provision_only_from_the_directory_verified_by_the_live_local_worker() {
         let dir = tempfile::tempdir().unwrap();
         let mut a = App::new();
         a.project = "Team".into(); a.snapshot.channels = vec![crate::projects::channel("Team", "general")]; a.status = "live".into();
         assert!(source(&a, Action::Create).is_err());
+        let default = std::path::absolute(neochat::client::local_data_dir(None).unwrap()).unwrap();
+        a.local_discovery = Some((default.clone(), "http://127.0.0.1:23456/".into()));
+        assert!(matches!(source(&a, Action::Create), Ok(Some(Source::Local { dir, .. })) if dir == default));
         a.options.data_dir = Some(dir.path().into());
-        assert!(matches!(source(&a, Action::Create), Ok(Some(Source::Local(d))) if d == dir.path()));
+        assert!(source(&a, Action::Create).is_err()); // not the worker's directory
+        a.local_discovery.as_mut().unwrap().0 = dir.path().into();
+        assert!(matches!(source(&a, Action::Create), Ok(Some(Source::Local { dir: d, .. })) if d == dir.path()));
         a.options.endpoint = Some("https://same-name.invalid".into());
         assert!(source(&a, Action::Create).is_err());
         a.options.endpoint = None; a.options.invite = Some(dir.path().join("missing"));
@@ -361,6 +373,38 @@ mod tests {
         assert!(a.agent_wake.as_ref().unwrap().invite.text.is_empty());
     }
 
+    #[test]
+    fn setup_selection_not_active_membership_drives_wake_and_drops_old_consent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::new();
+        app.project = "Team".into();
+        let project = app.project.clone();
+        let endpoint = "https://fixture.invalid/";
+        let paths = ["personal", "worker"].map(|name| {
+            let grant = neochat::invite_file::InviteFile { version: 1, project: Some(project.clone()), endpoint: endpoint.into(), token: name.into(), expires_at: u64::MAX };
+            let path = grant.store(dir.path()).unwrap();
+            app.saved_boards.remember(project.clone(), Some(path.clone()), Some(endpoint.into()));
+            path
+        });
+        app.options.invite = Some(paths[0].clone());
+        crate::setup_guide::open(&mut app);
+        open(&mut app);
+        let old = Guide::new(&app).key;
+        app.agent_wake.as_mut().unwrap().confirming = Some(Action::Prepare);
+        let target = crate::setup_guide::choices(&app).into_iter().find(|t| t.profile.invite.as_ref() == Some(&paths[1])).unwrap();
+        crate::setup_guide::choose(&mut app,target);
+        assert!(app.agent_wake.is_none());
+        open(&mut app);
+        assert!(!selected(&app, &old, Harness::Neoism));
+        assert!(source(&app,Action::Create).is_err());
+        let Some(Source::Invite { path, membership, .. }) = source(&app,Action::Prepare).unwrap() else { panic!("expected selected grant") };
+        assert_eq!(path, paths[1]);
+        assert_eq!(membership.as_ref(), Some(&paths[1]));
+        assert_eq!(app.options.invite.as_ref(), Some(&paths[0]));
+        std::fs::remove_file(path).unwrap();
+        assert!(source(&app, Action::On).is_err()); // never fall back to the personal grant
+    }
+
     #[cfg(unix)]
     #[test]
     fn disposable_cli_receives_only_contract_args() {
@@ -374,7 +418,7 @@ test -z "${NEOCHAT_TOKEN-}${NEOCHAT_URL-}${NEOCHAT_DATA_DIR-}" || exit 1
 case "$2" in
 prepare) test "$5" = --project && test "$6" = Team || exit 1
 if test "$7" = --local-data-dir; then
-test "$#" = 11 && test "$8" = "${0%/*}" && test "$9" = --create-agent && test "${10}" = --harness && test "${11}" = claude || exit 1
+test "$#" = 13 && test "$8" = "${0%/*}" && test "$9" = --local-endpoint && test "${10}" = http://127.0.0.1:12432/ && test "${11}" = --create-agent && test "${12}" = --harness && test "${13}" = claude || exit 1
 else
 test "$#" = 10 && test "$7" = --invite && test "$8" = "${0%/*}/file with spaces" && test "$9" = --harness && test "${10}" = claude || exit 1
 fi
@@ -389,7 +433,7 @@ esac
         fs::write(&invite, serde_json::to_vec(&grant).unwrap()).unwrap();
         let invoke = |action, s| run(&cli, "board", "Team", s, Harness::Claude, action);
         let s = Source::Invite { path: invite, membership: None, endpoint: None };
-        let local = Source::Local(dir.path().into());
+        let local = Source::Local { dir: dir.path().into(), endpoint: "http://127.0.0.1:12432/".into() };
         assert_eq!(invoke(Action::Prepare, Some(&s)).unwrap(), "neoboard wake pair --code CODE");
         assert_eq!(invoke(Action::Create, Some(&local)).unwrap(), "neoboard wake pair --code CODE");
         for op in [Action::Test, Action::On, Action::Off, Action::Status] { assert_eq!(invoke(op, None).unwrap(), format!("{} response", op.arg())); }

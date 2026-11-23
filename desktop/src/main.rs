@@ -116,6 +116,7 @@ struct App {
     zoom: zoom::Zoom,
     snapshot: Snapshot,
     board_cache: Option<Snapshot>,
+    local_discovery: Option<(std::path::PathBuf, String)>,
     board_extra:(Vec<Reaction>,Vec<ScheduledPost>),
     page: Page,
     project: String,
@@ -125,6 +126,8 @@ struct App {
     project_menu: bool,
     home_copied: Option<&'static str>,
     setup_open: bool,
+    setup_target: Option<setup_guide::Target>,
+    setup_board_menu: bool,
     setup_session: setup_guide::Session,
     agent_wake: Option<agent_wake::Panel>,
     setup_agent: setup_guide::Agent,
@@ -277,8 +280,9 @@ impl App {
             local_name: OPTIONS.get().and_then(|o| o.profile.clone()).unwrap_or_else(|| profile::local_name(fixture || cfg!(test))),
             profiles: profile::Profiles::default(),
             zoom: zoom::Zoom::default(),
-            snapshot: Snapshot { cursor: 0, channels: vec![], messages: vec![] }, board_cache:None,board_extra:Default::default(),page: Page::Home, project:String::new(), options: OPTIONS.get().cloned().unwrap_or_default(), onboarding: Default::default(), project_menu:false, home_copied: None, setup_open:false, setup_agent:Default::default(), setup_choices:false, splash: Default::default(),
+            snapshot: Snapshot { cursor: 0, channels: vec![], messages: vec![] }, board_cache:None,board_extra:Default::default(),page: Page::Home, project:String::new(), options: OPTIONS.get().cloned().unwrap_or_default(), onboarding: Default::default(), project_menu:false, home_copied: None, setup_open:false, setup_target:None, setup_board_menu:false, setup_agent:Default::default(), setup_choices:false, splash: Default::default(),
             setup_session: Default::default(),
+            local_discovery: None,
             agent_wake: None,
             share:Default::default(), connection_wake:None, saved_boards:Default::default(), me:None, personal_name:edit(""), member_list:None, pick_assignee:false, details_picker:None, task_filters:Default::default(), aliases:BTreeMap::new(),
             filter: ALL_TASKS, query: edit(""), channel: edit(""), draft: edit(""), reply: edit(""),
@@ -674,7 +678,8 @@ fn poll(app: &mut App, seconds: f64, tx: &mut Tx) -> bool {
                     tx.copy(link.to_owned()); app.share.copied = true;
                 }
             }
-            Update::Snapshot(mut snapshot) => {
+            Update::Snapshot(mut snapshot, discovery) => {
+                app.local_discovery = discovery;
                 app.personal.reset_connection();
                 // A reconnect can skip deletion events entirely.
                 let missing: Vec<_> = app.board_cache.as_ref().unwrap_or(&app.snapshot).channels.iter().filter(|c| !snapshot.channels.contains(c)).cloned().collect();
@@ -849,6 +854,7 @@ fn main() {
                 return true;
             }
             if !matches!(app.release.stage, release_update::Stage::Hidden) && e.key == Key::Escape { app.release.dismiss(); return true; }
+            if e.key == Key::Escape && app.setup_board_menu {app.setup_board_menu=false;return true;}
             if e.key == Key::Escape && app.setup_choices {app.setup_choices=false;return true;}
             if e.key == Key::Escape && app.dialog==Some(Dialog::Filters) && app.details_picker.take().is_some(){return true;}
             if app.onboarding_visible() && e.key == Key::Escape { app.onboarding.cancel_form(); return true; }

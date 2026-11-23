@@ -42,11 +42,12 @@ pub(super) fn body(app: &App, key: &str, panel: &Panel) -> El {
         actions = actions.child(button("Start over", |a| if let Some(p) = &mut a.agent_wake { p.command=None; p.confirming=None; a.home_copied=None; }).disabled(panel.busy()));
     } else if status == "Not paired" {
         let local = wake::local_dir(app).is_some();
-        let joined = app.options.invite.is_some();
+        let Some(target) = setup_guide::target(app) else { return body };
+        let joined = target.profile.invite.is_some();
         let file = panel.dedicated || !local && !joined;
         step = step.child(title(&format!("Connect {}", h.name())));
         if panel.confirming == Some(Action::Create) {
-            step = step.child(label(format!("Create a board identity for {} on {}? This won't send a message or turn wake on.", h.name(), app.project)).wrap());
+            step = step.child(label(format!("Create a board identity for {} on {}? This won't send a message or turn wake on.", h.name(), target.label(app))).wrap());
             actions = actions.child(action("wake-create-confirm", "Create and continue", Action::Create)).child(cancel());
         } else if file {
             step = step.child(muted("Choose the invite file your board host issued to this agent. It gives the agent its own name, inbox, and permissions on this board. Don’t use your personal invite.").wrap());
@@ -68,7 +69,7 @@ pub(super) fn body(app: &App, key: &str, panel: &Panel) -> El {
         } else {
             step = step.child(muted(if joined { "Use the saved invite if it was issued to this agent. If you joined as yourself, choose the agent’s invite file instead." } else { "First time? Choose Connect chat to give the agent its own name and inbox on this board. Already have an invite file for this agent? Use that instead." }).wrap())
                 .child(muted(format!("Next, paste a pairing prompt into the {} chat you want to wake, or choose Manual for a terminal command. Wake stays off until you turn it on.", h.name())).wrap());
-            actions = actions.child(if local {action("wake-create","Connect chat…",Action::Create)} else {action("wake-prepare","Use saved invite",Action::Prepare)});
+            actions = actions.child(if local {action("wake-create","Connect chat…",Action::Create)} else {action("wake-prepare","This is the agent’s saved invite",Action::Prepare)});
         }
         if (local || joined) && panel.confirming.is_none() {
             actions = actions.child(button(if file {"Back"} else {"Use another invite…"}, |a| if let Some(p)=&mut a.agent_wake {p.dedicated=!p.dedicated;p.notice=None;p.invite=edit("");}).disabled(panel.busy()).key("wake-identity-source"));

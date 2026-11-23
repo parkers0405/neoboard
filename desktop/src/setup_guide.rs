@@ -1,9 +1,69 @@
 use serde_json::json;
+use crate::{connection::Options, saved_boards::BoardProfile};
 use sha2::{Digest, Sha256};
 use std::{env, path::{Path, PathBuf}, sync::{LazyLock, mpsc}};
 
 #[path = "setup_catalog.rs"]
 mod catalog;
+
+/// Drawer-only reference. Never change the connection worker, preferences or active project.
+#[derive(Clone, PartialEq)]
+pub struct Target { pub profile: BoardProfile, pub local: Option<PathBuf> }
+
+impl Target {
+    fn from_row(app: &crate::App, project: &str, profile: Option<&BoardProfile>) -> Self {
+        let profile = profile.cloned().unwrap_or_else(|| BoardProfile { project: project.into(), invite: app.options.invite.clone(), endpoint: app.options.endpoint.clone() });
+        let local = if profile.invite.is_none() && profile.endpoint.is_none() {
+            neochat::client::local_data_dir(app.options.data_dir.as_deref()).ok().and_then(|p| std::path::absolute(p).ok())
+        } else { None };
+        Self { profile, local }
+    }
+    pub fn label(&self, app: &crate::App) -> String {
+        let location = if self.local.is_some() { "Local".into() } else if let Some(i) = app.saved_boards.entries().iter().position(|p| p == &self.profile) { self.profile.location(i) } else { "Current server".into() };
+        format!("{} · {location}", self.profile.project)
+    }
+    fn options(&self) -> Options {
+        Options { invite: self.profile.invite.clone(), endpoint: self.profile.endpoint.clone(), data_dir: self.local.clone(), ..Default::default() }
+    }
+}
+
+pub fn choices(app: &crate::App) -> Vec<Target> {
+    app.board_rows().into_iter().map(|(id, saved, _)| Target::from_row(app, id, saved.map(|(_, p)| p))).collect()
+}
+
+fn active(app: &crate::App) -> Target {
+    let profile = app.saved_boards.entries().iter().find(|p| p.project == app.project && p.on_server(&app.options));
+    Target::from_row(app, &app.project, profile)
+}
+
+pub fn target(app: &crate::App) -> Option<Target> {
+    if app.onboarding.switching { return None; }
+    let target = match app.setup_target.as_ref().filter(|_| app.setup_open) {
+        Some(pinned) => choices(app).into_iter().find(|t| t == pinned)?,
+        None => active(app), // onboarding's guide uses its newly joined connection
+    };
+    (neochat::valid_project(&target.profile.project) && (target.local.is_some() || target.profile.invite.as_deref().is_some_and(Path::is_absolute))
+        && !(app.status == "access denied" && target.profile.on_server(&app.options))).then_some(target)
+}
+
+pub fn choose(app: &mut crate::App, target: Target) {
+    app.setup_target = Some(target);
+    app.setup_board_menu = false;
+    app.home_copied = None;
+    app.agent_wake = None;
+}
+
+pub fn copy_allowed(app: &crate::App, shown: Option<&Target>) -> bool {
+    let Some(current) = target(app) else { return false };
+    Some(&current) == shown && current.profile.invite.as_ref().is_none_or(|path|
+        neochat::invite_file::InviteFile::read(path).is_ok_and(|grant| check_scope(&grant, &current.profile.project, current.profile.endpoint.as_deref()).is_ok()))
+}
+
+pub fn open(app: &mut crate::App) {
+    choose(app, active(app));
+    app.setup_choices = false;
+    app.setup_open = true;
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Agent {
@@ -44,6 +104,7 @@ pub struct Install {
     path: PathBuf,
     joined: bool,
     host_number: Option<usize>,
+    endpoint: Option<String>,
 }
 
 impl Install {
@@ -53,7 +114,7 @@ impl Install {
         let suffix = self.key.rsplit('-').next().unwrap_or(&self.key);
         let board = if self.joined {
             let invite = neochat::invite_file::InviteFile::read(&self.path).map_err(|_| "No changes: the saved invite is unavailable, invalid or expired.")?;
-            if invite.project.as_ref().is_some_and(|p| p != &self.project) { return Err("No changes: the invite belongs to another board."); }
+            check_scope(&invite, &self.project, self.endpoint.as_deref())?;
             // Use the picker's public alias, never invite-derived text (including the endpoint).
             let alias = self.host_number.map(|n| format!("Host {n}")).unwrap_or_else(|| "saved invite".into());
             let label = format!("{} ({alias}; {suffix})", self.project);
@@ -64,6 +125,13 @@ impl Install {
         };
         catalog::install(dir, &self.key, &self.adapter, &board, approved)
     }
+}
+
+fn check_scope(invite: &neochat::invite_file::InviteFile, project: &str, endpoint: Option<&str>) -> Result<(), &'static str> {
+    if invite.project.as_deref() != Some(project) || endpoint.is_some_and(|e| reqwest::Url::parse(e).ok() != reqwest::Url::parse(&invite.endpoint).ok()) {
+        return Err("No changes: the saved membership does not match the selected board and endpoint.");
+    }
+    Ok(())
 }
 
 #[derive(Default)]
@@ -137,44 +205,41 @@ static ADAPTER: LazyLock<String> = LazyLock::new(|| {
 });
 
 impl Guide {
+    fn unavailable(agent: Agent) -> Self {
+        Self { agent, key: String::new(), install: None, intro: "Choose a local board or a saved membership.".into(), instruction: "This connection is unavailable for setup.".into(), snippet: String::new(), question: "Do not use a different board or credential.".into() }
+    }
+
     pub fn new(app: &crate::App) -> Self {
-        let mut guide = Self::build(app.setup_agent, &ADAPTER, &app.options, &app.project);
+        let Some(target) = target(app) else { return Self::unavailable(app.setup_agent) };
+        let mut guide = Self::build(app.setup_agent, &ADAPTER, &target.options(), &target.profile.project);
         if app.fixture || app.onboarding.switching { guide.install = None; }
         if let Some(entry) = guide.install.as_mut().filter(|e| e.joined) {
             // Match the host alias shown in the board picker without copying its endpoint.
-            entry.host_number = app.saved_boards.entries().iter().position(|p| p.project == app.project && p.invite == app.options.invite).map(|i| i + 1);
+            entry.host_number = app.saved_boards.entries().iter().position(|p| p == &target.profile).map(|i| i + 1);
         }
         guide
     }
 
     fn build(agent: Agent, adapter: &str, opts: &crate::connection::Options, project: &str) -> Self {
-        let mut args = Vec::new();
         let joined = opts.invite.is_some();
-        let remote = !joined && opts.endpoint.is_some();
-        let path = if joined { opts.invite.clone() } else if remote { None } else {
-            neochat::client::local_data_dir(opts.data_dir.as_deref()).ok().and_then(|p| std::path::absolute(p).ok())
-        };
-        let location = path.as_deref().filter(|p| p.is_absolute()).and_then(Path::to_str);
-        if !remote { args.extend([if joined { "--invite" } else { "--data-dir" }.to_owned(), location.unwrap_or("<absolute path required>").to_owned()]); }
-        let key = server_key(project, if joined { "invite" } else if remote { "endpoint" } else { "local" }, location.or(opts.endpoint.as_deref()).unwrap_or(""));
+        let path = opts.invite.as_ref().or_else(|| opts.data_dir.as_ref().filter(|_| opts.endpoint.is_none()));
         let literal = |s: &str| !s.contains(['{', '}']) && !s.chars().any(char::is_control);
-        let installable = agent == Agent::Neoism && !remote && location.is_some_and(literal) && literal(adapter) && Path::new(adapter).is_absolute() && neochat::valid_project(project);
+        let Some(location) = path.filter(|p| p.is_absolute()).and_then(|p| p.to_str()).filter(|s| literal(s)) else { return Self::unavailable(agent) };
+        let args = [if joined { "--invite" } else { "--data-dir" }, location];
+        let key = server_key(project, if joined { "invite" } else { "local" }, location);
+        let installable = agent == Agent::Neoism && literal(adapter) && Path::new(adapter).is_absolute() && neochat::valid_project(project);
         let mut install = None;
-        let intro = if joined { "Adding this entry authorizes this agent on this device to use your saved invite, with the same board permissions and expiry. No token is copied." } else if remote { "This board is hosted. Give the connection its own board credential." } else { "This connection uses local discovery. It can access all boards visible to the local credential, not just the selected board." }.to_owned();
+        let intro = if joined { "Adding this entry lets the agent use this saved membership, with its permissions and expiry. If you joined as yourself, this is your personal membership. Add it only if you intend to grant that access." } else { "Adding this entry grants the agent local MCP access to all boards visible to the local credential, not just the selected board." }.to_owned();
         let (location, snippet) = match agent {
             Agent::Codex => {
                 // JSON string escapes also work in TOML basic strings; DEL must be escaped in TOML.
                 let command = json!(adapter).to_string().replace('\u{7f}', "\\u007f");
                 let args = json!(args).to_string().replace('\u{7f}', "\\u007f");
-                let env = if remote { "\nenv_vars = [\"NEOCHAT_URL\", \"NEOCHAT_TOKEN\"]" } else { "" };
-                ("~/.codex/config.toml", format!("[mcp_servers.{key}]\ncommand = {command}\nargs = {args}{env}"))
+                ("~/.codex/config.toml", format!("[mcp_servers.{key}]\ncommand = {command}\nargs = {args}"))
             }
             Agent::Neoism => {
-                if remote {
-                    return Self { agent, key, install: None, intro, instruction: "Join this hosted board with a saved invite before adding it to Neoism.".into(), snippet: "A board registration requires a saved invite or local data directory.".into(), question: format!("Using neoboard, list the channels visible for board {project} without making changes.") };
-                }
                 if installable {
-                    install = path.map(|path| Install { key: key.clone(), project: project.to_owned(), adapter: adapter.into(), path, joined, host_number: None });
+                    install = Some(Install { key: key.clone(), project: project.to_owned(), adapter: adapter.into(), path: PathBuf::from(location), joined, host_number: None, endpoint: opts.endpoint.clone() });
                 }
                 let registry = crate::profile::config_dir().filter(|d| d.is_absolute()).map(|d| d.join(catalog::BOARDS)).unwrap_or_else(|| PathBuf::from("<absolute boards file>"));
                 let server = catalog::server(adapter, &registry.to_string_lossy());
@@ -182,22 +247,16 @@ impl Guide {
                 return Self { agent, key, install, intro, instruction: "Add this board, then reconnect neoboard in Neoism. One global plugin serves all boards you add on this device.".into(), snippet: format!("{:#}", json!({"neoboard":server})), question };
             }
             Agent::ClaudeCode | Agent::ClaudeDesktop => {
-                let mut server = json!({"command":adapter, "args":args});
+                let server = json!({"command":adapter, "args":args});
                 let location = if agent == Agent::ClaudeCode {
-                    if remote { server["env"] = json!({"NEOCHAT_URL":"${NEOCHAT_URL}", "NEOCHAT_TOKEN":"${NEOCHAT_TOKEN}"}); }
                     "the project's .mcp.json"
                 } else {
-                    if remote { server["env"] = json!({"NEOCHAT_URL":"<board endpoint>", "NEOCHAT_TOKEN":"<agent invite token>"}); }
                     "claude_desktop_config.json (Settings → Developer → Edit Config)"
                 };
                 (location, format!("{:#}", json!({"mcpServers":{(&key):server}})))
             }
         };
-        let auth = if joined { "Keep the invite file private and on this device. For a separate grant or the CLI, omit --invite, set NEOCHAT_URL and NEOCHAT_TOKEN privately in a separate launch environment, and verify with neochat channels." } else { match (remote, agent) {
-            (false, _) => "No workspace selection is needed.",
-            (true, Agent::ClaudeDesktop) => "Replace the env placeholders privately in that local file with the board endpoint and this agent's scoped invite token. Do not share the edited file.",
-            (true, _) => "Set NEOCHAT_URL and NEOCHAT_TOKEN to this board’s endpoint and agent-specific credential in a separate client launch environment.",
-        }};
+        let auth = if joined { "Keep the membership file private and on this device." } else { "No workspace selection is needed." };
         Self {
             agent, intro, key: key.clone(), install,
             instruction: format!("Add {key} to {location} without replacing any other entries. {auth} Restart {}.", agent.name()),
@@ -214,7 +273,8 @@ impl Guide {
             Agent::Codex => "Pair a dedicated Codex thread using its exact thread ID. If the OS blocks the CLI, stop; do not bypass the warning.",
         };
         let wake = if self.agent == Agent::ClaudeDesktop { runtime.to_string() } else { format!("If I want wake, guide me through Home → Setup → Set up wake. {runtime} Use the agent's own board identity. I choose Copy for agent and paste the pairing prompt into the exact conversation I want to wake, or choose Manual for a terminal command. Then I select Check connection. Do not ask me to paste private codes or tokens here. Pairing leaves wake off. I can choose Turn on to allow mentions and requested task updates to start turns, or Pause to stop future wakes. Do not enable wake or send a test on my behalf.") };
-        format!("1. Connect MCP for {}\n{} {}\n\n{}\n\n2. Verify access\n{}\n\n3. Automatic wake (optional)\n{}", self.agent.name(), self.intro, self.instruction, self.snippet, self.question, wake)
+        if self.key.is_empty() { return self.instruction.clone(); }
+        format!("1. Connect MCP for {}\n{} {}\nAuthorize this connection only with my explicit approval. Do not switch the current session’s MCP, substitute another board, or use my personal or host access by default. If this exact connection is unavailable, stop.\n\n{}\n\n2. Verify access\n{}\n\n3. Automatic wake (optional)\n{}", self.agent.name(), self.intro, self.instruction, self.snippet, self.question, wake)
     }
 }
 
@@ -224,18 +284,15 @@ mod tests {
     use crate::connection::Options;
 
     #[test]
-    fn selected_clients_get_their_own_config_without_credentials() {
+    fn endpoint_without_a_membership_has_no_actionable_guide() {
         let opts = Options { token: "PRIVATE_SENTINEL".into(), endpoint: Some("https://PRIVATE_SENTINEL.invalid".into()), ..Options::default() };
         assert_eq!(Agent::default(), Agent::Neoism);
-        for (agent, marker) in Agent::ALL.into_iter().zip(["${NEOCHAT_TOKEN}", "<agent invite token>", "env_vars", "saved invite"]) {
+        for agent in Agent::ALL {
             let guide = Guide::build(agent, "C:\\Neo Board\\adapter.exe", &opts, "Team");
             let text = guide.copy_text();
-            assert!(text.contains(agent.name()) && text.contains(&guide.snippet) && text.contains(&guide.question));
-            assert!(guide.snippet.contains(marker));
-            assert!(guide.install.is_none() && (agent == Agent::Neoism || guide.snippet.contains(&guide.key)));
+            assert!(guide.key.is_empty() && guide.snippet.is_empty() && guide.install.is_none());
             assert!(!text.contains("PRIVATE_SENTINEL") && !text.contains("--data-dir"));
-            assert!(text.contains("3. Automatic wake (optional)") && !text.contains("--code "));
-            assert_eq!(text.contains("Check connection"), agent != Agent::ClaudeDesktop);
+            assert!(text.contains("unavailable"));
         }
     }
 
@@ -342,7 +399,12 @@ mod tests {
             fonts: &[include_bytes!("../assets/fonts/GeistMono-Regular.otf")], families: ("Geist Mono", "Geist Mono"),
             ..rune::AppSpec::new("Setup", (1252., 674.), || {
                 let mut app = crate::App::new();
-                app.project = "Team".into(); app.options.data_dir = Some(env::temp_dir().join("test-board")); app.setup_open = true;
+                app.project = "Team".into();
+                app.options.data_dir = Some(env::temp_dir().join("test-board"));
+                app.snapshot.channels = vec!["Team/general".into(), "Archive/general".into()];
+                for host in ["east", "west"] { app.saved_boards.remember("Team".into(), Some(env::temp_dir().join(format!("fixture-{host}.neochat"))), Some(format!("https://{host}.invalid/"))); }
+                open(&mut app);
+                app.setup_board_menu = true;
                 app
             }, crate::view::root)
         };
@@ -373,5 +435,51 @@ mod tests {
         assert!(rt.state.setup_session.status(&key).starts_with("No changes:"));
         rt.update(|a,_| { a.options.invite = Some(tmp.path().join("different.neochat")); add_board(a, &key); });
         assert!(rt.state.setup_session.inbox.is_none()); // stale action ignored
+    }
+
+    #[test]
+    fn drawer_selects_exact_saved_grant_or_discovered_local_without_switching() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = crate::App::new();
+        app.project = "Desktop".into();
+        app.options.data_dir = Some(dir.path().into());
+        app.snapshot.channels = vec!["Desktop/general".into(), "Team/general".into()];
+        let grant = neochat::invite_file::InviteFile { version: 1, project: Some("Team".into()), endpoint: "https://fixture.invalid/".into(), token: "password-exchange-fixture".into(), expires_at: u64::MAX };
+        let paths = [grant.store(dir.path()).unwrap(), grant.store(dir.path()).unwrap()];
+        for path in &paths { app.saved_boards.remember("Team".into(), Some(path.clone()), Some(grant.endpoint.clone())); }
+        let (tx, requests) = mpsc::sync_channel(4);
+        app.commands = Some(tx);
+        open(&mut app);
+        let mut rt = rune::Runtime::new(app, crate::view::root, (1100., 960.), rune::Env::new(true, 1.));
+        let click = |rt: &mut rune::Runtime<crate::App>, id: &str| {
+            for _ in 0..4 { rt.frame(1./60.); }
+            let (x,y) = rt.find(id).unwrap_or_else(|| panic!("missing {id}"));
+            rt.pointer_move(x,y); rt.pointer_down(x,y); rt.pointer_up(x,y); rt.frame(1./60.);
+        };
+        let mut keys = std::collections::BTreeSet::new();
+        for (index, path) in [(0, Some(&paths[0])), (1, Some(&paths[1])), (3, None)] {
+            click(&mut rt, "setup-board");
+            click(&mut rt, &format!("setup-board-{index}"));
+            assert!(!rt.state.setup_board_menu && rt.file_dialog().is_none());
+            let t = target(&rt.state).unwrap();
+            assert_eq!(t.profile.project, "Team");
+            assert_eq!(t.profile.invite.as_ref(), path);
+            assert!(copy_allowed(&rt.state, Some(&t)));
+            let guide = Guide::new(&rt.state);
+            assert!(guide.question.contains(&guide.key) && guide.question.contains("without making changes"));
+            assert!(keys.insert(guide.key.clone()));
+            let entry = selected(&rt.state, &guide.key).unwrap();
+            assert_eq!(entry.path.as_path(), path.map_or(dir.path(), |p| p.as_path()));
+            assert_eq!(entry.joined, path.is_some());
+            assert!(!guide.copy_text().contains(&grant.token));
+            assert_eq!(rt.state.project, "Desktop");
+            assert!(rt.state.options.invite.is_none() && requests.try_recv().is_err());
+        }
+        let shown = target(&rt.state).unwrap();
+        rt.update(|a,_| { a.options.endpoint = Some("http://127.0.0.1:12345".into()); });
+        assert!(!copy_allowed(&rt.state, Some(&shown)) && Guide::new(&rt.state).install.is_none());
+        assert!(keys.iter().all(|k| selected(&rt.state,k).is_none()));
+        rt.frame(1./60.);
+        assert!(rt.find("setup-wake").is_none() && rt.find("copy-setup").is_none());
     }
 }

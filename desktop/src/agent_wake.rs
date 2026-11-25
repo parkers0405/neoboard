@@ -5,6 +5,13 @@ use std::{path::{Path, PathBuf}, process::Stdio, sync::mpsc};
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Harness { Neoism, Claude, Codex }
 
+#[derive(Clone, serde::Deserialize)]
+pub struct Chat { pub chat_id: String, pub harness: String, pub actor: String, pub session: String, pub enabled: bool }
+
+impl Chat {
+    pub fn client(&self) -> Option<Harness> { match self.harness.as_str() { "neoism" => Some(Harness::Neoism), "claude" => Some(Harness::Claude), "codex" => Some(Harness::Codex), _ => None } }
+}
+
 impl Harness {
     pub fn name(self) -> &'static str {
         match self { Self::Neoism => "Neoism", Self::Claude => "Claude Code", Self::Codex => "Codex" }
@@ -15,16 +22,19 @@ impl Harness {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Action { Prepare, Create, Status, On, Off, Test }
+pub enum Action { Prepare, Create, Status, On, Off, Test, Disconnect }
 impl Action {
     fn arg(self) -> &'static str {
-        match self { Self::Prepare | Self::Create => "prepare", Self::Status => "status", Self::On => "on", Self::Off => "off", Self::Test => "test" }
+        match self { Self::Prepare | Self::Create => "prepare", Self::Status => "status", Self::On => "on", Self::Off => "off", Self::Test => "test", Self::Disconnect => "disconnect" }
     }
 }
 
 pub struct Panel {
     key: String,
     pub harness: Harness,
+    pub chat_id: String,
+    pub chats: Vec<Chat>,
+    pub list_error: bool,
     pub invite: TextEdit,
     pub dedicated: bool,
     pub manual: bool,
@@ -34,27 +44,30 @@ pub struct Panel {
     pub test: Option<String>,
     pub notice: Option<String>,
     pub confirming: Option<Action>,
-    pending: Option<(Action, mpsc::Receiver<Result<String, String>>)>,
+    pending: Option<(Action, mpsc::Receiver<(Result<String, String>, Option<Vec<Chat>>)>)>,
 }
 
 impl Panel {
     fn new(key: String, harness: Harness) -> Self {
-        Self { key, harness, invite: edit(""), dedicated: false, manual: false, details: false, command: None, status: None, test: None, notice: None, confirming: None, pending: None }
+        Self { key, harness, chat_id: "default".into(), chats: vec![], list_error: false, invite: edit(""), dedicated: false, manual: false, details: false, command: None, status: None, test: None, notice: None, confirming: None, pending: None }
     }
     pub fn busy(&self) -> bool { self.pending.is_some() }
     pub fn matches_board(&self, key: &str) -> bool { self.key == key }
     pub fn poll(&mut self) -> bool {
         let Some((action, rx)) = &self.pending else { return false };
-        let result = match rx.try_recv() {
+        let (result, list) = match rx.try_recv() {
             Ok(result) => result,
             Err(mpsc::TryRecvError::Empty) => return false,
-            Err(_) => Err("No result received. Check status before retrying.".into()),
+            Err(_) => (Err("No result received. Check status before retrying.".into()), None),
         };
+        self.list_error = list.is_none();
+        if let Some(chats) = list { self.chats = chats; }
         self.notice = None;
         match (action, result) {
             (Action::Test, Ok(msg) | Err(msg)) => self.test = Some(msg),
             (_, Err(msg)) => self.notice = Some(msg),
             (Action::Prepare | Action::Create, Ok(command)) => self.command = Some(command),
+            (Action::Disconnect, Ok(_)) => { self.command=None; self.test=None; self.details=false; self.status=Some("Not paired".into()); self.notice=Some("Chat disconnected. Other chats are unchanged.".into()); },
             (_, Ok(msg)) => {
                 if paired(&msg).is_some() { self.command = None; }
                 self.status = Some(msg);
@@ -81,9 +94,12 @@ pub fn open(app: &mut App) {
         crate::setup_guide::Agent::ClaudeCode => Harness::Claude,
         crate::setup_guide::Agent::Codex => Harness::Codex,
         crate::setup_guide::Agent::Neoism => Harness::Neoism,
-        crate::setup_guide::Agent::ClaudeDesktop => {app.agent_wake=None; return;},
+        crate::setup_guide::Agent::ClaudeDesktop => Harness::Neoism, // list remains visible; no setup controls
     };
-    app.agent_wake = Some(Panel::new(Guide::new(app).key, harness));
+    let key = Guide::new(app).key;
+    let mut panel = Panel::new(key.clone(), harness);
+    if let Some(previous) = app.agent_wake.take().filter(|p| p.key == key) { panel.chats = previous.chats; }
+    app.agent_wake = Some(panel);
     refresh(app, harness);
 }
 
@@ -94,6 +110,19 @@ pub fn select(app: &mut App, harness: Harness) {
         app.home_copied = None;
         refresh(app, harness);
     }
+}
+
+pub fn choose_chat(app: &mut App, key: &str, h: Harness, id: &str, new: bool) {
+    if !app.setup_open || Guide::new(app).key != key { return; }
+    let Some(p) = app.agent_wake.as_mut().filter(|p| !p.busy() && p.key == key) else { return };
+    if !new && !p.chats.iter().any(|c| c.client()==Some(h) && c.chat_id==id) { return; }
+    let chats = std::mem::take(&mut p.chats);
+    *p = Panel::new(key.into(), h);
+    p.chats = chats;
+    p.chat_id = if new { format!("chat-{:x}-{:x}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()) } else { id.into() };
+    app.setup_agent = match h { Harness::Claude=>crate::setup_guide::Agent::ClaudeCode, Harness::Neoism=>crate::setup_guide::Agent::Neoism, Harness::Codex=>crate::setup_guide::Agent::Codex };
+    app.home_copied = None;
+    refresh(app,h);
 }
 
 pub fn selected(app: &App, key: &str, harness: Harness) -> bool {
@@ -175,9 +204,10 @@ pub fn start(app: &mut App, key: &str, harness: Harness, action: Action) {
     let source = source(app, action);
     let panel = app.agent_wake.as_mut().unwrap();
     let source = match source { Ok(s) => s, Err(msg) => { panel.command = None; panel.confirming = None; panel.notice = Some(msg.into()); return; } };
-    if matches!(action, Action::Create | Action::On) && panel.confirming != Some(action) { panel.confirming = Some(action); panel.notice = None; return; }
+    if matches!(action, Action::Create | Action::On | Action::Disconnect) && panel.confirming != Some(action) { panel.confirming = Some(action); panel.notice = None; return; }
     panel.confirming = None;
     let project = target.profile.project;
+    let chat = panel.chat_id.clone();
     let key = key.to_owned();
     if source.is_some() {
         panel.command = None;
@@ -187,17 +217,24 @@ pub fn start(app: &mut App, key: &str, harness: Harness, action: Action) {
     panel.pending = Some((action, rx));
     panel.notice = None;
     std::thread::spawn(move || {
-        let result = std::env::current_exe().map_err(|_| "Could not locate the bundled CLI.".into()).and_then(|exe| {
-            run(&exe.with_file_name(format!("neoboard{}", std::env::consts::EXE_SUFFIX)), &key, &project, source.as_ref(), harness, action)
-        });
+        let result = match std::env::current_exe() {
+            Ok(exe) => {
+                let cli = exe.with_file_name(format!("neoboard{}", std::env::consts::EXE_SUFFIX));
+                let result = run(&cli,&key,&project,source.as_ref(),harness,action,&chat);
+                let list = crate::background_process::command(&cli).args(["wake","list","--board-id",&key]).stdin(Stdio::null()).stderr(Stdio::null()).output().ok().filter(|out| out.status.success()).and_then(|out| serde_json::from_slice(&out.stdout).ok());
+                (result,list)
+            }
+            Err(_) => (Err("Could not locate the bundled CLI.".into()),None),
+        };
         let _ = tx.send(result);
         wake();
     });
 }
 
-fn run(cli: &Path, key: &str, project: &str, source: Option<&Source>, harness: Harness, action: Action) -> Result<String, String> {
+fn run(cli: &Path, key: &str, project: &str, source: Option<&Source>, harness: Harness, action: Action, chat: &str) -> Result<String, String> {
     let mut cmd = crate::background_process::command(cli);
     cmd.args(["wake", action.arg(), "--board-id", key]);
+    if chat != "default" { cmd.args(["--chat-id",chat]); }
     let preparing = matches!(action, Action::Prepare | Action::Create);
     if preparing {
         source.ok_or("No identity source selected.")?.args(&mut cmd, project)?;
@@ -266,12 +303,29 @@ mod tests {
             let (tx, rx) = mpsc::channel();
             p.pending = Some((op, rx));
             assert!(!p.poll());
-            tx.send(Ok(value.into())).unwrap();
+            assert!(tx.send((Ok(value.into()), Some(vec![]))).is_ok());
             assert!(p.poll());
         }
         assert_eq!(p.status.as_deref(), Some("Off"));
         assert_eq!(p.test.as_deref(), Some("Requested, not acknowledged"));
         assert_eq!(p.command.as_deref(), Some("pair here"));
+    }
+
+    #[test]
+    fn client_switch_and_new_chat_preserve_board_list_not_pairing_controls() {
+        let mut a=App::new(); crate::fixture::load(&mut a,true);
+        a.setup_open=true; open(&mut a);
+        let (key,h)={ let p=a.agent_wake.as_mut().unwrap();
+            p.chats.push(Chat {chat_id:"default".into(), harness:"neoism".into(), actor:"reviewer".into(), session:"first".into(), enabled:true});
+            (p.key.clone(),Harness::Neoism)
+        };
+        a.setup_agent=crate::setup_guide::Agent::ClaudeCode; open(&mut a);
+        assert_eq!(a.agent_wake.as_ref().unwrap().chats[0].session,"first");
+        choose_chat(&mut a,&key,h,"default",false);
+        choose_chat(&mut a,&key,h,"",true);
+        let p=a.agent_wake.as_ref().unwrap();
+        assert_ne!(p.chat_id,"default"); assert_eq!(p.chats.len(),1); assert!(p.chats[0].enabled);
+        assert_eq!(p.status.as_deref(),Some("Not paired")); assert!(p.confirming.is_none());
     }
 
     #[test]
@@ -406,8 +460,8 @@ mod tests {
         app.agent_wake.as_mut().unwrap().confirming = Some(Action::Prepare);
         let target = crate::setup_guide::choices(&app).into_iter().find(|t| t.profile.invite.as_ref() == Some(&paths[1])).unwrap();
         crate::setup_guide::choose(&mut app,target);
-        assert!(app.agent_wake.is_none());
-        open(&mut app);
+        let fresh=app.agent_wake.as_ref().unwrap();
+        assert!(fresh.confirming.is_none() && fresh.command.is_none() && fresh.chats.is_empty());
         assert!(!selected(&app, &old, Harness::Neoism));
         assert!(source(&app,Action::Create).is_err());
         let Some(Source::Invite { path, membership, .. }) = source(&app,Action::Prepare).unwrap() else { panic!("expected selected grant") };
@@ -444,7 +498,7 @@ esac
         let invite = dir.path().join("file with spaces");
         let grant = neochat::invite_file::InviteFile { version: 1, project: Some("Team".into()), endpoint: "http://127.0.0.1:12432".into(), token: "test-only".into(), expires_at: u64::MAX };
         fs::write(&invite, serde_json::to_vec(&grant).unwrap()).unwrap();
-        let invoke = |action, s| run(&cli, "board", "Team", s, Harness::Claude, action);
+        let invoke = |action, s| run(&cli, "board", "Team", s, Harness::Claude, action,"default");
         let s = Source::Invite { path: invite, membership: None, endpoint: None };
         let local = Source::Local { dir: dir.path().into(), endpoint: "http://127.0.0.1:12432/".into() };
         assert_eq!(invoke(Action::Prepare, Some(&s)).unwrap(), "neoboard wake pair --code CODE");

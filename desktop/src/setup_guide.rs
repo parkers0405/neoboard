@@ -51,6 +51,7 @@ pub fn choose(app: &mut crate::App, target: Target) {
     app.setup_board_menu = false;
     app.home_copied = None;
     app.agent_wake = None;
+    if app.setup_open { crate::agent_wake::open(app); }
 }
 
 pub fn copy_allowed(app: &crate::App, shown: Option<&Target>) -> bool {
@@ -60,9 +61,9 @@ pub fn copy_allowed(app: &crate::App, shown: Option<&Target>) -> bool {
 }
 
 pub fn open(app: &mut crate::App) {
+    app.setup_open = true;
     choose(app, active(app));
     app.setup_choices = false;
-    app.setup_open = true;
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

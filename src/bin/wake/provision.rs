@@ -29,6 +29,26 @@ pub fn local(dir:&Path,data:&Path,expected_endpoint:Option<&str>,key:&str,projec
 #[cfg(test)]
 mod tests {
     #[test]
+    fn saved_identities_are_reused_only_for_the_selected_chat() {
+        use sha2::{Digest, Sha256};
+        let dir = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let origin = "http://127.0.0.1:1";
+        std::fs::write(data.path().join("endpoint.json"), serde_json::json!({"url":origin,"token":"fixture"}).to_string()).unwrap();
+        std::fs::write(data.path().join("admin-token"), "fixture").unwrap();
+        for (chat, digest, token) in [
+            ("default", Sha256::digest(b"board:neoism"), "legacy"),
+            ("two", Sha256::digest(b"board:neoism:two\0http://127.0.0.1:1"), "second"),
+        ] {
+            let path = dir.path().join(format!("agent-{digest:x}.json"));
+            let invite = serde_json::json!({"version":1,"project":"Team","endpoint":origin,"token":token,"expires_at":super::super::now()+600});
+            std::fs::write(&path, invite.to_string()).unwrap();
+            let key = super::super::store::binding_key("board", "neoism", chat).unwrap();
+            assert_eq!(super::local(dir.path(), data.path(), None, &key, "Team", "neoism").unwrap(), path);
+        }
+    }
+
+    #[test]
     fn changed_discovery_refused_before_provisioning() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("endpoint.json"), r#"{"url":"http://127.0.0.1:1","token":"fixture"}"#).unwrap();

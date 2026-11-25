@@ -749,8 +749,8 @@ fn agent_picker(app:&App)->El {
         let mut choices = col().w_full();
         for agent in setup_guide::Agent::ALL {
             choices = choices.child(choice_row(agent.name().into(),app.setup_agent==agent,move |a:&mut App| {
-                if a.setup_agent != agent { a.agent_wake = None; }
-                a.setup_agent = agent; a.setup_choices = false; a.home_copied = None;
+                if a.setup_agent != agent { a.setup_agent = agent; agent_wake::open(a); }
+                a.setup_choices = false; a.home_copied = None;
             }).key(format!("setup-agent-{}",agent.name())));
         }
         float_menu(app, "setup-agent", choices);
@@ -810,7 +810,7 @@ fn setup_drawer(app:&App, width: f32)->El {
     picker = picker.child(muted(&guide.instruction).wrap()).child(muted(config_hint).wrap());
     if target.is_some() { picker=picker.child(block("copy-mcp-config","Copy MCP config",guide.snippet)); }
     let supported = app.setup_agent != setup_guide::Agent::ClaudeDesktop;
-    let wake = if !supported || target.is_none() { el() } else if let Some(panel) = app.agent_wake.as_ref().filter(|p| p.matches_board(&wake_key)) { wake_view::body(app,&wake_key,panel) } else { let key=wake_key.clone(); row().child(dialog_action(button("Set up wake",move |a| if a.setup_open && a.setup_agent == agent && setup_guide::Guide::new(a).key == key { agent_wake::open(a); })).key("setup-wake")) };
+    let wake = if target.is_none() { el() } else if let Some(panel) = app.agent_wake.as_ref().filter(|p| p.matches_board(&wake_key)) { wake_view::body(app,&wake_key,panel) } else { let key=wake_key.clone(); row().child(dialog_action(button("Connected chats",move |a| if a.setup_open && a.setup_agent == agent && setup_guide::Guide::new(a).key == key { agent_wake::open(a); })).key("setup-wake")) };
     let cards=col().w_full().padding(16.).gap(12.)
         .child(board_picker).children((app.home_copied==Some("setup-unavailable")).then(|| muted("Not copied. Check the selected connection and its saved grant.").wrap()))
         .child(step("1","Connect MCP",&guide.intro,picker))

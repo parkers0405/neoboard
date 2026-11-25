@@ -9,19 +9,19 @@ mod neoism_pair;
 use clap::{Args, Subcommand};
 use rand::RngCore;
 use std::{env,path::{Path,PathBuf}};
-use store::{Binding,Pending,Source,transaction};
+use store::{Binding,Source,transaction};
 
 #[derive(Args)]
 pub struct Options { #[command(subcommand)] command: Command }
 #[derive(Args)]
 struct Scope {
     #[arg(long)] board_id: String,
+    #[arg(long, default_value=store::DEFAULT_CHAT)] chat_id: String,
     #[arg(long, value_parser=["neoism","claude","codex"])] harness: String,
 }
 impl Scope {
     fn key(&self)->Result<String,String>{
-        if self.board_id.is_empty() || self.board_id.len()>128 || matches!(self.board_id.as_str(),"."|"..") || !self.board_id.bytes().all(|c|c.is_ascii_alphanumeric() || b"-_.".contains(&c)){return Err("Invalid board ID".into());}
-        Ok(format!("{}:{}",self.board_id,self.harness))
+        store::binding_key(&self.board_id, &self.harness, &self.chat_id)
     }
 }
 #[derive(Subcommand)]
@@ -34,7 +34,11 @@ enum Command {
     On(Scope),
     /// Stop admitting new turns; leave an already reserved turn and all inbox messages alone.
     Off(Scope),
+    /// Remove only this local chat pairing. Does not revoke board membership.
+    Disconnect(Scope),
     Status(Scope),
+    /// List this board's paired chats as JSON, without credentials or local paths.
+    List { #[arg(long)] board_id: String },
     /// Explicitly request one diagnostic turn, without changing the automatic wake switch.
     Test(Scope),
     /// Acknowledge a single diagnostic nonce from the paired runtime's turn.
@@ -75,7 +79,7 @@ fn pair(dir:&Path,code:String,session:Option<String>,bin:Option<PathBuf>,workspa
     runtime::probe(&t,bearer.as_deref())?;inbox::poll(&source,0)?;
     transaction(dir,|s|{let p=s.pending.remove(&code).ok_or("Pairing code is no longer valid")?;
         if p.expires<=now(){return Err("Pairing code expired".into());}
-        let key=format!("{}:{}",source.board,source.harness);
+        let key=store::binding_key(&source.board,&source.harness,&source.chat_id)?;
         if s.bindings.contains_key(&key) || s.bindings.values().any(|b|duplicate(&b.source,&source)){return Err("This board actor is already paired. Give each dedicated conversation its own scoped actor.".into());}
         s.bindings.insert(key,Binding{source,target:t,bearer,enabled:false,watermark:0,uncertain:None,last:"Paired; no turn sent".into(),test:None});Ok(())})?;
     println!("Paired. Automatic wake is off. Choose Turn on when ready.");Ok(())
@@ -91,7 +95,9 @@ fn toggle(dir:&Path,key:&str,on:bool)->Result<(),String>{
     println!("{}",if on {"On. New and unread inbox notifications can wake this conversation."}else{"Off. Pairing and inbox preserved; a turn already in progress may finish."});Ok(())
 }
 pub fn run(options:Options)->Result<(),String>{
-    let dir=store::home()?;
+    run_in(options, store::home()?)
+}
+fn run_in(options:Options, dir:PathBuf)->Result<(),String>{
     match options.command {
         Command::Prepare{scope,project,invite,local_data_dir,local_endpoint,create_agent}=>{
             let key=scope.key()?;if !neochat::valid_project(&project){return Err("Invalid project".into());}
@@ -99,9 +105,8 @@ pub fn run(options:Options)->Result<(),String>{
             if transaction(&dir,|s|Ok(s.bindings.contains_key(&key)))?{return Err("Already paired; use On or Off".into());}
             let invite=if create_agent{provision::local(&dir,local_data_dir.as_deref().ok_or("Missing local data directory")?,local_endpoint.as_deref(),&key,&project,&scope.harness)?}else{invite.ok_or("Missing scoped invite")?};
             let (origin,actor)=inbox::identify(&invite,&project)?;
-            let source=Source{board:scope.board_id,project,invite,origin,actor,harness:scope.harness};let code=nonce();
-            transaction(&dir,|s|{if s.bindings.contains_key(&key)||s.bindings.values().any(|b|duplicate(&b.source,&source)){return Err("Already paired for this board actor; use On or Off".into());}
-                s.pending.retain(|_,p|p.expires>now() && !(p.source.board==source.board && p.source.harness==source.harness) && !duplicate(&p.source,&source));s.pending.insert(code.clone(),Pending{source,expires:now()+600});Ok(())})?;
+            let source=Source{board:scope.board_id,chat_id:scope.chat_id,project,invite,origin,actor,harness:scope.harness};let code=nonce();
+            transaction(&dir,|s|s.prepare(code.clone(),source,now()))?;
             println!("{} wake pair --code {}",quoted_exe()?,code);Ok(())
         },
         Command::Pair{code,request,session,executable,workspace,origin}=>{
@@ -109,10 +114,27 @@ pub fn run(options:Options)->Result<(),String>{
             let code=match code { Some(code)=>code, None=>transaction(&dir,|s|s.pending.keys().find(|code|request.as_deref()==Some(&format!("{:x}",Sha256::digest(code.as_bytes())))).cloned().ok_or("Pairing request not found on this device. Generate a fresh prompt in NeoBoard.".into()))? };
             pair(&dir,code,session,executable,workspace,origin)
         },
+        Command::List{board_id}=>{let rows=transaction(&dir,|s|s.list(&board_id))?;println!("{}",serde_json::Value::Array(rows));Ok(())},
         Command::Status(scope)=>{let key=scope.key()?;let text=transaction(&dir,|s|Ok(match s.bindings.get(&key){None=>"Not paired".to_string(),Some(b)=>format!("{} | @{} | {} | {}{}",if b.enabled{"On"}else{"Off"},b.source.actor,b.target.session,b.last,if b.uncertain.is_some(){" | Reserved; if interrupted, inspect session before wake resolve"}else{""})}))?;println!("{text}");Ok(())},
         Command::On(scope)=>toggle(&dir,&scope.key()?,true),Command::Off(scope)=>toggle(&dir,&scope.key()?,false),
+        Command::Disconnect(scope)=>{
+            let key=scope.key()?;
+            let _control=store::lock(&dir,"control.lock",true)?;
+            let binding=transaction(&dir,|s|s.bindings.get(&key).cloned().ok_or("Not paired".into()))?;
+            let _session=worker::session_lock(&dir,&binding)?;
+            let any=transaction(&dir,|s|{
+                s.bindings.remove(&key);
+                s.pending.retain(|_,p|!(p.source.board==scope.board_id && p.source.harness==scope.harness && p.source.chat_id==scope.chat_id));
+                Ok(s.bindings.values().any(|b|b.enabled))
+            })?;
+            if !any && binding.enabled { service::uninstall()?; }
+            println!("Not paired"); Ok(())
+        },
         Command::Test(scope)=>worker::test(&dir,&scope.key()?),Command::Run{once}=>worker::run(&dir,once),
         Command::Ack{code}=>transaction(&dir,|s|{let b=s.bindings.values_mut().find(|b|b.test.as_ref()==Some(&code)).ok_or("No pending test for this code")?;b.test=None;b.last="Test acknowledged by the conversation".into();println!("Acknowledged");Ok(())}),
         Command::Resolve(scope)=>{let key=scope.key()?;let b=transaction(&dir,|s|s.bindings.get(&key).cloned().ok_or("Not paired".into()))?;let _guard=worker::session_lock(&dir,&b)?;transaction(&dir,|s|{let b=s.bindings.get_mut(&key).ok_or("Not paired")?;if b.uncertain.take().is_none(){return Err("No uncertain delivery".into());}b.test=None;b.last="Operator skipped the uncertain delivery; not replayed".into();println!("Skipped without resending");Ok(())})}
     }
 }
+
+#[cfg(test)]
+mod chat_tests;

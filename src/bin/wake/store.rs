@@ -2,8 +2,23 @@ use super::runtime::Target;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fs::{self, File, OpenOptions}, io::Write, path::{Path, PathBuf}};
 
+pub const DEFAULT_CHAT: &str = "default";
+fn default_chat() -> String { DEFAULT_CHAT.into() }
+
+pub fn valid_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 128 && !matches!(id, "." | "..")
+        && id.bytes().all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))
+}
+
+pub fn binding_key(board: &str, harness: &str, chat: &str) -> Result<String, String> {
+    if !valid_id(board) { return Err("Invalid board ID".into()); }
+    if !valid_id(chat) { return Err("Invalid chat ID".into()); }
+    Ok(if chat == DEFAULT_CHAT { format!("{board}:{harness}") } else { format!("{board}:{harness}:{chat}") })
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Source {
+    #[serde(default = "default_chat")] pub chat_id: String,
     pub board: String, pub project: String, pub invite: PathBuf, pub origin: String, pub actor: String, pub harness: String,
 }
 #[derive(Serialize, Deserialize)]
@@ -15,6 +30,30 @@ pub struct Binding {
 }
 #[derive(Default, Serialize, Deserialize)]
 pub struct State { pub pending: BTreeMap<String, Pending>, pub bindings: BTreeMap<String, Binding> }
+
+impl State {
+    pub fn prepare(&mut self, code: String, source: Source, now: u64) -> Result<(), String> {
+        let key = binding_key(&source.board, &source.harness, &source.chat_id)?;
+        if self.bindings.contains_key(&key) || self.bindings.values().any(|b| super::duplicate(&b.source, &source)) {
+            return Err("Already paired for this board actor; use On or Off".into());
+        }
+        let same_chat = |s: &Source| s.board == source.board && s.harness == source.harness && s.chat_id == source.chat_id;
+        if self.pending.values().any(|p| p.expires > now && !same_chat(&p.source) && super::duplicate(&p.source, &source)) {
+            return Err("Another pairing request uses this scoped actor. Give each conversation its own actor.".into());
+        }
+        self.pending.retain(|_, p| p.expires > now && !same_chat(&p.source));
+        self.pending.insert(code, Pending { source, expires: now + 600 });
+        Ok(())
+    }
+
+    pub fn list(&self, board: &str) -> Result<Vec<serde_json::Value>, String> {
+        if !valid_id(board) { return Err("Invalid board ID".into()); }
+        Ok(self.bindings.values().filter(|b| b.source.board == board).map(|b| serde_json::json!({
+            "chat_id": b.source.chat_id, "harness": b.source.harness, "actor": b.source.actor,
+            "session": b.target.session, "enabled": b.enabled,
+        })).collect())
+    }
+}
 
 pub fn home() -> Result<PathBuf,String> {
     let p = std::env::var_os("NEOBOARD_WAKE_HOME").map(PathBuf::from).or_else(|| dirs::data_local_dir().map(|p| p.join("neoboard").join("wake"))).ok_or("Cannot locate user data directory")?;

@@ -21,11 +21,15 @@ const TEXT_LIMIT: usize = 16384;
 struct Args {
     /// Require board_id on every board call. The JSON object maps safe IDs to a public
     /// label and exactly one absolute invite or data_dir path. No fallback.
-    #[arg(long, value_name = "ABS FILE", conflicts_with_all = ["invite", "url", "token", "data_dir"])]
+    #[arg(long, value_name = "ABS FILE", conflicts_with_all = ["invite", "agent_invite", "url", "token", "data_dir"])]
     boards_file: Option<PathBuf>,
     /// Use this explicitly authorized saved board invite; never fall back to local discovery.
     #[arg(long, conflicts_with_all = ["url", "token", "data_dir"])]
     invite: Option<PathBuf>,
+    /// Use this dedicated agent grant, such as one created by wake setup. Unlike --invite it may
+    /// name a board on this machine by numeric loopback address. No fallback.
+    #[arg(long, value_name = "ABS FILE", conflicts_with_all = ["invite", "url", "token", "data_dir"])]
+    agent_invite: Option<PathBuf>,
     /// Remote endpoint (default: NEOCHAT_URL).
     #[arg(long)]
     url: Option<String>,
@@ -58,6 +62,11 @@ fn main() {
         let client = if let Some(path) = args.invite {
             let invite = neochat::invite_file::InviteFile::read(&path).unwrap_or_else(|reason| {
                 fail(&format!("Cannot use the selected board invite: {reason} Reopen NeoBoard Setup for that board."))
+            });
+            Client::new(&invite.endpoint, &invite.token, None)
+        } else if let Some(path) = args.agent_invite {
+            let invite = neochat::invite_file::InviteFile::read_agent(&path).unwrap_or_else(|reason| {
+                fail(&format!("Cannot use the selected agent grant: {reason} Set up wake again for that board."))
             });
             Client::new(&invite.endpoint, &invite.token, None)
         } else if let Some(path) = args.data_dir {

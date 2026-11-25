@@ -10,8 +10,12 @@ reply_id=$sid
 if test "$mode" = wrong; then reply_id=other; fi
 if test "$1" = --version; then test "$#" = 1; echo fixture; exit; fi
 if test "$1" = --resume; then
-    test "$#" = 6 && test "$2" = "$sid" && test "$3" = --print && test "$4" = --output-format && test "$5" = json || exit 2
-    printf %s "$6" >prompt
+    test "$#" -ge 7 && test "$2" = "$sid" && test "$3" = --print && test "$4" = --output-format && test "$5" = json || exit 2
+    shift 5
+    : >options
+    while test "$1" != --; do printf '%s\n' "$1" >>options; shift; test "$#" -ge 2 || exit 2; done
+    test "$#" = 2 || exit 2
+    printf %s "$2" >prompt
     case "$mode" in
         large) dd if=/dev/zero bs=65536 count=65; exit;;
         badjson) echo NOT-JSON; exit;;

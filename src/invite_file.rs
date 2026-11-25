@@ -31,6 +31,30 @@ mod tests {
         assert!(InviteFile::from_link(&link.replacen("https:", "http:", 1)).is_err());
         assert!(InviteFile::from_link(&link.replacen(&invite.expires_at.to_string(), "1", 1)).is_err());
     }
+
+    #[test]
+    fn agent_grants_also_accept_numeric_loopback_boards_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.json");
+        for (endpoint, shared, agent) in [
+            ("https://board.example/", true, true),
+            ("http://127.0.0.1:52258", false, true),
+            ("http://[::1]:52258/", false, true),
+            ("http://localhost:52258", false, false),
+            ("http://board.example/", false, false),
+            ("http://user@127.0.0.1:1/", false, false),
+            ("http://127.0.0.1:1/path", false, false),
+        ] {
+            let invite = InviteFile { project: Some("team".into()), version: 1, endpoint: endpoint.into(),
+                token: "key".into(), expires_at: crate::board::now() + 300 };
+            std::fs::write(&path, serde_json::to_vec(&invite).unwrap()).unwrap();
+            assert_eq!(InviteFile::read(&path).is_ok(), shared, "{endpoint}");
+            assert_eq!(InviteFile::read_agent(&path).is_ok(), agent, "{endpoint}");
+        }
+        let expired = InviteFile { project: None, version: 1, endpoint: "http://127.0.0.1:1".into(), token: "key".into(), expires_at: 1 };
+        std::fs::write(&path, serde_json::to_vec(&expired).unwrap()).unwrap();
+        assert!(InviteFile::read_agent(&path).is_err());
+    }
 }
 
 pub fn https_endpoint(endpoint: &str) -> Result<String, &'static str> {
@@ -38,6 +62,20 @@ pub fn https_endpoint(endpoint: &str) -> Result<String, &'static str> {
     if url.scheme() != "https" || url.host_str().is_none() || !url.username().is_empty()
         || url.password().is_some() || url.query().is_some() || url.fragment().is_some() {
         return Err("the sharing endpoint must be an HTTPS URL without credentials, query or fragment");
+    }
+    Ok(url.to_string())
+}
+
+/// A dedicated agent grant may also name a board on this machine: plain HTTP is
+/// accepted only for a numeric loopback address, never a hostname.
+pub fn agent_endpoint(endpoint: &str) -> Result<String, &'static str> {
+    if let Ok(url) = https_endpoint(endpoint) { return Ok(url); }
+    let refused = "the agent endpoint must be HTTPS, or HTTP on a numeric loopback address";
+    let url = Url::parse(endpoint).map_err(|_| refused)?;
+    let local = url.host_str().unwrap_or("").trim_matches(['[', ']']).parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
+    if url.scheme() != "http" || !local || !url.username().is_empty() || url.password().is_some()
+        || url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
+        return Err(refused);
     }
     Ok(url.to_string())
 }
@@ -109,7 +147,17 @@ impl InviteFile {
         Ok(())
     }
 
-    pub fn read(path: &Path) -> Result<Self, String> {
+    pub fn read(path: &Path) -> Result<Self, String> { Self::load(path)?.validate() }
+
+    /// Read a dedicated agent grant, which may point at a board on this machine.
+    pub fn read_agent(path: &Path) -> Result<Self, String> {
+        let mut invite = Self::load(path)?;
+        invite.check()?;
+        invite.endpoint = agent_endpoint(&invite.endpoint)?;
+        Ok(invite)
+    }
+
+    fn load(path: &Path) -> Result<Self, String> {
         if !path.is_absolute() || !std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file()) {
             return Err("Choose a regular invite file by its absolute path.".into());
         }
@@ -118,17 +166,22 @@ impl InviteFile {
         let mut data = Vec::new();
         file.take(8193).read_to_end(&mut data).map_err(|_| "Could not read the invite file.")?;
         if data.len() > 8192 { return Err("Invite file is too large.".into()); }
-        serde_json::from_slice::<Self>(&data).map_err(|_| "Invalid Neoboard invite file.")?.validate()
+        serde_json::from_slice::<Self>(&data).map_err(|_| "Invalid Neoboard invite file.".into())
     }
 
     pub(crate) fn validate(mut self) -> Result<Self, String> {
+        self.check()?;
+        self.endpoint = https_endpoint(&self.endpoint)?;
+        Ok(self)
+    }
+
+    fn check(&self) -> Result<(), String> {
         if self.version != 1 { return Err("Unsupported Neoboard invite version.".into()); }
         if self.expires_at <= crate::board::now() { return Err("This invite has expired.".into()); }
         if self.project.as_deref().is_some_and(|id| !crate::valid_project(id)) { return Err("Invalid board in invite.".into()); }
         if self.token.is_empty() || self.token.len() > 512 || !self.token.bytes().all(|c| c.is_ascii_graphic()) {
             return Err("Invalid invite key.".into());
         }
-        self.endpoint = https_endpoint(&self.endpoint)?;
-        Ok(self)
+        Ok(())
     }
 }

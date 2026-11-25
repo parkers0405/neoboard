@@ -29,6 +29,17 @@ pub enum Outcome {
     Uncertain,
 }
 
+/// Claude Code only. A `--print` turn cannot answer permission prompts and the
+/// user's own MCP entries may act as someone else, so attach the paired actor's
+/// grant under a fixed name and pre-approve exactly `allow`, nothing broader.
+pub struct Access {
+    pub adapter: PathBuf,
+    pub grant: PathBuf,
+    pub allow: Vec<String>,
+}
+
+pub const CONNECTION: &str = "neoboard-wake";
+
 const LIMIT: u64 = 4 * 1024 * 1024;
 const SHORT: Duration = Duration::from_secs(10);
 const TURN: Duration = Duration::from_secs(300);
@@ -179,7 +190,8 @@ fn runtime_command(t: &Target) -> Result<Command, ()> {
     cmd.current_dir(&t.workspace).env_clear();
     // Allowlist rather than guessing all current/future board credential names.
     // Runtime credentials are managed by the selected CLI's own profile.
-    for k in ["HOME", "PATH", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "USERPROFILE", "APPDATA",
+    // USER is required: without it Claude Code cannot find its macOS keychain login.
+    for k in ["HOME", "USER", "LOGNAME", "PATH", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "USERPROFILE", "APPDATA",
         "LOCALAPPDATA", "SystemRoot", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME",
         "CODEX_HOME", "CLAUDE_CONFIG_DIR"] {
         if let Some(v) = std::env::var_os(k) { cmd.env(k, v); }
@@ -191,14 +203,30 @@ fn runtime_command(t: &Target) -> Result<Command, ()> {
     Ok(cmd)
 }
 
-fn cli(t: &Target, prompt: Option<&str>, timeout: Duration) -> Result<(), ()> {
+fn claude_access(a: &Access) -> Result<(String, &[String]), ()> {
+    check_path(&a.adapter, true).map_err(|_| ())?;
+    if !a.grant.is_absolute() || a.allow.iter().any(|rule| rule.is_empty() || rule.starts_with('-') || rule.chars().any(char::is_control)) { return Err(()); }
+    let (adapter, grant) = (a.adapter.to_str().ok_or(())?, a.grant.to_str().ok_or(())?);
+    Ok((json!({"mcpServers":{CONNECTION:{"command":adapter,"args":["--agent-invite",grant]}}}).to_string(), &a.allow))
+}
+
+fn cli(t: &Target, prompt: Option<&str>, access: Option<&Access>, timeout: Duration) -> Result<(), ()> {
     let deadline = Instant::now() + timeout;
     let mut cmd = runtime_command(t)?;
     let rpc = prompt.is_some() && t.harness == "codex";
     match prompt {
         None => { cmd.arg("--version"); }
         Some(_) if rpc => { cmd.arg("app-server"); }
-        Some(text) => { cmd.args(["--resume", &t.session, "--print", "--output-format", "json", text]); }
+        Some(text) => {
+            cmd.args(["--resume", &t.session, "--print", "--output-format", "json"]);
+            if let Some(access) = access {
+                let (config, allow) = claude_access(access)?;
+                cmd.arg("--mcp-config").arg(config);
+                if !allow.is_empty() { cmd.arg("--allowedTools").args(allow); }
+            }
+            // Both options above take a list; end it so the prompt is never read as a value.
+            cmd.arg("--").arg(text);
+        }
     }
     let mut child = cmd.stdin(if rpc { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped()).stderr(Stdio::null()).spawn().map_err(|_| ())?;
@@ -236,12 +264,12 @@ fn cli(t: &Target, prompt: Option<&str>, timeout: Duration) -> Result<(), ()> {
     Err(())
 }
 
-pub fn send(t: &Target, prompt: &str, neoism_token: Option<&str>) -> Outcome {
+pub fn send(t: &Target, prompt: &str, neoism_token: Option<&str>, access: Option<&Access>) -> Outcome {
     if validate(t).is_err() || prompt.trim().is_empty() || prompt.len() > 16 * 1024 || prompt.starts_with('-') || prompt.contains('\0') {
         return Outcome::Uncertain;
     }
     if t.harness == "neoism" { neoism(t, neoism_token, Some(prompt)).unwrap_or(Outcome::Uncertain) }
-    else if cli(t, Some(prompt), TURN).is_ok() { Outcome::Accepted }
+    else if cli(t, Some(prompt), access.filter(|_| t.harness == "claude"), TURN).is_ok() { Outcome::Accepted }
     else { Outcome::Uncertain }
 }
 
@@ -249,7 +277,7 @@ pub fn send(t: &Target, prompt: &str, neoism_token: Option<&str>) -> Outcome {
 /// For Neoism, requires the authenticated GET to return the exact session ID.
 pub fn probe(t: &Target, neoism_token: Option<&str>) -> Result<(), String> {
     validate(t)?;
-    if t.harness == "neoism" { neoism(t, neoism_token, None).map(|_| ()) } else { cli(t, None, SHORT) }
+    if t.harness == "neoism" { neoism(t, neoism_token, None).map(|_| ()) } else { cli(t, None, None, SHORT) }
         .map_err(|_| "runtime probe not confirmed".into())
 }
 

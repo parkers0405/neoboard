@@ -100,6 +100,10 @@ pub(super) fn on_message(tx: &Transaction<'_>, cursor: u64, actor: &str, m: &Mes
             }
         }
     }
+    let assignee = m.task.as_ref().and_then(|t| t.assignee.as_deref());
+    if let Some(to) = assignee.filter(|to| *to != actor && Some(*to) != prev.as_ref().and_then(|p|p.task.as_ref()?.assignee.as_deref())) {
+        recipients.insert(to.to_owned(), "assigned");
+    }
     if let Some(reason) = transition(m,prev.as_ref()) {
         let rows = tx.prepare("SELECT c.actor FROM subscriptions s JOIN credentials c ON c.id=s.credential WHERE thread=?1 AND kind=?2 AND (author='' OR author=?3) AND after_cursor<?4")?.query_map(params![m.parent.unwrap_or(m.id),reason,m.author,cursor],|r|r.get::<_,String>(0))?;
         for row in rows { recipients.entry(row?).or_insert(reason); }
@@ -258,6 +262,19 @@ async fn cancel(State(board):State<Board>, headers:HeaderMap, Path(id):Path<u64>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn assignment_notifies_only_the_new_actor_once() {
+        let dir=tempfile::tempdir().unwrap(); let token=random_token(); let admin=random_token();
+        let board=Board::open(dir.path().join("board.sqlite3"),&token,&admin).unwrap();
+        for actor in ["one","two","other"] { board.create_invite(&admin,InviteRequest{actor:actor.into(),channels:vec![],expires_at:None}).unwrap(); }
+        board.action(&token,None,None,Action::Post{channel:"general".into(),text:"Review @one".into(),task:true,labels:Default::default(),needs:vec![],assignee:Some("one".into())}).unwrap();
+        let id=board.snapshot(&token).unwrap().messages[0].id;
+        for to in [Some("two"),Some("two"),None] { board.action(&token,None,None,Action::Assign{id,assignee:to.map(str::to_owned)}).unwrap(); }
+        let db=board.lock().unwrap(); let mut query=db.prepare("SELECT c.actor,i.reason FROM inbox i JOIN credentials c ON i.credential=c.id ORDER BY i.event").unwrap();
+        let results=query.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).unwrap().collect::<std::result::Result<Vec<_>,_>>().unwrap();
+        assert_eq!(results,vec![("one".into(),"assigned".into()),("two".into(),"assigned".into())]);
+    }
 
     #[test]
     fn delivery_failure_rolls_back_source_and_partial_fanout() {

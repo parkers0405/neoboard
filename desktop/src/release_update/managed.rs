@@ -29,7 +29,7 @@ impl Installer {
         format!("{RELEASES}/download/{}/{}", release.tag(), self.filename())
     }
 
-    pub(super) fn start(self, release: &Release) -> Result<String> {
+    pub(super) fn start(self, release: &Release, verified: impl FnOnce()) -> Result<()> {
         let client = Client::builder().https_only(true).timeout(Duration::from_secs(300))
             .user_agent("neoboard-desktop-update")
             .redirect(Policy::custom(|a| {
@@ -40,10 +40,19 @@ impl Installer {
             let response = client.get(url).send()?.error_for_status()?;
             if response.status() != reqwest::StatusCode::OK { return Err("unexpected release response".into()); }
             Ok(response)
-        }, |path| self.launch(path))
+        }, |path| {
+            verified();
+            match self {
+                #[cfg(windows)]
+                Self::Msi => super::windows::apply(path),
+                #[cfg(target_os = "macos")]
+                Self::Dmg => super::macos::apply(path, &release.version),
+                _ => Err(format!("No installer for {} on this platform", path.display()).into()),
+            }
+        })
     }
 
-    fn handoff<R: Read>(self, release: &Release, mut fetch: impl FnMut(String) -> Result<R>, launch: impl FnOnce(&Path) -> Result<()>) -> Result<String> {
+    fn handoff<R: Read>(self, release: &Release, mut fetch: impl FnMut(String) -> Result<R>, launch: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
         let url = self.url(release);
         let mut sidecar = String::new();
         fetch(format!("{url}.sha256"))?.take(1025).read_to_string(&mut sidecar)?;
@@ -58,34 +67,10 @@ impl Installer {
         let path = dir.path().join(self.filename());
         stage_verified(fetch(url)?, &path, expected, MAX_BYTES)?;
         launch(&path)?;
-        // The external installer may outlive this desktop and still need the file.
+        // The Windows helper consumes the verified MSI after the desktop exits.
+        #[cfg(windows)]
         let _ = dir.keep();
-        Ok(format!("Verified installer: {}. You can delete it after the upgrade.", path.display()))
-    }
-
-    fn launch(self, path: &Path) -> Result<()> {
-        match self {
-            #[cfg(windows)]
-            Self::Msi => {
-                use std::{ffi::OsString, os::windows::ffi::OsStringExt, path::PathBuf};
-                use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
-                let mut buf = [0; 32768];
-                // Do not search PATH or the working directory for msiexec.exe.
-                let n = unsafe { GetSystemDirectoryW(buf.as_mut_ptr(), buf.len() as u32) } as usize;
-                if n == 0 || n >= buf.len() { return Err("cannot locate Windows Installer".into()); }
-                let system = PathBuf::from(OsString::from_wide(&buf[..n]));
-                std::process::Command::new(system.join("msiexec.exe")).arg("/i").arg(path).arg("/norestart").spawn()?;
-                Ok(())
-            }
-            #[cfg(target_os = "macos")]
-            Self::Dmg => {
-                if !std::process::Command::new("/usr/bin/hdiutil").args(["attach", "-readonly", "-autoopen"]).arg(path).status()?.success() {
-                    return Err("could not open the verified disk image".into());
-                }
-                Ok(())
-            }
-            _ => Err(format!("no installer handoff for {} on this platform", path.display()).into()),
-        }
+        Ok(())
     }
 }
 
@@ -146,6 +131,7 @@ mod tests {
                 assert_eq!(result.is_ok(), valid);
                 assert_eq!(launched.is_some(), valid);
                 assert_eq!(urls.len(), if sidecar == "bad" { 1 } else { 2 });
+                #[cfg(windows)]
                 if let Some(path) = launched { fs::remove_dir_all(path.parent().unwrap()).unwrap(); }
             }
         }

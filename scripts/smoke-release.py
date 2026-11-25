@@ -35,11 +35,11 @@ def run(*cmd, **kwargs):
     return subprocess.run(cmd, check=True, timeout=30, capture_output=True, text=True, **kwargs).stdout
 
 
-def check_windows_subsystems(bundle):
+def check_windows_subsystems(folder):
     # Check the linker output, not the Rust source. The PE32/PE32+ optional
     # headers both put Subsystem at offset 68, after the signature + COFF header.
     for name in ('neochat-desktop', 'neoboard', 'neochat', 'neochatd', 'neochat-mcp', 'neochat-share'):
-        with bundle.open(name + '.exe') as exe:
+        with (folder / (name + '.exe')).open('rb') as exe:
             if exe.read(2) != b'MZ':
                 raise ValueError(f'{name}: missing DOS header')
             exe.seek(0x3c)
@@ -62,22 +62,24 @@ def check_windows_subsystems(bundle):
                 raise ValueError(f'{name}: expected PE subsystem {expected}, got {actual}')
 
 
-def smoke_zip(archive):
-    with tempfile.TemporaryDirectory() as tmp, zipfile.ZipFile(archive) as bundle:
+def smoke_native(artifact, installed=False):
+    with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp).resolve()
         suffix = '.exe' if os.name == 'nt' else ''
-        if os.name == 'nt':
-            check_windows_subsystems(bundle)
-            desktop = bundle.extract('neochat-desktop.exe', root)
+        folder = Path(artifact).resolve() if installed else root
+        daemon, client = [folder / (name + suffix) for name in ('neochatd', 'neochat')]
+        if installed:
+            check_windows_subsystems(folder)
+            desktop = folder / 'neochat-desktop.exe'
             help_text = subprocess.run([desktop, '--help'], check=True, capture_output=True, timeout=30).stdout
             if b'--data-dir' not in help_text:
                 raise RuntimeError('GUI desktop lost redirected --help output')
-        daemon, client = [root / (name + suffix) for name in ('neochatd', 'neochat')]
-        for path in (daemon, client):
-            info = bundle.getinfo(path.name)
-            bundle.extract(info, root)
-            if os.name != 'nt':
-                path.chmod((info.external_attr >> 16) & 0o777)
+        else:
+            with zipfile.ZipFile(artifact) as bundle:
+                for path in (daemon, client):
+                    info = bundle.getinfo(path.name)
+                    bundle.extract(info, root)
+                    path.chmod((info.external_attr >> 16) & 0o777)
         env = {k: v for k, v in os.environ.items() if not k.upper().startswith('NEOCHAT_')}
         env.update(NEOCHAT_DATA_DIR=str(root / 'data'), NEOCHAT_BIND='127.0.0.1:0',
                    HOME=tmp, USERPROFILE=tmp, APPDATA=tmp, LOCALAPPDATA=tmp,
@@ -134,17 +136,19 @@ def smoke_image(image):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode', choices=('zip', 'image', 'windows-pe'),
-                        help='windows-pe checks the Windows ZIP on any host without running a binary')
+    parser.add_argument('mode', choices=('zip', 'installed', 'image', 'windows-pe'),
+                        help='windows-pe checks a Windows installation directory without running a binary')
     parser.add_argument('artifact')
     args = parser.parse_args()
     if args.mode == 'windows-pe':
-        with zipfile.ZipFile(args.artifact) as bundle:
-            check_windows_subsystems(bundle)
+        check_windows_subsystems(Path(args.artifact))
         print('Verified Windows PE subsystems: desktop GUI (2); all five console tools CUI (3)')
         raise SystemExit(0)
     try:
-        (smoke_zip if args.mode == 'zip' else smoke_image)(args.artifact)
+        if args.mode == 'image':
+            smoke_image(args.artifact)
+        else:
+            smoke_native(args.artifact, installed=args.mode == 'installed')
     except subprocess.CalledProcessError as exc:
         raise SystemExit(f'{exc}: {exc.stderr}') from exc
     print('Packaged write/restart/read passed:', args.artifact)

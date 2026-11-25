@@ -22,10 +22,10 @@ fn fixture(ext: &str, last: &str) -> File {
 
 #[test]
 fn release_contract() {
+    assert!(asset("windows", "x86_64").unwrap_err().to_string().contains("NeoBoard-x86_64.msi"));
     for (os, arch, expected, ext) in [
         ("linux", "x86_64", "linux-x86_64", ""),
         ("macos", "aarch64", "darwin-aarch64", ""),
-        ("windows", "x86_64", "windows-x86_64", ".exe"),
     ] {
         assert_eq!(asset(os, arch).unwrap(), format!("neoboard-{expected}.zip"));
         let dir = tempfile::tempdir().unwrap();

@@ -1012,19 +1012,19 @@ fn update_layer(app: &App, viewport: [f32; 2]) -> Option<El> {
         Stage::Checking => ("Checking for updates", "Contacting GitHub Releases…".into()),
         Stage::Notice(detail) => ("Check for updates",detail.clone()),
         Stage::ManualRelease(version, _) => ("Update available", format!("Neoboard {version} is available. No automatic update is available for this installation. View the official release for manual options. Before upgrading a host, stop its daemon and back up the entire data directory.")),
-        Stage::Offer(version, action) => ("Update available", format!("Neoboard {version} is available. {}", action.instructions())),
-        Stage::Running => ("Preparing update", "The updater is working. It does not report progress.".into()),
-        Stage::HandedOff(installer, detail) => (match installer { release_update::Installer::Msi => "Windows Installer started", release_update::Installer::Dmg => "Disk image opened" }, format!("Finish the upgrade outside NeoBoard. Installation is not confirmed. {}\n\n{detail}", release_update::RECONNECT)),
+        Stage::Offer(version, action) => ("Update NeoBoard", format!("Version {} → {version}\n\n{}", env!("CARGO_PKG_VERSION"), action.instructions())),
+        Stage::Running(detail) => ("Updating NeoBoard", (*detail).into()),
         Stage::Finished(Ok(detail)) if cfg!(windows) => ("Update staged", format!("Your running installation has not been replaced. After switching, point MCP clients to the new bundle. {}\n\n{detail}", release_update::RECONNECT)),
         Stage::Finished(Ok(detail)) => ("Updater finished", format!("Finish your drafts before restarting Neoboard and its services.\n\n{detail}")),
         Stage::Finished(Err(error)) => ("Update not confirmed", format!("{error}\n\nKeep your drafts. Check the installation before retrying. {}", release_update::RECONNECT)),
     };
     let mut body = col().w_full().padding(20.).gap(12.).child(label(title).font(TextStyle::new(16.,600.))).child(muted(detail).wrap());
-    if matches!(app.release.stage, Stage::Running) {
+    if matches!(app.release.stage, Stage::Running(_)) {
         body = body.child(el().key("update-indeterminate").w(160.).h(5.).radius(2.).fill(gray(53))
             .child(el().absolute(112.*app.release.pulse,0.).w(48.).h(5.).radius(2.).fill(gray(200))));
     } else {
-        let mut actions = row().gap(8.).child(dialog_action(button("Dismiss", |a| a.release.dismiss())));
+        let dismiss = if matches!(app.release.stage, Stage::Offer(..)) { "Not now" } else { "Close" };
+        let mut actions = row().gap(8.).child(dialog_action(button(dismiss, |a| a.release.dismiss())));
         if let Stage::Offer(_, action) = app.release.stage {
             actions = actions.child(solid(filled(action.label(), |a| a.release.accept()).key("start-update")));
         } else if let Stage::ManualRelease(_, url) = &app.release.stage {

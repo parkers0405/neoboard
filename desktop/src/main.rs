@@ -878,7 +878,7 @@ fn main() {
             ("settings", |a| {fixture::load(a,true); a.dialog=Some(Dialog::Settings);}),
             ("update-offer", |a| {fixture::load(a,true); a.release.stage=release_update::Stage::Offer(semver::Version::new(1,2,0), release_update::Update::Portable);}),
             ("update-msi", |a| {fixture::load(a,true); a.dialog=Some(Dialog::Settings); a.release.stage=release_update::Stage::Offer(semver::Version::new(1,2,0), release_update::Update::Managed(release_update::Installer::Msi));}),
-            ("update-running", |a| {fixture::load(a,true); a.release.stage=release_update::Stage::Running;}),
+            ("update-running", |a| {fixture::load(a,true); a.release.stage=release_update::Stage::Running("Downloading and verifying the release…");}),
             ("personal", |a| {fixture::load(a,true);a.personal.desired=Some("Sam Lee".into());a.open_personal();a.dialog=Some(Dialog::Personal);}),
             ("task-filters", |a| {fixture::load(a,true);a.dialog=Some(Dialog::Filters);}),
             ("task-status-menu", |a| { fixture::load(a,true); a.dialog = Some(Dialog::Filters); a.details_picker = Some("filter-status"); }),

@@ -26,7 +26,7 @@ fn asset(os: &str, arch: &str) -> Result<&'static str> {
     match (os, arch) {
         ("linux", "x86_64") => Ok("neoboard-linux-x86_64.zip"),
         ("macos", "aarch64") => Ok("neoboard-darwin-aarch64.zip"),
-        ("windows", "x86_64") => Ok("neoboard-windows-x86_64.zip"),
+        ("windows", "x86_64") => Err("Windows releases use NeoBoard-x86_64.msi. Use the installed desktop updater or download the MSI from GitHub Releases.".into()),
         _ => Err("no release bundle for this platform".into()),
     }
 }

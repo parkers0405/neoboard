@@ -78,10 +78,8 @@ jobs:
           fi
       - run: python scripts/package-release.py ${{ matrix.asset }}
       - name: Write, restart and read using binaries from the release ZIP
+        if: runner.os != 'Windows'
         run: python scripts/smoke-release.py zip dist/neoboard-${{ matrix.asset }}.zip
-      - if: runner.os == 'Windows'
-        shell: pwsh
-        run: ./scripts/build-msi.ps1
       - uses: actions/upload-artifact@v4
         with:
           name: neoboard-${{ matrix.asset }}
@@ -117,9 +115,11 @@ jobs:
           TAG: ${{ inputs.release_tag || github.ref_name }}
         working-directory: dist
         run: |
-          for asset in neoboard-linux-x86_64.{zip,tar.gz} neoboard-darwin-aarch64.{zip,tar.gz,dmg} neoboard-windows-x86_64.zip NeoBoard-x86_64.msi; do
+          assets=()
+          for asset in neoboard-linux-x86_64.{zip,tar.gz} neoboard-darwin-aarch64.{zip,tar.gz,dmg} NeoBoard-x86_64.msi; do
             test -s "$asset"
             sha256sum --check "$asset.sha256"
+            assets+=("$asset" "$asset.sha256")
           done
-          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --draft --title "NeoBoard $TAG" --notes 'Before upgrading a host, stop the daemon and back up the entire data directory while it is stopped. For an installer-managed installation, upgrade with the matching installer, not the portable updater. On macOS Apple Silicon, open the DMG and drag NeoBoard to Applications. On Windows x86-64, run the MSI. On Linux x86-64, extract the tarball and run neochat-desktop. Portable archives and SHA-256 checksums are provided.' *.dmg *.msi *.tar.gz *.zip *.sha256
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --draft --title "NeoBoard $TAG" --notes 'Before upgrading a host, stop the daemon and back up the entire data directory while it is stopped. For a new installation, use the MSI on Windows x86-64, the DMG on macOS Apple Silicon, or the tarball on Linux x86-64. Portable archives are available for Linux and macOS only.' "${assets[@]}"
           gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest

@@ -1,5 +1,9 @@
 //! A check only offers an action. Only local consent can release its worker.
 mod managed;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(windows)]
+mod windows;
 pub use managed::Installer;
 use std::{fs, io::Read, path::{Path, PathBuf}, process::Stdio, sync::mpsc, time::Duration};
 #[cfg(unix)]
@@ -170,16 +174,14 @@ pub enum Update { Portable, Managed(Installer) }
 impl Update {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Managed(Installer::Msi) => "Start MSI update",
-            Self::Managed(Installer::Dmg) => "Open release DMG",
-            Self::Portable if cfg!(unix) => "Update and reopen",
+            Self::Managed(_) => "Update and restart",
+            Self::Portable if cfg!(unix) => "Update and restart",
             Self::Portable => "Stage update",
         }
     }
     pub fn instructions(self) -> &'static str {
         match self {
-            Self::Managed(Installer::Msi) => "Save your work. If you host a board, stop its daemon and back up the entire data directory first. Start the update to download and verify the MSI, then follow Windows Installer.",
-            Self::Managed(Installer::Dmg) => "Save your work. If you host a board, stop its daemon and back up the entire data directory first. Open the verified disk image, quit NeoBoard and drag the new app to Applications.",
+            Self::Managed(_) => "Save your drafts before restarting. NeoBoard will verify the download, install it, and reopen. If you host a board, stop its daemon and back up its data first.",
             Self::Portable if cfg!(unix) => "Finish your drafts first. Updating will reopen the installed desktop. Reconnect external MCP clients after updating.",
             Self::Portable => "The update will stage a separate bundle. Switch paths and reconnect external MCP clients manually.",
         }
@@ -187,7 +189,7 @@ impl Update {
 }
 
 #[derive(Default)]
-pub enum Stage { #[default] Hidden, Checking, Notice(String), ManualRelease(Version, String), Offer(Version, Update), Running, HandedOff(Installer, String), Finished(Result<String, String>) }
+pub enum Stage { #[default] Hidden, Checking, Notice(String), ManualRelease(Version, String), Offer(Version, Update), Running(&'static str), Finished(Result<String, String>) }
 
 #[derive(Default)]
 pub struct Session {
@@ -227,7 +229,8 @@ impl Session {
             let latest = latest();
             if !manual && !latest.as_ref().is_some_and(|r| r.version.cmp_precedence(&current).is_gt()) { return None; }
             let action = match (std::env::consts::OS, std::env::consts::ARCH, managed) {
-                ("macos", "aarch64", _) | ("windows" | "linux", "x86_64", _) =>
+                ("windows", "x86_64", installer) => installer.map(Update::Managed),
+                ("macos", "aarch64", _) | ("linux", "x86_64", _) =>
                     managed.map(Update::Managed).or_else(||exe.as_ref().map(|_|Update::Portable)),
                 _ => None,
             };
@@ -243,8 +246,12 @@ impl Session {
             wait.recv().ok()?;
             let result = match action? {
                 Update::Portable => Stage::Finished(install(&exe?)),
-                Update::Managed(installer) => match installer.start(&latest?) {
-                    Ok(detail) => Stage::HandedOff(installer, detail),
+                Update::Managed(installer) => match installer.start(&latest?, || {
+                    let _ = send.send(Stage::Running("Download verified. Installing the update…"));
+                    wake();
+                }) {
+                    // The platform helper now owns installation and relaunch.
+                    Ok(()) => std::process::exit(0),
                     Err(e) => Stage::Finished(Err(e.to_string())),
                 },
             };
@@ -256,12 +263,15 @@ impl Session {
         else if manual {self.stage=Stage::Notice("Could not start the update check.".into());}
     }
     pub fn accept(&mut self) {
-        if !matches!(self.stage, Stage::Offer(..)) { return; }
-        self.stage = if self.consent.take().is_some_and(|tx| tx.send(()).is_ok()) { Stage::Running }
+        let Stage::Offer(_, action) = self.stage else { return; };
+        self.stage = if self.consent.take().is_some_and(|tx| tx.send(()).is_ok()) { Stage::Running(match action {
+            Update::Managed(_) => "Downloading and verifying the release…",
+            Update::Portable => "Preparing the new desktop bundle…",
+        }) }
             else { Stage::Finished(Err("No packaged updater is available.".into())) };
     }
     pub fn dismiss(&mut self) {
-        if matches!(self.stage, Stage::Running) { return; }
+        if matches!(self.stage, Stage::Running(_)) { return; }
         self.consent = None;
         self.inbox = None;
         self.stage = Stage::Hidden;
@@ -273,7 +283,7 @@ impl Session {
                 Ok(stage) => { self.stage = stage; changed = true; }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.inbox = None;
-                    if matches!(self.stage, Stage::Running) {
+                    if matches!(self.stage, Stage::Running(_)) {
                         self.stage = Stage::Finished(Err("The updater stopped without a result.".into()));
                         changed = true;
                     }
@@ -281,7 +291,7 @@ impl Session {
                 _ => {}
             }
         }
-        if matches!(self.stage, Stage::Running) {
+        if matches!(self.stage, Stage::Running(_)) {
             self.pulse = (seconds * 3.).sin() as f32 * 0.5 + 0.5;
             tx.wake_after(Duration::from_millis(60));
             changed = true;
@@ -420,7 +430,7 @@ mod tests {
         assert_eq!(rx.try_iter().count(), 1);
         rt.state.release.accept();
         assert_eq!(rx.try_iter().count(), 0);
-        assert!(matches!(rt.state.release.stage, Stage::Running));
+        assert!(matches!(rt.state.release.stage, Stage::Running(_)));
         assert_eq!(rt.state.draft.text, "unsent");
     }
 

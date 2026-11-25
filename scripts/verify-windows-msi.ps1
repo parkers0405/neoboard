@@ -2,7 +2,7 @@
 # For the separate interactive/token check see docs/windows-msi-smoke.md.
 param(
     [string]$Msi = "$PSScriptRoot/../dist/NeoBoard-x86_64.msi",
-    [string]$Zip = "$PSScriptRoot/../dist/neoboard-windows-x86_64.zip"
+    [Parameter(Mandatory)][string]$Payload
 )
 $ErrorActionPreference = 'Stop'
 $Msi = (Resolve-Path -LiteralPath $Msi).Path
@@ -73,23 +73,23 @@ try {
     [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($installer)
 }
 
-$reference = Join-Path $work 'reference'
-Expand-Archive -LiteralPath $Zip -DestinationPath $reference
 Assert-NoDesktop 'before install; use a clean runner'
 Invoke-Installer i install
 try {
     Assert-NoDesktop 'after quiet install'
-    $expected = @(Get-ChildItem -LiteralPath $reference -Force)
+    $expected = @(Get-ChildItem -LiteralPath $Payload -Force)
     $actual = @(Get-ChildItem -LiteralPath $install -Force)
-    if (Compare-Object $expected.Name $actual.Name) { throw 'Installed file list differs from the release ZIP' }
+    if (Compare-Object $expected.Name $actual.Name) { throw 'Installed file list differs from the MSI payload' }
     foreach ($file in $expected) {
         $installedFile = Join-Path $install $file.Name
         if ((Get-FileHash -LiteralPath $installedFile).Hash -ne (Get-FileHash -LiteralPath $file.FullName).Hash) {
-            throw "Installed file differs from ZIP: $($file.Name)"
+            throw "Installed file differs from MSI payload: $($file.Name)"
         }
     }
     & "$install/neoboard.exe" --version
     if ($LASTEXITCODE -ne 0) { throw 'Installed CLI smoke test failed' }
+    python "$PSScriptRoot/smoke-release.py" installed $install
+    if ($LASTEXITCODE -ne 0) { throw 'Installed Windows release smoke test failed' }
     Invoke-Installer fa repair
     Assert-NoDesktop 'after quiet repair'
 } finally {

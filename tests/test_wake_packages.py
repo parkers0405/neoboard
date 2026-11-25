@@ -40,6 +40,14 @@ class WakePackages(unittest.TestCase):
                     dest.write_bytes((ROOT / source).read_bytes())
 
                 def mac_tool(cmd, *, check):
+                    if os_name == 'Windows':
+                        payload = Path(cmd[cmd.index('-Payload') + 1])
+                        wix = ET.parse(ROOT / 'scripts/neoboard.wxs')
+                        expected = {f.get('Name') for f in wix.findall(".//{*}ComponentGroup[@Directory='INSTALLFOLDER']/{*}Component/{*}File")}
+                        self.assertEqual({p.name for p in payload.iterdir()}, expected)
+                        for name in NAMES:
+                            self.assertEqual((payload / (name + '.exe')).read_bytes(), name.encode())
+                        return
                     if cmd[:2] == ['hdiutil', 'create']:
                         contents = Path(cmd[cmd.index('-srcfolder') + 1]) / 'NeoBoard.app/Contents'
                         entry = plistlib.loads((contents / 'Info.plist').read_bytes())['CFBundleExecutable']
@@ -56,22 +64,18 @@ class WakePackages(unittest.TestCase):
                     PACKAGE(asset)
 
                 archive = Path('dist', f'neoboard-{asset}.zip')
+                if os_name == 'Windows':
+                    self.assertFalse(list(Path('dist').glob('*.zip*')))
+                    continue
                 with zipfile.ZipFile(archive) as z:
                     for name in ('neochat-desktop', 'neoboard'):
                         self.assertEqual(z.read(name + suffix), name.encode())
-                if os_name == 'Windows':
-                    wix = ET.parse(ROOT / 'scripts/neoboard.wxs')
-                    group = wix.find(".//{*}ComponentGroup[@Directory='INSTALLFOLDER']")
-                    self.assertIsNotNone(group)
-                    names = {f.get('Name') for f in group.findall('./{*}Component/{*}File')}
-                    self.assertTrue({'neochat-desktop.exe', 'neoboard.exe'} <= names)
-                else:
-                    prefix = 'NeoBoard.app/Contents/MacOS' if os_name == 'Darwin' else 'neoboard'
-                    with tarfile.open(archive.with_suffix('.tar.gz')) as tar:
-                        for name in ('neochat-desktop', 'neoboard'):
-                            item = tar.getmember(f'{prefix}/{name}')
-                            self.assertTrue(item.isfile() and item.mode & 0o111)
-                            self.assertEqual(tar.extractfile(item).read(), name.encode())
+                prefix = 'NeoBoard.app/Contents/MacOS' if os_name == 'Darwin' else 'neoboard'
+                with tarfile.open(archive.with_suffix('.tar.gz')) as tar:
+                    for name in ('neochat-desktop', 'neoboard'):
+                        item = tar.getmember(f'{prefix}/{name}')
+                        self.assertTrue(item.isfile() and item.mode & 0o111)
+                        self.assertEqual(tar.extractfile(item).read(), name.encode())
 
 
 if __name__ == '__main__':

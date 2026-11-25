@@ -1,10 +1,9 @@
-"""Offline regression tests for the Windows release ZIP check."""
-import io
+"""Offline regression tests for the Windows MSI payload check."""
 from pathlib import Path
 import runpy
 import struct
 import unittest
-import zipfile
+import tempfile
 
 
 check = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'scripts/smoke-release.py'))['check_windows_subsystems']
@@ -24,10 +23,11 @@ def image(subsystem, magic=0x20b):
 
 class WindowsSubsystems(unittest.TestCase):
     def check_images(self, **replacements):
-        with zipfile.ZipFile(io.BytesIO(), 'w') as bundle:
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
             for name in ('neochat-desktop', 'neoboard', 'neochat', 'neochatd', 'neochat-mcp', 'neochat-share'):
-                bundle.writestr(name + '.exe', replacements.get(name, image(2 if name == 'neochat-desktop' else 3)))
-            check(bundle)
+                (folder / (name + '.exe')).write_bytes(replacements.get(name, image(2 if name == 'neochat-desktop' else 3)))
+            check(folder)
 
     def test_pe32_and_pe32_plus(self):
         self.check_images(neochat=image(3, 0x10b))

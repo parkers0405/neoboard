@@ -52,6 +52,13 @@ def package(asset):
     files += [Path('desktop/target/release') / ('neochat-desktop' + suffix), Path('LICENSE'), Path('MCP.md'), Path('desktop/assets/fonts/OFL.GeistMono.txt')]
     programs = files[:6]
     notices = [(path, path.name) for path in files[6:]] + [(Path('rune/LICENSE'), 'LICENSE-Rune'), (Path('vendor/winit-compat/winit-0.30.13/LICENSE'), 'LICENSE-winit')]
+    if system == 'windows':
+        Path('dist').mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory() as payload:
+            for path, name in [(p, p.name) for p in programs] + notices:
+                shutil.copy2(path, Path(payload) / name)
+            subprocess.run(['pwsh', '-NoProfile', '-File', 'scripts/build-msi.ps1', '-Payload', payload], check=True)
+        return
     if system == 'darwin':
         # Sign before archiving so the portable ZIP, the app and the tarball all carry the same signed programs.
         for path in programs:

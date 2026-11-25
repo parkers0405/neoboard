@@ -1026,7 +1026,10 @@ fn update_layer(app: &App, viewport: [f32; 2]) -> Option<El> {
         let dismiss = if matches!(app.release.stage, Stage::Offer(..)) { "Not now" } else { "Close" };
         let mut actions = row().gap(8.).child(dialog_action(button(dismiss, |a| a.release.dismiss())));
         if let Stage::Offer(_, action) = app.release.stage {
-            actions = actions.child(solid(filled(action.label(), |a| a.release.accept()).key("start-update")));
+            actions = actions.child(solid(filled(action.label(), |a| {
+                let data = a.local_discovery.as_ref().filter(|_| !a.remote()).map(|(dir,_)| dir.clone());
+                a.release.accept(data);
+            }).key("start-update")));
         } else if let Stage::ManualRelease(_, url) = &app.release.stage {
             let url = url.clone();
             actions = actions.child(dialog_action(button("View release", |_| {}).key("view-release").on_press_tx(move |a: &mut App, tx| {

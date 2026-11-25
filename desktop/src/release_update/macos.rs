@@ -133,7 +133,7 @@ fn replace(target: &Path, slot: TempDir, launch: impl FnOnce(&Path) -> Result<()
     Ok(())
 }
 
-pub(super) fn apply(dmg: &Path, version: &Version) -> Result<()> {
+pub(super) fn apply(dmg: &Path, version: &Version, data: Option<&Path>) -> Result<()> {
     let exe = env::current_exe()?.canonicalize()?;
     let app = installed_bundle(&exe)?;
     let parent = app.parent().ok_or("no installation directory")?;
@@ -154,7 +154,9 @@ pub(super) fn apply(dmg: &Path, version: &Version) -> Result<()> {
         // the old app available for rollback. The helper sees no shell path input.
         let mut cleaner = Command::new("/bin/sh").env_clear().args(["-c", "IFS= read -r cancel || /bin/rm -rf -- \"$1\"", "neoboard-cleanup"])
             .arg(backup_dir).current_dir("/").stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()?;
-        let error = Command::new(&exe).args(env::args_os().skip(1)).current_dir(cwd)
+        let mut reopen = Command::new(&exe);
+        super::relaunch_daemon(&mut reopen, data);
+        let error = reopen.args(env::args_os().skip(1)).current_dir(cwd)
             .env("NEOBOARD_DESKTOP_UPDATE_HANDOFF", format!("Updated to {version}." )).exec();
         // Keep stdin open until the helper is stopped, so it cannot delete the backup.
         let _ = cleaner.kill();

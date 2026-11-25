@@ -2,7 +2,15 @@ use super::{inbox,nonce,quoted_exe,runtime::{self,Outcome},store::{self,transact
 use std::{path::Path,thread,time::Duration};
 use sha2::{Digest,Sha256};
 
-fn binding(dir:&Path,key:&str)->Result<Binding,String>{transaction(dir,|s|s.bindings.get(key).cloned().ok_or("Not paired".into()))}
+pub(super) fn binding(dir:&Path,key:&str)->Result<Binding,String>{
+    let b=transaction(dir,|s|s.bindings.get(key).cloned().ok_or("Not paired".into()))?;
+    let Some(origin)=inbox::relocated(&b.source) else{return Ok(b)};
+    // Grant first: a crash between the two writes is repaired by the next call.
+    inbox::readdress(&b.source.invite,&origin)?;
+    transaction(dir,|s|{let cur=s.bindings.get_mut(key).ok_or("Not paired")?;
+        if cur.source.origin==b.source.origin && cur.source.actor==b.source.actor{cur.source.origin=origin.clone();}
+        Ok(cur.clone())})
+}
 pub(super) fn session_lock(dir:&Path,b:&Binding)->Result<std::fs::File,String>{
     let identity=(&b.target.harness,&b.target.origin,&b.target.session);
     let digest=Sha256::digest(serde_json::to_vec(&identity).map_err(|_|"Invalid session binding")?);

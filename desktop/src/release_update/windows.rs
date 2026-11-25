@@ -39,7 +39,7 @@ fn arguments(args: impl Iterator<Item = OsString>) -> OsString {
     OsString::from_wide(&result)
 }
 
-pub(super) fn apply(msi: &Path) -> Result<(), Box<dyn Error>> {
+pub(super) fn apply(msi: &Path, data: Option<&Path>) -> Result<(), Box<dyn Error>> {
     let dir = msi.parent().ok_or("missing MSI staging directory")?;
     if !msi.is_absolute()
         || msi.file_name() != Some(OsStr::new("NeoBoard-x86_64.msi"))
@@ -60,7 +60,9 @@ pub(super) fn apply(msi: &Path) -> Result<(), Box<dyn Error>> {
     // Windows PowerShell expects UTF-16LE for -EncodedCommand. Pass only the
     // fixed helper this way so command-line parsing cannot consume its quotes.
     let script: Vec<_> = HELPER.encode_utf16().flat_map(u16::to_le_bytes).collect();
-    Command::new(system.join(r"WindowsPowerShell\v1.0\powershell.exe"))
+    let mut helper = Command::new(system.join(r"WindowsPowerShell\v1.0\powershell.exe"));
+    super::relaunch_daemon(&mut helper, data);
+    helper
         .args([
             "-NoLogo",
             "-NoProfile",
@@ -117,7 +119,7 @@ try {
     $install.Verb = 'runas'
     $process = [Diagnostics.Process]::Start($install)
     try { $process.WaitForExit(); $code = $process.ExitCode } finally { $process.Dispose() }
-    if ($code -notin 0,3010,1641) { throw "Windows Installer exited with code $code. The desktop was not reopened." }
+    if ($code -notin 0,3010,1641) { throw "Windows Installer exited with code $code." }
     if ($code -ne 1641) { # 1641: the installer already initiated a system restart
         $app = [Diagnostics.ProcessStartInfo]::new()
         $app.FileName = $env:NB_UPDATE_EXE
@@ -127,7 +129,18 @@ try {
         foreach ($key in 'PARENT','MSI','EXE','ARGS','CWD') { $app.EnvironmentVariables.Remove('NB_UPDATE_' + $key) }
         [Diagnostics.Process]::Start($app).Dispose()
     }
-} catch { $failure = $_.Exception.Message }
+} catch {
+    $failure = $_.Exception.Message
+    if ($env:NEOBOARD_UPDATE_LOCAL_DATA -and [IO.File]::Exists($env:NB_UPDATE_EXE) -and ($null -eq $parent -or !(Get-Process -Id $env:NB_UPDATE_PARENT -ErrorAction SilentlyContinue))) {
+        try {
+            $restore = [Diagnostics.ProcessStartInfo]::new($env:NB_UPDATE_EXE, [string]$env:NB_UPDATE_ARGS)
+            $restore.WorkingDirectory = $env:NB_UPDATE_CWD
+            $restore.UseShellExecute = $false
+            $restore.EnvironmentVariables['NEOBOARD_UPDATE_ROLLBACK'] = '1'
+            [Diagnostics.Process]::Start($restore).Dispose()
+        } catch { $failure += ' Could not reopen the desktop; open it manually.' }
+    }
+}
 try {
     Check-Staging
     [IO.File]::Delete($msi)

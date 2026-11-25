@@ -6,6 +6,8 @@ When the desktop offers a newer release, choose **Update and restart** or **Not 
 
 After confirmation, NeoBoard downloads the installer and its `.sha256` from the official GitHub release **for the displayed tag** and verifies it before installation. On Apple Silicon macOS it replaces the installed app bundle in place; on Windows x86-64 it runs Windows Installer for the Program Files installation. Approve any Windows permission prompt. The desktop reopens automatically after installation. Restart any separately managed services and reconnect external MCP clients yourself.
 
+Starting with v0.2.15, **Update and restart** also gracefully stops the active local daemon if it was automatically started from this installation. After replacement the new desktop starts its new sibling daemon against the same board data before opening the window. The updater never kills a daemon by name. Remote boards, custom daemons and independently managed services are not restarted. When upgrading **from v0.2.14 or earlier**, restart the old local daemon once: those versions do not support the update handoff.
+
 If the desktop cannot safely identify an updater for your installation, or the release does not list both the matching installer and checksum, **View release** opens the official page for the displayed version. This does not download or run an installer on your behalf.
 
 ## Portable bundles

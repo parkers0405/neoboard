@@ -86,7 +86,7 @@ fn pair(dir:&Path,code:String,session:Option<String>,bin:Option<PathBuf>,workspa
 }
 fn toggle(dir:&Path,key:&str,on:bool)->Result<(),String>{
     let _guard=store::lock(dir,"control.lock",true)?;
-    let b=transaction(dir,|s|s.bindings.get(key).cloned().ok_or("Not paired".into()))?;
+    let b=worker::binding(dir,key)?;
     if on {inbox::poll(&b.source,b.watermark)?;runtime::probe(&b.target,b.bearer.as_deref())?;if b.uncertain.is_some(){return Err("Inspect the previous uncertain turn and use wake resolve before enabling".into());}}
     let any=transaction(dir,|s|{s.bindings.get_mut(key).ok_or("Not paired")?.enabled=on;Ok(s.bindings.values().any(|x|x.enabled))})?;
     let manual=env::var_os("NEOBOARD_WAKE_HOME").is_some() && env::var("NEOBOARD_WAKE_MANUAL").as_deref()==Ok("1");
@@ -105,7 +105,7 @@ fn run_in(options:Options, dir:PathBuf)->Result<(),String>{
             if transaction(&dir,|s|Ok(s.bindings.contains_key(&key)))?{return Err("Already paired; use On or Off".into());}
             let invite=if create_agent{provision::local(&dir,local_data_dir.as_deref().ok_or("Missing local data directory")?,local_endpoint.as_deref(),&key,&project,&scope.harness)?}else{invite.ok_or("Missing scoped invite")?};
             let (origin,actor)=inbox::identify(&invite,&project)?;
-            let source=Source{board:scope.board_id,chat_id:scope.chat_id,project,invite,origin,actor,harness:scope.harness};let code=nonce();
+            let source=Source{board:scope.board_id,chat_id:scope.chat_id,project,invite,origin,actor,harness:scope.harness,local:local_data_dir.filter(|_|create_agent)};let code=nonce();
             transaction(&dir,|s|s.prepare(code.clone(),source,now()))?;
             println!("{} wake pair --code {}",quoted_exe()?,code);Ok(())
         },
@@ -115,7 +115,7 @@ fn run_in(options:Options, dir:PathBuf)->Result<(),String>{
             pair(&dir,code,session,executable,workspace,origin)
         },
         Command::List{board_id}=>{let rows=transaction(&dir,|s|s.list(&board_id))?;println!("{}",serde_json::Value::Array(rows));Ok(())},
-        Command::Status(scope)=>{let key=scope.key()?;let text=transaction(&dir,|s|Ok(match s.bindings.get(&key){None=>"Not paired".to_string(),Some(b)=>format!("{} | @{} | {} | {}{}",if b.enabled{"On"}else{"Off"},b.source.actor,b.target.session,b.last,if b.uncertain.is_some(){" | Reserved; if interrupted, inspect session before wake resolve"}else{""})}))?;println!("{text}");Ok(())},
+        Command::Status(scope)=>{let key=scope.key()?;let _=worker::binding(&dir,&key);let text=transaction(&dir,|s|Ok(match s.bindings.get(&key){None=>"Not paired".to_string(),Some(b)=>format!("{} | @{} | {} | {}{}",if b.enabled{"On"}else{"Off"},b.source.actor,b.target.session,b.last,if b.uncertain.is_some(){" | Reserved; if interrupted, inspect session before wake resolve"}else{""})}))?;println!("{text}");Ok(())},
         Command::On(scope)=>toggle(&dir,&scope.key()?,true),Command::Off(scope)=>toggle(&dir,&scope.key()?,false),
         Command::Disconnect(scope)=>{
             let key=scope.key()?;

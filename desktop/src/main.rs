@@ -811,6 +811,7 @@ fn poll(app: &mut App, seconds: f64, tx: &mut Tx) -> bool {
     app.splash.tick(seconds,app.page==Page::Home && app.dialog.is_none() && !app.setup_open,tx) || changed
 }
 fn main() {
+    if let Err(e) = release_update::resume_daemon() { eprintln!("Could not restart the local daemon after update: {e}"); }
     #[cfg(windows)]
     if std::env::args_os().skip(1).eq([std::ffi::OsString::from("--wake-login")]) {
         // HKCU Run entry: use the GUI subsystem before attaching a console or

@@ -20,6 +20,8 @@ pub fn binding_key(board: &str, harness: &str, chat: &str) -> Result<String, Str
 pub struct Source {
     #[serde(default = "default_chat")] pub chat_id: String,
     pub board: String, pub project: String, pub invite: PathBuf, pub origin: String, pub actor: String, pub harness: String,
+    /// The local board's data directory, when wake setup created the agent there.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub local: Option<PathBuf>,
 }
 #[derive(Serialize, Deserialize)]
 pub struct Pending { pub source: Source, pub expires: u64 }

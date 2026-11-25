@@ -29,7 +29,7 @@ impl Installer {
         format!("{RELEASES}/download/{}/{}", release.tag(), self.filename())
     }
 
-    pub(super) fn start(self, release: &Release, verified: impl FnOnce()) -> Result<()> {
+    pub(super) fn start<'a>(self, release: &Release, verified: impl FnOnce() -> Result<Option<&'a Path>>) -> Result<()> {
         let client = Client::builder().https_only(true).timeout(Duration::from_secs(300))
             .user_agent("neoboard-desktop-update")
             .redirect(Policy::custom(|a| {
@@ -41,12 +41,12 @@ impl Installer {
             if response.status() != reqwest::StatusCode::OK { return Err("unexpected release response".into()); }
             Ok(response)
         }, |path| {
-            verified();
+            let data = verified()?;
             match self {
                 #[cfg(windows)]
-                Self::Msi => super::windows::apply(path),
+                Self::Msi => super::windows::apply(path, data),
                 #[cfg(target_os = "macos")]
-                Self::Dmg => super::macos::apply(path, &release.version),
+                Self::Dmg => super::macos::apply(path, &release.version, data),
                 _ => Err(format!("No installer for {} on this platform", path.display()).into()),
             }
         })

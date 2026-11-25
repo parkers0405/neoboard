@@ -13,6 +13,22 @@ use semver::Version;
 const LATEST: &str = "https://api.github.com/repos/parkers0405/neoboard/releases/latest";
 const LIMIT: u64 = 256 * 1024;
 const HANDOFF: &str = "NEOBOARD_DESKTOP_UPDATE_HANDOFF";
+const RESTART_DATA: &str = "NEOBOARD_UPDATE_LOCAL_DATA";
+
+fn relaunch_daemon(cmd: &mut std::process::Command, data: Option<&Path>) {
+    cmd.env_remove(RESTART_DATA);
+    cmd.env_remove("NEOBOARD_UPDATE_ROLLBACK");
+    if let Some(path) = data { cmd.env(RESTART_DATA, path); }
+}
+
+pub fn resume_daemon() -> Result<(), String> {
+    let Some(data) = std::env::var_os(RESTART_DATA) else { return Ok(()) };
+    let data = Path::new(&data);
+    if std::env::var_os("NEOBOARD_UPDATE_ROLLBACK").is_some() {
+        neochat::client::resume_after_update(data).map_err(|e| e.to_string())?;
+    }
+    neochat::client::connect_local(Some(data), None).map(|_| ()).map_err(|e| e.to_string())
+}
 pub const RECONNECT: &str = "External MCP connections are not verified. Reconnect Neoboard in each MCP client to load the updated adapter.";
 
 // WiX installs in ProgramFiles64Folder/NeoBoard. Other Program Files paths
@@ -123,7 +139,7 @@ fn package_cli(exe: &Path) -> Option<PathBuf> {
     Some(dir.join(binary("neoboard")))
 }
 
-fn install(exe: &Path) -> Result<String, String> {
+fn install(exe: &Path, data: Option<&Path>) -> Result<String, String> {
     let cli = package_cli(exe).ok_or("The packaged updater is no longer available.")?;
     // neoboard desktop owns its private companion and the install transaction.
     // Returning its reserved approval status touches neither daemon nor MCP clients.
@@ -161,8 +177,9 @@ fn install(exe: &Path) -> Result<String, String> {
         }
         // Replace only ourselves. Preserve the board selection and relative CLI paths;
         // never rediscover current_exe after the swap (it can now point into the backup).
-        let error = Command::new(exe).args(std::env::args_os().skip(1)).current_dir(cwd)
-            .env(HANDOFF, &diagnostic).exec();
+        let mut reopen = Command::new(exe);
+        relaunch_daemon(&mut reopen, data);
+        let error = reopen.args(std::env::args_os().skip(1)).current_dir(cwd).env(HANDOFF, &diagnostic).exec();
         Err(format!("Installed, but could not reopen {}: {error}. {diagnostic}", exe.display()))
     }
     #[cfg(not(unix))] { Ok(diagnostic) }
@@ -181,7 +198,7 @@ impl Update {
     }
     pub fn instructions(self) -> &'static str {
         match self {
-            Self::Managed(_) => "Save your drafts before restarting. NeoBoard will verify the download, install it, and reopen. If you host a board, stop its daemon and back up its data first.",
+            Self::Managed(_) => "Save drafts and back up hosted data. NeoBoard will restart its managed local daemon and reopen the window. Independently managed services must be restarted separately.",
             Self::Portable if cfg!(unix) => "Finish your drafts first. Updating will reopen the installed desktop. Reconnect external MCP clients after updating.",
             Self::Portable => "The update will stage a separate bundle. Switch paths and reconnect external MCP clients manually.",
         }
@@ -196,7 +213,7 @@ pub struct Session {
     pub stage: Stage,
     pub pulse: f32,
     inbox: Option<mpsc::Receiver<Stage>>,
-    consent: Option<mpsc::Sender<()>>,
+    consent: Option<mpsc::Sender<Option<PathBuf>>>,
     started: bool,
     wake: Option<rune::Waker>,
 }
@@ -243,18 +260,33 @@ impl Session {
             send.send(stage).ok()?;
             wake();
             if !offered{return None;}
-            wait.recv().ok()?;
+            let data: Option<PathBuf> = wait.recv().ok()?;
+            let mut stopped = None;
+            let mut stop = || -> Result<Option<&Path>, Box<dyn std::error::Error>> {
+                if let Some(dir) = data.as_deref() && std::env::var_os("NEOBOARD_PORTABLE_HANDOFF").is_none() {
+                    match neochat::client::stop_for_update(dir) {
+                        Ok(true) => stopped = Some(dir), Ok(false) => (),
+                        Err(e) => { let _=neochat::client::resume_after_update(dir); return Err(e.into()); }
+                    }
+                }
+                Ok(stopped)
+            };
             let result = match action? {
-                Update::Portable => Stage::Finished(install(&exe?)),
+                Update::Portable => Stage::Finished(stop().map_err(|e| e.to_string()).and_then(|data| install(exe.as_ref().unwrap(), data))),
                 Update::Managed(installer) => match installer.start(&latest?, || {
                     let _ = send.send(Stage::Running("Download verified. Installing the update…"));
                     wake();
+                    stop()
                 }) {
                     // The platform helper now owns installation and relaunch.
                     Ok(()) => std::process::exit(0),
                     Err(e) => Stage::Finished(Err(e.to_string())),
                 },
             };
+            if let Some(data) = stopped && matches!(result, Stage::Finished(Err(_))) {
+                let _ = neochat::client::resume_after_update(data);
+                let _ = neochat::client::connect_local(Some(data),None);
+            }
             send.send(result).ok()?;
             wake();
             Some(())
@@ -262,9 +294,9 @@ impl Session {
         if worker.is_ok() { self.inbox = Some(recv); self.consent = Some(approve); }
         else if manual {self.stage=Stage::Notice("Could not start the update check.".into());}
     }
-    pub fn accept(&mut self) {
+    pub fn accept(&mut self, data: Option<PathBuf>) {
         let Stage::Offer(_, action) = self.stage else { return; };
-        self.stage = if self.consent.take().is_some_and(|tx| tx.send(()).is_ok()) { Stage::Running(match action {
+        self.stage = if self.consent.take().is_some_and(|tx| tx.send(data).is_ok()) { Stage::Running(match action {
             Update::Managed(_) => "Downloading and verifying the release…",
             Update::Portable => "Preparing the new desktop bundle…",
         }) }
@@ -353,7 +385,7 @@ mod tests {
         // binary replaced it, the working directory and the post-update notice.
         const CHILD: &str = "NEOBOARD_TEST_HANDOFF_BUNDLE";
         if let Some(root) = std::env::var_os(CHILD) {
-            let result = install(&Path::new(&root).join("neochat-desktop"));
+            let result = install(&Path::new(&root).join("neochat-desktop"), None);
             if std::env::var_os("NEOBOARD_TEST_NO_REPLACEMENT").is_some() {
                 assert!(result.unwrap_err().contains("No replacement desktop"));
                 return;
@@ -428,7 +460,7 @@ mod tests {
         let (x,y) = rt.find("start-update").unwrap();
         rt.pointer_move(x,y); rt.pointer_down(x,y); rt.pointer_up(x,y); rt.frame(1./60.);
         assert_eq!(rx.try_iter().count(), 1);
-        rt.state.release.accept();
+        rt.state.release.accept(None);
         assert_eq!(rx.try_iter().count(), 0);
         assert!(matches!(rt.state.release.stage, Stage::Running(_)));
         assert_eq!(rt.state.draft.text, "unsent");

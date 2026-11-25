@@ -1,6 +1,9 @@
 //! Blocking client shared by the CLI and the desktop's network worker.
 mod board_password;
 mod notifications;
+#[doc(hidden)]
+pub mod update;
+pub use update::{resume_after_update, stop_for_update};
 pub use notifications::{InboxItem, InboxPage, Subscription};
 pub use board_password::{join_with_password, MAX_BOARD_PASSWORD_BYTES};
 use crate::protocol::{Action, Discovery, DisplayNameRequest, Event, Invite, InviteRequest, Member, Organization, Outcome, Reaction, ScheduledPost, Snapshot};
@@ -339,6 +342,10 @@ pub fn connect_local(data_dir: Option<&Path>, profile: Option<&str>) -> Result<C
     }
 
     let mut command = daemon_command();
+    let bundled = std::env::var_os("NEOCHAT_DAEMON").is_none()
+        && update::sibling().is_ok_and(|p| Path::new(command.get_program()).canonicalize().ok().as_ref() == Some(&p));
+    update::check_spawn(&dir, bundled).map_err(|e| ClientError(e.to_string()))?;
+    if bundled { command.arg("--bundled-auto-v1"); }
     command.arg("--data-dir").arg(&dir).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     #[cfg(unix)]
     {

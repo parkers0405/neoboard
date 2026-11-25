@@ -1,4 +1,7 @@
 use super::store::Source;
+#[cfg(test)]
+#[path = "inbox_tests.rs"]
+mod tests;
 use neochat::{client::InboxPage, invite_file::InviteFile};
 use std::{fs::File,io::Read,path::Path,time::Duration};
 
@@ -21,6 +24,26 @@ fn page(origin:&str,token:&str,after:u64)->Result<InboxPage,String>{
     let p:InboxPage=serde_json::from_slice(&bytes).map_err(|_|"Board does not support the expected inbox response")?;
     if p.items.len()>1 || !neochat::valid_project(&p.actor) || matches!(p.actor.as_str(),"local"|"system") {return Err("A dedicated agent credential is required; do not use host credentials".into());}
     Ok(p)
+}
+/// A local board listens on a new port after every launch. Follow it only through this
+/// user's own discovery file, and only once the saved grant authenticates there as the
+/// same actor. Returns the origin to adopt, or None when nothing should change.
+pub fn relocated(s:&Source)->Option<String>{
+    let (saved,token)=access(&s.invite,&s.project).ok()?;
+    if !s.origin.starts_with("http://"){return None;}
+    let found=neochat::client::Client::discover(s.local.as_deref(),None).ok()?;
+    let u=reqwest::Url::parse(found.endpoint()).ok()?;
+    if u.scheme()!="http" || u.path()!="/" || !u.host_str().unwrap_or("").trim_matches(['[',']']).parse::<std::net::IpAddr>().is_ok_and(|ip|ip.is_loopback()){return None;}
+    let origin=u.origin().ascii_serialization();
+    if origin==s.origin && origin==saved{return None;}
+    (page(&origin,&token,0).ok()?.actor==s.actor).then_some(origin)
+}
+/// Point the saved grant at the board's new address, keeping its credential and expiry.
+pub fn readdress(path:&Path,origin:&str)->Result<(),String>{
+    let mut bytes=Vec::new(); File::open(path).and_then(|f|f.take(8193).read_to_end(&mut bytes)).map_err(|_|"Cannot open scoped invite")?;
+    let mut inv:InviteFile=serde_json::from_slice(&bytes).map_err(|_|"Invalid scoped invite")?;
+    inv.endpoint=origin.into();
+    inv.replace(path)
 }
 pub fn identify(path:&Path, project:&str)->Result<(String,String),String>{let (origin,token)=access(path,project)?;let actor=page(&origin,&token,0)?.actor;Ok((origin,actor))}
 pub(super) fn saved_origin(path:&Path, project:&str)->Result<String,String>{access(path,project).map(|(origin,_)|origin)}

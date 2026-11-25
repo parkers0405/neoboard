@@ -11,6 +11,8 @@ struct Args {
     /// Companion mode: private readiness line and graceful shutdown on stdin EOF.
     #[arg(long, hide=true)]
     portable_v1: bool,
+    #[arg(long, hide=true, conflicts_with="portable_v1")]
+    bundled_auto_v1: bool,
     #[arg(long, env="NEOCHAT_BIND", default_value="127.0.0.1:0")]
     bind: SocketAddr,
     #[arg(long, env="NEOCHAT_DATA_DIR", default_value_os_t=neochat::default_data_dir())]
@@ -54,6 +56,9 @@ async fn main() -> Result<(),Box<dyn std::error::Error>> {
     // OS file locking prevents a second service from replacing a live discovery endpoint.
     let lock=OpenOptions::new().create(true).truncate(false).write(true).open(args.data_dir.join("service.lock"))?;
     lock.try_lock()?;
+    // Recheck after acquiring the service lock: a reconnect may have spawned
+    // this process just before the updater installed its hold.
+    let auto = args.bundled_auto_v1.then(|| neochat::client::update::AutoDaemon::register(&args.data_dir)).transpose()?;
     let board_token=token(&args.data_dir.join("board-token"))?;
     let admin_token=token(&args.data_dir.join("admin-token"))?;
     let board=Board::open(args.data_dir.join("board.sqlite3"),&board_token,&admin_token)?;
@@ -95,11 +100,15 @@ async fn main() -> Result<(),Box<dyn std::error::Error>> {
             }
         }
     });
+    let auto = auto.map(std::sync::Arc::new);
+    let auto_ref = auto.clone();
     let result=axum::serve(listener,neochat::router(board)).with_graceful_shutdown(async move {
         if args.portable_v1 {
             let (tx,rx)=tokio::sync::oneshot::channel();
             std::thread::spawn(move || { let mut byte=[0]; let _=std::io::Read::read(&mut io::stdin().lock(), &mut byte); let _=tx.send(()); });
             tokio::select! { _=shutdown()=>{}, _=rx=>{} }
+        } else if let Some(auto) = auto_ref {
+            tokio::select! { _=shutdown()=>{}, _=auto.stop_requested()=>{} }
         } else { shutdown().await; }
         resume.abort();
         management.abort();
@@ -108,6 +117,7 @@ async fn main() -> Result<(),Box<dyn std::error::Error>> {
     let _=fs::remove_file(args.data_dir.join(CONTROL_FILE));
     let _=stop_tx.send(true); let _=worker.await;
     let _=fs::remove_file(discovery_path);
+    if result.is_ok() { if let Some(auto) = auto { auto.finished()?; } }
     drop(lock);
     result?; Ok(())
 }

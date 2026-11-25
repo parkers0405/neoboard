@@ -203,3 +203,28 @@ fn claude_turn_attaches_the_agent_grant_and_only_the_listed_approvals() {
     assert_eq!(send(&t, PROMPT, None, Some(&access(&["mcp__neoboard-wake"]))), Outcome::Accepted);
     assert!(!dir.path().join("options").exists());
 }
+
+// Codex delivers through its own durable queue, which reaches an open window. Only an
+// older Codex without the command (argument error, nothing queued) uses the hidden run.
+#[cfg(unix)]
+#[test]
+fn codex_prefers_its_queue_and_only_falls_back_when_the_command_is_missing() {
+    let (dir, t) = fixture("codex");
+    fs::write(dir.path().join("queue"), "ok").unwrap();
+    assert_eq!(send(&t, PROMPT, None, None), Outcome::Accepted);
+    assert_eq!(fs::read_to_string(dir.path().join("queued")).unwrap(), PROMPT);
+    assert!(!dir.path().join("prompt").exists()); // no second, hidden turn
+    for mode in ["silent", "refused"] {
+        fs::write(dir.path().join("queue"), mode).unwrap();
+        assert_eq!(send(&t, PROMPT, None, None), Outcome::Uncertain, "{mode}");
+        assert!(!dir.path().join("prompt").exists());
+    }
+    fs::remove_file(dir.path().join("queue")).unwrap();
+    assert_eq!(send(&t, PROMPT, None, None), Outcome::Accepted);
+    assert!(dir.path().join("prompt").exists());
+
+    configure(&t, &["mcp", "add", "neoboard-wake-0a1b2c3d", "--", "/adapter", "--agent-invite", "/grant"]).unwrap();
+    assert_eq!(fs::read_to_string(dir.path().join("configured")).unwrap(), "mcp\nadd\nneoboard-wake-0a1b2c3d\n--\n/adapter\n--agent-invite\n/grant\n");
+    fs::write(dir.path().join("mcp-fail"), "").unwrap();
+    assert!(configure(&t, &["mcp", "add", "x"]).is_err());
+}

@@ -29,6 +29,11 @@ pub struct Pending { pub source: Source, pub expires: u64 }
 pub struct Binding {
     pub source: Source, pub target: Target, pub bearer: Option<String>, pub enabled: bool,
     pub watermark: u64, pub uncertain: Option<String>, pub last: String, pub test: Option<String>,
+    /// The paired runtime has this binding's own connection (and, for Claude Code, the
+    /// watcher hook) installed, so an open conversation can take deliveries itself.
+    #[serde(default)] pub live: bool,
+    /// A setup test is waiting for the open conversation's watcher, not for a background run.
+    #[serde(default)] pub live_test: bool,
 }
 #[derive(Default, Serialize, Deserialize)]
 pub struct State { pub pending: BTreeMap<String, Pending>, pub bindings: BTreeMap<String, Binding> }

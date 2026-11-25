@@ -230,7 +230,7 @@ impl Guide {
         let key = server_key(project, if joined { "invite" } else { "local" }, location);
         let installable = agent == Agent::Neoism && literal(adapter) && Path::new(adapter).is_absolute() && neochat::valid_project(project);
         let mut install = None;
-        let intro = if joined { "Adding this entry lets the agent use this saved membership, with its permissions and expiry. If you joined as yourself, this is your personal membership. Add it only if you intend to grant that access." } else { "Adding this entry grants the agent local MCP access to all boards visible to the local credential, not just the selected board." }.to_owned();
+        let intro = if joined { "This gives the agent your saved membership on this board, with its permissions and expiry. If you joined as yourself, that is your personal access." } else { "This gives the agent local access to every board this device can see, not only the selected one." }.to_owned();
         let (location, snippet) = match agent {
             Agent::Codex => {
                 // JSON string escapes also work in TOML basic strings; DEL must be escaped in TOML.
@@ -273,7 +273,7 @@ impl Guide {
             Agent::ClaudeCode => "Pair a dedicated Claude Code session. If the terminal cannot identify it, use its exact session ID, never the most recent chat.",
             Agent::Codex => "Pair a dedicated Codex thread using its exact thread ID. If the OS blocks the CLI, stop; do not bypass the warning.",
         };
-        let wake = if self.agent == Agent::ClaudeDesktop { runtime.to_string() } else { format!("If I want wake, guide me through Home → Setup → Set up wake. {runtime} Use the agent's own board identity. I choose Copy for agent and paste the pairing prompt into the exact conversation I want to wake, or choose Manual for a terminal command. Then I select Check connection. Do not ask me to paste private codes or tokens here. Pairing leaves wake off. I can choose Turn on to allow mentions and requested task updates to start turns, or Pause to stop future wakes. Do not enable wake or send a test on my behalf.") };
+        let wake = if self.agent == Agent::ClaudeDesktop { runtime.to_string() } else { format!("If I want wake, guide me through Setup → Automatic wake → Connected chats. {runtime} Use the agent's own board identity. I choose Copy for agent and paste the pairing prompt into the exact conversation I want to wake, or choose Manual for a terminal command. Then I select Check connection. Do not ask me to paste private codes or tokens here. Pairing leaves wake off. I can choose Turn on to allow mentions and requested task updates to start turns, or Pause to stop future wakes. Do not enable wake or send a test on my behalf.") };
         if self.key.is_empty() { return self.instruction.clone(); }
         format!("1. Connect MCP for {}\n{} {}\nAuthorize this connection only with my explicit approval. Do not switch the current session’s MCP, substitute another board, or use my personal or host access by default. If this exact connection is unavailable, stop.\n\n{}\n\n2. Verify access\n{}\n\n3. Automatic wake (optional)\n{}", self.agent.name(), self.intro, self.instruction, self.snippet, self.question, wake)
     }

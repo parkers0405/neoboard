@@ -264,12 +264,68 @@ fn cli(t: &Target, prompt: Option<&str>, access: Option<&Access>, timeout: Durat
     Err(())
 }
 
+/// Run a short, promptless command of the bound CLI with the same cleared environment.
+/// Returns its exit code and bounded stdout; never forwards stderr.
+fn brief(t: &Target, args: &[&str], timeout: Duration) -> Result<(Option<i32>, Vec<u8>), ()> {
+    let mut cmd = runtime_command(t)?;
+    let mut child = cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().map_err(|_| ())?;
+    let output = child.stdout.take().expect("piped stdout");
+    let (tx, rx) = mpsc::channel();
+    let reader = thread::Builder::new().spawn(move || { let _ = tx.send(bounded(output, 8192)); });
+    let deadline = Instant::now() + timeout;
+    if reader.is_ok() {
+        if let Ok(Ok(bytes)) = rx.recv_timeout(timeout) {
+            while Instant::now() < deadline {
+                match child.try_wait() {
+                    Ok(Some(status)) => return Ok((status.code(), bytes)),
+                    Ok(None) => thread::sleep(Duration::from_millis(10)),
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+    #[cfg(unix)]
+    unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL); }
+    let _ = child.kill();
+    let _ = child.wait();
+    Err(())
+}
+
+/// Change the bound CLI's own configuration (for example registering an MCP server).
+pub fn configure(t: &Target, args: &[&str]) -> Result<(), String> {
+    validate(t)?;
+    if t.harness == "neoism" || args.iter().any(|a| a.contains('\0')) { return Err("unsupported runtime configuration".into()); }
+    match brief(t, args, SHORT * 3) {
+        Ok((Some(0), _)) => Ok(()),
+        _ => Err("runtime configuration not confirmed".into()),
+    }
+}
+
+/// Codex keeps a durable per-session queue served by its shared local daemon: a
+/// queued message starts a turn in the open window, and `--resume` loads the
+/// session there when no window is open. `Ok(false)` means this Codex has no
+/// `queue` command (argument error, nothing queued), so the caller may fall back.
+fn codex_queue(t: &Target, prompt: &str) -> Result<bool, ()> {
+    match brief(t, &["queue", "--thread", &t.session, "--message", prompt, "--resume"], SHORT * 3)? {
+        (Some(0), out) if out.starts_with(b"Queued message ") => Ok(true),
+        (Some(2), _) => Ok(false),
+        _ => Err(()),
+    }
+}
+
 pub fn send(t: &Target, prompt: &str, neoism_token: Option<&str>, access: Option<&Access>) -> Outcome {
     if validate(t).is_err() || prompt.trim().is_empty() || prompt.len() > 16 * 1024 || prompt.starts_with('-') || prompt.contains('\0') {
         return Outcome::Uncertain;
     }
-    if t.harness == "neoism" { neoism(t, neoism_token, Some(prompt)).unwrap_or(Outcome::Uncertain) }
-    else if cli(t, Some(prompt), access.filter(|_| t.harness == "claude"), TURN).is_ok() { Outcome::Accepted }
+    if t.harness == "neoism" { return neoism(t, neoism_token, Some(prompt)).unwrap_or(Outcome::Uncertain); }
+    if t.harness == "codex" {
+        match codex_queue(t, prompt) {
+            Ok(true) => return Outcome::Accepted,
+            Ok(false) => {}
+            Err(()) => return Outcome::Uncertain,
+        }
+    }
+    if cli(t, Some(prompt), access.filter(|_| t.harness == "claude"), TURN).is_ok() { Outcome::Accepted }
     else { Outcome::Uncertain }
 }
 

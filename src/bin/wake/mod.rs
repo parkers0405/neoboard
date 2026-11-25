@@ -5,6 +5,7 @@ mod service;
 mod worker;
 mod provision;
 mod neoism_pair;
+mod live;
 
 use clap::{Args, Subcommand};
 use rand::RngCore;
@@ -47,6 +48,10 @@ enum Command {
     Resolve(Scope),
     /// Run the consumer in the foreground (normally started by the per-user login service).
     Run { #[arg(long)] once:bool },
+    /// Hook entry point installed in a paired Claude Code conversation. Waits for that
+    /// conversation's next delivery, prints it and exits 2 so the open window starts a turn.
+    #[command(hide=true)]
+    Watch,
 }
 fn nonce()->String { let mut bytes=[0u8;16];rand::rngs::OsRng.fill_bytes(&mut bytes);bytes.iter().map(|b|format!("{b:02x}")).collect() }
 fn now()->u64 { neochat::board::now() }
@@ -81,7 +86,7 @@ fn pair(dir:&Path,code:String,session:Option<String>,bin:Option<PathBuf>,workspa
         if p.expires<=now(){return Err("Pairing code expired".into());}
         let key=store::binding_key(&source.board,&source.harness,&source.chat_id)?;
         if s.bindings.contains_key(&key) || s.bindings.values().any(|b|duplicate(&b.source,&source)){return Err("This board actor is already paired. Give each dedicated conversation its own scoped actor.".into());}
-        s.bindings.insert(key,Binding{source,target:t,bearer,enabled:false,watermark:0,uncertain:None,last:"Paired; no turn sent".into(),test:None});Ok(())})?;
+        s.bindings.insert(key,Binding{source,target:t,bearer,enabled:false,watermark:0,uncertain:None,last:"Paired; no turn sent".into(),test:None,live:false,live_test:false});Ok(())})?;
     println!("Paired. Automatic wake is off. Choose Turn on when ready.");Ok(())
 }
 fn toggle(dir:&Path,key:&str,on:bool)->Result<(),String>{
@@ -92,7 +97,15 @@ fn toggle(dir:&Path,key:&str,on:bool)->Result<(),String>{
     let manual=env::var_os("NEOBOARD_WAKE_HOME").is_some() && env::var("NEOBOARD_WAKE_MANUAL").as_deref()==Ok("1");
     if on && !manual { if let Err(e)=service::ensure_running(){transaction(dir,|s|{s.bindings.get_mut(key).unwrap().enabled=false;Ok(())})?;return Err(e);} }
     else if !any {service::uninstall()?;}
-    println!("{}",if on {"On. New and unread inbox notifications can wake this conversation."}else{"Off. Pairing and inbox preserved; a turn already in progress may finish."});Ok(())
+    // Best effort: without it, wakes still run in the background as before.
+    let live=on && b.target.harness!="neoism" && {
+        let installed=live::install(&b);
+        transaction(dir,|s|{let cur=s.bindings.get_mut(key).ok_or("Not paired")?;cur.live=installed.is_ok();
+            if let Err(e)=&installed{cur.last=format!("Open-window wake unavailable ({e}); wakes run in the background");} Ok(())})?;
+        installed.is_ok() && !b.live
+    };
+    println!("{}{}",if on {"On. New and unread inbox notifications can wake this conversation."}else{"Off. Pairing and inbox preserved; a turn already in progress may finish."},
+        if live {" Restart the paired conversation once so wakes appear in its open window."}else{""});Ok(())
 }
 pub fn run(options:Options)->Result<(),String>{
     run_in(options, store::home()?)
@@ -131,6 +144,7 @@ fn run_in(options:Options, dir:PathBuf)->Result<(),String>{
             println!("Not paired"); Ok(())
         },
         Command::Test(scope)=>worker::test(&dir,&scope.key()?),Command::Run{once}=>worker::run(&dir,once),
+        Command::Watch=>std::process::exit(live::watch(&dir)),
         Command::Ack{code}=>transaction(&dir,|s|{let b=s.bindings.values_mut().find(|b|b.test.as_ref()==Some(&code)).ok_or("No pending test for this code")?;b.test=None;b.last="Test acknowledged by the conversation".into();println!("Acknowledged");Ok(())}),
         Command::Resolve(scope)=>{let key=scope.key()?;let b=transaction(&dir,|s|s.bindings.get(&key).cloned().ok_or("Not paired".into()))?;let _guard=worker::session_lock(&dir,&b)?;transaction(&dir,|s|{let b=s.bindings.get_mut(&key).ok_or("Not paired")?;if b.uncertain.take().is_none(){return Err("No uncertain delivery".into());}b.test=None;b.last="Operator skipped the uncertain delivery; not replayed".into();println!("Skipped without resending");Ok(())})}
     }

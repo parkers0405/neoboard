@@ -9,6 +9,17 @@ sid=00000000-0000-4000-8000-000000000017
 reply_id=$sid
 if test "$mode" = wrong; then reply_id=other; fi
 if test "$1" = --version; then test "$#" = 1; echo fixture; exit; fi
+if test "$1" = queue; then
+    test -f queue || exit 2 # an older Codex: unknown subcommand, nothing queued
+    test "$#" = 6 && test "$2" = --thread && test "$3" = "$sid" && test "$4" = --message && test "$6" = --resume || exit 3
+    case "$(cat queue)" in
+        ok) printf %s "$5" >queued; echo "Queued message fixture for thread $3.";;
+        silent) exit 0;;
+        *) exit 1;;
+    esac
+    exit
+fi
+if test "$1" = mcp; then printf '%s\n' "$@" >>configured; test ! -f mcp-fail; exit; fi
 if test "$1" = --resume; then
     test "$#" -ge 7 && test "$2" = "$sid" && test "$3" = --print && test "$4" = --output-format && test "$5" = json || exit 2
     shift 5

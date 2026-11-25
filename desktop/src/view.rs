@@ -451,7 +451,11 @@ fn dialog(app:&App, page:Dialog, viewport: [f32; 2], filter_anchor: Option<[f32;
             if let Some(error)=&app.error {p=p.child(muted(error).wrap());}
             p.child(row().w_full().child(spacer()).child(button(if app.creating_channel.is_some(){"Creating…"}else{"Create channel"},App::create_channel).key("create-channel").radius(7.).fill(gray(0)).border(1.,gray(55))))
         },
-        Settings=>panel.child(nav("Personal","Your display name across boards on this device",Personal)).child(nav("Board View","Task density, sort order and sidebar",BoardView)).child(dialog_action(button("Check for updates",|a|a.release.manual()).key("check-updates"))),
+        Settings=>panel.child(nav("Personal","Your display name across boards on this device",Personal)).child(nav("Board View","Task density, sort order and sidebar",BoardView))
+            // Same guide as the "?" in the title bar.
+            .child(row().key("settings-setup").w_full().h(58.).px(14.).items_center().radius(10.).fill(gray(0)).border(1.,gray(55)).hover(gray(48))
+                .child(col().gap(3.).child(label("Setup")).child(muted("Connect an agent, verify access and set up wake").font(TextStyle::new(10.,400.)))).child(spacer()).child(muted("›"))
+                .on_press(|a:&mut App| { a.close_dialog(); setup_guide::open(a); })).child(dialog_action(button("Check for updates",|a|a.release.manual()).key("check-updates"))),
         Personal=>{let mut p=panel.child(muted("Display name")).child(form_input(&app.personal_name,"personal-name",&app.local_name).on_edit(|a:&mut App|&mut a.personal_name))
             .child(muted("Members see this name on boards that allow it. Other boards update when you open them. Leave blank to clear your custom name.").wrap())
             .child(muted(app.name_field_status()).wrap());
@@ -800,22 +804,23 @@ fn setup_drawer(app:&App, width: f32)->El {
         }
     }
     let prompt = guide.copy_text();
+    // The instruction already names the file to edit; add a second line only when it says something new.
     let config_hint = match app.setup_agent {
-        _ if target.is_none() => "Choose an available local board or saved membership first.",
-        setup_guide::Agent::Neoism => "Manual setup: merge this entry into Neoism's mcp.json. Add board to Neoism handles registration without pasting.",
-        setup_guide::Agent::ClaudeCode => "Manual setup: merge this entry into your project's .mcp.json.",
-        setup_guide::Agent::Codex => "Manual setup: add this entry to ~/.codex/config.toml.",
-        setup_guide::Agent::ClaudeDesktop => "Manual setup: paste the entry in Settings → Developer → Edit Config in Claude Desktop.",
+        _ if target.is_none() => Some("Choose an available local board or saved membership first."),
+        setup_guide::Agent::Neoism if guide.install.is_some() => Some("Or merge the entry below into Neoism's mcp.json yourself."),
+        _ => None,
     };
-    picker = picker.child(muted(&guide.instruction).wrap()).child(muted(config_hint).wrap());
+    picker = picker.child(muted(&guide.instruction).wrap()).children(config_hint.map(|hint| muted(hint).wrap()));
+    let ask = format!("Ask your agent: {}", guide.question);
+    let verify = if target.is_some() { row().child(copy("copy-verify","Copy question",guide.question.clone())) } else { el() };
     if target.is_some() { picker=picker.child(block("copy-mcp-config","Copy MCP config",guide.snippet)); }
     let supported = app.setup_agent != setup_guide::Agent::ClaudeDesktop;
     let wake = if target.is_none() { el() } else if let Some(panel) = app.agent_wake.as_ref().filter(|p| p.matches_board(&wake_key)) { wake_view::body(app,&wake_key,panel) } else { let key=wake_key.clone(); row().child(dialog_action(button("Connected chats",move |a| if a.setup_open && a.setup_agent == agent && setup_guide::Guide::new(a).key == key { agent_wake::open(a); })).key("setup-wake")) };
     let cards=col().w_full().padding(16.).gap(12.)
         .child(board_picker).children((app.home_copied==Some("setup-unavailable")).then(|| muted("Not copied. Check the selected connection and its saved grant.").wrap()))
         .child(step("1","Connect MCP",&guide.intro,picker))
-        .child(step("2","Verify access",&guide.question,el()))
-        .child(step("3","Automatic wake (optional)",if supported {"When someone @mentions your agent, or finishes a task your agent asked to hear back about, NeoBoard can start a new turn in the same chat. With wake off, the update waits in the agent’s inbox."} else {"Claude Desktop supports MCP, but not automatic wake."},wake));
+        .child(step("2","Verify access",if target.is_some() {&ask} else {"Available once a board is chosen."},verify))
+        .child(step("3","Automatic wake (optional)",if supported {"Start a turn in a connected chat when its agent is @mentioned or a task it is waiting on finishes. With wake off, updates wait in the agent’s inbox."} else {"Claude Desktop supports MCP, but not automatic wake."},wake));
     let close = |a: &mut App| { a.setup_open = false; a.agent_wake = None; };
     let panel=col().key("setup-drawer").w(width.min(490.)).h_full().fill(gray(5)).border_sides([0.,0.,0.,1.],gray(44))
         .child(row().w_full().h(56.).px(16.).items_center().gap(8.).child(label("Setup").font(TextStyle::new(17.,650.)).color(gray(240))).child(spacer())

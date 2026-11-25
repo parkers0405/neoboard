@@ -9,8 +9,13 @@ pub fn local(dir:&Path,data:&Path,expected_endpoint:Option<&str>,key:&str,projec
     let url=reqwest::Url::parse(host.endpoint()).map_err(|_|"Invalid local board endpoint")?;
     if expected_endpoint.is_some_and(|expected| expected != host.endpoint()) {return Err("Local discovery changed. Reconnect the board before creating an agent identity.".into());}
     if !url.host_str().unwrap_or("").trim_matches(['[',']']).parse::<std::net::IpAddr>().is_ok_and(|ip|ip.is_loopback()) || url.path()!="/" {return Err("Can only create an agent identity on the selected loopback board".into());}
-    let path=dir.join(format!("agent-{:x}.json",Sha256::digest(key.as_bytes())));
-    if path.exists(){let (origin,_)=super::inbox::identify(&path,project)?;if origin!=url.origin().ascii_serialization(){return Err("Existing agent credential belongs to another daemon; not replacing it".into());}return Ok(path);}
+    let origin=url.origin().ascii_serialization();
+    let legacy=dir.join(format!("agent-{:x}.json",Sha256::digest(key.as_bytes())));
+    // Inspect locally before using any credential. A relaunch can assign a new port.
+    // Keep the old grant intact; only the confirmed Create action can mint a new one.
+    if legacy.exists() && super::inbox::saved_origin(&legacy,project)?==origin {return Ok(legacy);}
+    let path=dir.join(format!("agent-{:x}.json",Sha256::digest(format!("{key}\0{origin}").as_bytes())));
+    if path.exists(){if super::inbox::saved_origin(&path,project)?!=origin{return Err("Saved agent origin mismatch; choose a scoped invite for this board".into());}return Ok(path);}
     let actor=format!("{harness}-{}",&super::nonce()[..10]);
     let expires_at=super::now()+365*24*3600;
     use Grant::*;

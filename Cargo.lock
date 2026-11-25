@@ -1765,7 +1765,7 @@ dependencies = [
 
 [[package]]
 name = "neochat"
-version = "0.2.12"
+version = "0.2.13"
 dependencies = [
  "axum",
  "base64 0.22.1",

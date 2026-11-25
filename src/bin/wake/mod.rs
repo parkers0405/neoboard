@@ -101,7 +101,7 @@ pub fn run(options:Options)->Result<(),String>{
             let (origin,actor)=inbox::identify(&invite,&project)?;
             let source=Source{board:scope.board_id,project,invite,origin,actor,harness:scope.harness};let code=nonce();
             transaction(&dir,|s|{if s.bindings.contains_key(&key)||s.bindings.values().any(|b|duplicate(&b.source,&source)){return Err("Already paired for this board actor; use On or Off".into());}
-                s.pending.retain(|_,p|p.expires>now() && !duplicate(&p.source,&source));s.pending.insert(code.clone(),Pending{source,expires:now()+600});Ok(())})?;
+                s.pending.retain(|_,p|p.expires>now() && !(p.source.board==source.board && p.source.harness==source.harness) && !duplicate(&p.source,&source));s.pending.insert(code.clone(),Pending{source,expires:now()+600});Ok(())})?;
             println!("{} wake pair --code {}",quoted_exe()?,code);Ok(())
         },
         Command::Pair{code,request,session,executable,workspace,origin}=>{

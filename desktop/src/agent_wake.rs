@@ -203,11 +203,23 @@ fn run(cli: &Path, key: &str, project: &str, source: Option<&Source>, harness: H
         source.ok_or("No identity source selected.")?.args(&mut cmd, project)?;
     }
     for var in ["NEOCHAT_URL", "NEOCHAT_TOKEN", "NEOCHAT_DATA_DIR", "NEOCHAT_DAEMON"] { cmd.env_remove(var); }
-    let out = cmd.args(["--harness", harness.arg()]).stdin(Stdio::null()).stderr(Stdio::null()).output()
+    let out = cmd.args(["--harness", harness.arg()]).stdin(Stdio::null()).stderr(if preparing { Stdio::piped() } else { Stdio::null() }).output()
         .map_err(|_| "Could not run the bundled neoboard CLI. Check your installation.")?;
     let text = std::str::from_utf8(&out.stdout).unwrap_or("").trim_end_matches(['\n', '\r']);
     let short = !text.is_empty() && text.len() <= 4096 && !text.chars().any(char::is_control);
     if !out.status.success() {
+        if preparing {
+            // Never forward arbitrary CLI output: an invite, token or pairing code may appear there.
+            let hint = match std::str::from_utf8(&out.stderr).unwrap_or("").trim() {
+                "Neoboard: Board unreachable; inbox not delivered" => "The agent inbox could not be reached. Check that the selected board is running.",
+                "Neoboard: Could not create scoped agent identity" => "The board refused to create a dedicated agent. Check the daemon version and local admin access.",
+                "Neoboard: Local discovery changed. Reconnect the board before creating an agent identity." => "The local board address changed. Reconnect the selected board and try Connect chat again.",
+                "Neoboard: Expected an unexpired invite scoped to the selected board" => "The saved invite is expired or scoped to a different board. Choose a current dedicated agent invite.",
+                "Neoboard: Local board admin unavailable; provide a scoped invite instead" => "Local board admin access is unavailable. Choose a dedicated agent invite for this board.",
+                _ => "Wake preparation failed. No pairing prompt was confirmed.",
+            };
+            return Err(hint.into());
+        }
         // Only control verbs promise user-safe status; prepare errors must never echo credentials.
         return Err(if short && !preparing { format!("Not confirmed: {text}") } else if action == Action::Status { "Status unavailable. Check the bundled CLI and try again.".into() } else { format!("Wake {} was not confirmed. Check status before retrying.", action.arg()) });
     }

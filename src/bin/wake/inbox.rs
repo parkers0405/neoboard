@@ -23,6 +23,7 @@ fn page(origin:&str,token:&str,after:u64)->Result<InboxPage,String>{
     Ok(p)
 }
 pub fn identify(path:&Path, project:&str)->Result<(String,String),String>{let (origin,token)=access(path,project)?;let actor=page(&origin,&token,0)?.actor;Ok((origin,actor))}
+pub(super) fn saved_origin(path:&Path, project:&str)->Result<String,String>{access(path,project).map(|(origin,_)|origin)}
 pub fn poll(s:&Source, after:u64)->Result<InboxPage,String>{
     let (origin,token)=access(&s.invite,&s.project)?;if origin!=s.origin{return Err("Saved invite changed server; wake stopped".into());}
     let p=page(&origin,&token,after)?;if p.actor!=s.actor{return Err("Saved invite changed actor; wake stopped".into());} Ok(p)
